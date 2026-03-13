@@ -69,13 +69,21 @@ The current screen already shows:
 
 /release/firmware.bin can be flashed on emtpy devices via known methods
 
+via webflasher like the one from ESPHome 
+https://web.esphome.io/
+connect USB - choose COM Port 
+dont prepare fore first use, just
+Install with firmware.bin
+
+or espboards.dev
+https://www.espboards.dev/tools/program/
+
+from VSCode:
 ```bash
 idf.py -p PORT flash
 ```
 
-Alternatively, the merged initial-flash image can be written directly at
-offset `0x0`:
-
+Alternatively, the merged initial-flash image can be written directly with esptool:
 ```bash
-python -m esptool --chip esp32s3 --port PORT write_flash 0x0 release/firmware.bin
+esptool.exe --chip esp32s3 --port PORT write_flash 0x0 release/firmware.bin
 ```
