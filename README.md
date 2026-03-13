@@ -58,7 +58,7 @@ The current screen already shows:
 
 - LAN Mode must be enabled on the printer
 - camera and MJPEG decoding are intentionally not fully finished yet
-- active printer control is not implemented yet
+- active printer control is intentionally out of scope and not planned for this project
 - MQTT TLS is working, but is not yet pinned to dedicated Bambu certificate handling
 
 ## Build
