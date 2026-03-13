@@ -4,8 +4,9 @@ Round ESP32-S3 printer companion for Bambu Lab: live status, progress ring, came
 
 ## Native ESP-IDF App
 
-Dieses Unterprojekt ist der native Nachfolger von
-[`big-printsphere.yaml`](../big-printsphere.yaml).
+PrintSphere ist die native ESP-IDF-Neuauflage und der bessere Nachfolger von
+[`big-printsphere.yaml`](../big-printsphere.yaml) und nicht nur ein
+Unterprojekt davon.
 
 ## Ziel
 
