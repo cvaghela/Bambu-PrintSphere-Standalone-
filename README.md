@@ -72,12 +72,14 @@ The current screen already shows:
 via webflasher like the one from ESPHome 
 https://web.esphome.io/
 connect USB - choose COM Port 
-dont prepare fore first use, just
+dont prepare for first use, just
 Install with firmware.bin
 
 or espboards.dev
 https://www.espboards.dev/tools/program/
+flash the bin to 0x0 as the bootloader is included in this merged bin
 
+alternative clone the repo and open in vscode.
 from VSCode:
 ```bash
 idf.py -p PORT flash
