@@ -64,7 +64,7 @@ The current screen already shows:
 ## Current Limitations
 - camera and MJPEG decoding are not fully finished yet
 - MQTT TLS is working, but is not yet pinned to dedicated Bambu certificate handling
-
+- as a owner of a P1S I build and tested it for P1S / P1P series, feel free to test also for other models
 ## Flash
 
 /release/firmware.bin can be flashed on emtpy devices via known methods
