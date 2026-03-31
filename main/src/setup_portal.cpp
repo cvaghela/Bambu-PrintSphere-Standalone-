@@ -256,6 +256,30 @@ std::string cloud_verify_note(const BambuCloudSnapshot& snapshot) {
                                : "Bambu is currently waiting for an email code. The cloud login completes after that step.";
 }
 
+SourceMode parse_source_mode_field(const cJSON* root) {
+  if (root == nullptr) {
+    return SourceMode::kHybrid;
+  }
+
+  std::string value = trim_copy(read_string_field(root, "source_mode"));
+  if (value.empty()) {
+    value = trim_copy(read_string_field(root, "state_source"));
+  }
+  return parse_source_mode(value);
+}
+
+std::string source_mode_badge_value(SourceMode mode) {
+  switch (mode) {
+    case SourceMode::kCloudOnly:
+      return "Cloud only";
+    case SourceMode::kLocalOnly:
+      return "Local only";
+    case SourceMode::kHybrid:
+    default:
+      return "Hybrid";
+  }
+}
+
 void append_cloud_status_fields(std::string* body, const BambuCloudSnapshot& cloud) {
   if (body == nullptr) {
     return;
@@ -396,7 +420,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const auto* portal = static_cast<const SetupPortal*>(request->user_ctx);
   const WifiCredentials wifi = portal->config_store_.load_wifi_credentials();
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
-  const StatusSourcePreference state_source = portal->config_store_.load_status_source_preference();
+  const SourceMode source_mode = portal->config_store_.load_source_mode();
   const PrinterConnection printer = portal->config_store_.load_printer_config();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
   const BambuCloudSnapshot cloud_snapshot = portal->cloud_client_.snapshot();
@@ -425,8 +449,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     cloud_badge_class = "info";
   }
 
-  const std::string source_badge_value =
-      state_source == StatusSourcePreference::kCloud ? "Cloud primary" : "Local primary";
+  const std::string source_badge_value = source_mode_badge_value(source_mode);
   std::string local_badge_value = "Not configured";
   const char* local_badge_class = "idle";
   if (local_snapshot.connection == PrinterConnectionState::kOnline) {
@@ -588,17 +611,22 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += json_escape(cloud.password);
     html += "\" autocomplete=\"current-password\"></div>";
     html += "</div>";
-    html += "<div class=\"field\"><label for=\"state_source\">Status Source</label><select id=\"state_source\">";
-    html += "<option value=\"cloud\"";
-    if (state_source == StatusSourcePreference::kCloud) {
+    html += "<div class=\"field\"><label for=\"source_mode\">Connection Mode</label><select id=\"source_mode\">";
+    html += "<option value=\"hybrid\"";
+    if (source_mode == SourceMode::kHybrid) {
       html += " selected";
     }
-    html += ">Cloud primary, local MQTT fallback</option>";
-    html += "<option value=\"local\"";
-    if (state_source == StatusSourcePreference::kLocal) {
+    html += ">Hybrid: cloud preview plus local live status</option>";
+    html += "<option value=\"cloud_only\"";
+    if (source_mode == SourceMode::kCloudOnly) {
       html += " selected";
     }
-    html += ">Local MQTT primary, cloud fallback</option></select></div>";
+    html += ">Cloud only</option>";
+    html += "<option value=\"local_only\"";
+    if (source_mode == SourceMode::kLocalOnly) {
+      html += " selected";
+    }
+    html += ">Local only</option></select></div>";
     html += "<div class=\"hint-box\"><strong>Cloud Status:</strong> <span id=\"cloud-detail\">";
     html += json_escape(cloud_snapshot.detail);
     html += "</span></div>";
@@ -702,8 +730,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += json_escape(cloud.email);
   html += "\",cloud_password:\"";
   html += json_escape(cloud.password);
-  html += "\",state_source:\"";
-  html += to_string(state_source);
+  html += "\",source_mode:\"";
+  html += to_string(source_mode);
   html += "\",printer_host:\"";
   html += json_escape(printer.host);
   html += "\",printer_serial:\"";
@@ -757,6 +785,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "setBadge('cloud-badge','Cloud',cloudValue,cloudState);"
           "const cloudDetail=document.getElementById('cloud-detail');if(cloudDetail){cloudDetail.textContent=body.cloud_detail||'No cloud response yet';}"
           "applyResolvedSerial(body);"
+          "const sourceMode=document.getElementById('source_mode')?valueOf('source_mode'):(savedConfig.source_mode||'hybrid');"
+          "const sourceValue=sourceMode==='cloud_only'?'Cloud only':(sourceMode==='local_only'?'Local only':'Hybrid');"
+          "setBadge('source-badge','Source',sourceValue,'info');"
           "let localValue='Not configured';let localState='idle';"
           "if(body.local_connected){localValue='Connected';localState='ok';}"
           "else if(body.local_error){localValue='Error';localState='warn';}"
@@ -773,7 +804,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "wifi_password:valueOf('wifi_password'),"
           "cloud_email:(document.getElementById('cloud_email')?trimmedValue('cloud_email'):savedConfig.cloud_email),"
           "cloud_password:(document.getElementById('cloud_password')?valueOf('cloud_password'):savedConfig.cloud_password),"
-          "state_source:(document.getElementById('state_source')?valueOf('state_source'):savedConfig.state_source)||'cloud',"
+          "source_mode:(document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode)||'hybrid',"
           "printer_host:(document.getElementById('printer_host')?trimmedValue('printer_host'):savedConfig.printer_host),"
           "printer_serial:(document.getElementById('printer_serial')?trimmedValue('printer_serial'):savedConfig.printer_serial),"
           "printer_access_code:(document.getElementById('printer_access_code')?trimmedValue('printer_access_code'):savedConfig.printer_access_code)},buildArcPayload());}";
@@ -793,10 +824,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "catch(error){setStatus('Saving failed','The request to the ESP could not be completed.',8000);saveButton.disabled=false;}});";
   html += "if(cloudConnectButton){cloudConnectButton.addEventListener('click',async()=>{const cloud_email=trimmedValue('cloud_email');"
           "const cloud_password=valueOf('cloud_password');"
-          "const state_source=document.getElementById('state_source')?valueOf('state_source'):savedConfig.state_source;"
+          "const source_mode=document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode;"
           "if(!cloud_email||!cloud_password){setStatus('Cloud credentials missing','Enter both Bambu email and password first.',5000);return;}"
           "cloudConnectButton.disabled=true;setStatus('Connecting cloud...','Saving credentials and starting the login now.',8000);"
-          "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,state_source})});"
+          "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,source_mode})});"
           "const body=await response.json().catch(()=>({}));updateCloudVerification(body);applyResolvedSerial(body);"
           "if(response.ok){if(body.cloud_connected){setStatus('Cloud connected',body.detail||'Connected to Bambu Cloud.',7000);}"
           "else if(body.cloud_verification_required){setStatus(body.cloud_tfa_required?'2FA required':'Email code required',body.detail||'Enter the requested code to finish the login.',10000);}"
@@ -806,10 +837,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "if(localConnectButton){localConnectButton.addEventListener('click',async()=>{const printer_host=trimmedValue('printer_host');"
           "const printer_serial=trimmedValue('printer_serial');"
           "const printer_access_code=trimmedValue('printer_access_code');"
-          "const state_source=document.getElementById('state_source')?valueOf('state_source'):savedConfig.state_source;"
+          "const source_mode=document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode;"
           "if(!printer_host||!printer_serial||!printer_access_code){setStatus('Local credentials missing','Enter printer host, serial and access code first.',5000);return;}"
           "localConnectButton.disabled=true;setStatus('Connecting local path...','Saving printer credentials and reconnecting MQTT now.',8000);"
-          "try{const response=await fetch('/api/local/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer_host,printer_serial,printer_access_code,state_source})});"
+          "try{const response=await fetch('/api/local/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer_host,printer_serial,printer_access_code,source_mode})});"
           "const body=await response.json().catch(()=>({}));"
           "if(response.ok){if(body.local_connected){setStatus('Local path connected',body.detail||'Connected to local Bambu MQTT.',7000);}"
           "else{setStatus('Local path started',body.detail||'Waiting for local printer response...',7000);}}"
@@ -889,7 +920,7 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   const auto* portal = static_cast<const SetupPortal*>(request->user_ctx);
   const WifiCredentials wifi = portal->config_store_.load_wifi_credentials();
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
-  const StatusSourcePreference state_source = portal->config_store_.load_status_source_preference();
+  const SourceMode source_mode = portal->config_store_.load_source_mode();
   const PrinterConnection printer = portal->config_store_.load_printer_config();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
 
@@ -898,8 +929,11 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   body += "\"cloud_email\":\"" + json_escape(cloud.email) + "\",";
   body += "\"printer_host\":\"" + json_escape(printer.host) + "\",";
   body += "\"printer_serial\":\"" + json_escape(printer.serial) + "\",";
+  body += "\"source_mode\":\"";
+  body += to_string(source_mode);
+  body += "\",";
   body += "\"state_source\":\"";
-  body += to_string(state_source);
+  body += to_string(source_mode);
   body += "\",";
   body += "\"wifi_connected\":";
   body += (portal->wifi_manager_.is_station_connected() ? "true" : "false");
@@ -949,8 +983,7 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
       .email = trim_copy(read_string_field(root, "cloud_email")),
       .password = read_string_field(root, "cloud_password"),
   };
-  const StatusSourcePreference state_source =
-      parse_status_source_preference(trim_copy(read_string_field(root, "state_source")));
+  const SourceMode source_mode = parse_source_mode_field(root);
 
   const PrinterConnection printer = {
       .host = trim_copy(read_string_field(root, "printer_host")),
@@ -989,17 +1022,17 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
   }
 
   ESP_LOGI(kTag,
-           "Saving config: wifi_ssid=%s cloud_email_len=%u state_source=%s local_host=%s serial_len=%u access_len=%u",
+           "Saving config: wifi_ssid=%s cloud_email_len=%u source_mode=%s local_host=%s serial_len=%u access_len=%u",
            wifi.ssid.c_str(), static_cast<unsigned int>(cloud.email.size()),
-           to_string(state_source), printer.host.c_str(),
+           to_string(source_mode), printer.host.c_str(),
            static_cast<unsigned int>(printer.serial.size()),
            static_cast<unsigned int>(printer.access_code.size()));
 
   ESP_RETURN_ON_ERROR(portal->config_store_.save_wifi_credentials(wifi), kTag, "save wifi failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_cloud_credentials(cloud), kTag,
                       "save cloud failed");
-  ESP_RETURN_ON_ERROR(portal->config_store_.save_status_source_preference(state_source), kTag,
-                      "save state source failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
+                      "save source mode failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_config(printer), kTag, "save printer failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_arc_color_scheme(arc_colors), kTag,
                       "save arc colors failed");
@@ -1076,8 +1109,7 @@ esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
       .email = trim_copy(read_string_field(root, "cloud_email")),
       .password = read_string_field(root, "cloud_password"),
   };
-  const StatusSourcePreference state_source =
-      parse_status_source_preference(trim_copy(read_string_field(root, "state_source")));
+  const SourceMode source_mode = parse_source_mode_field(root);
   cJSON_Delete(root);
 
   if (!cloud.is_configured()) {
@@ -1095,8 +1127,8 @@ esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
   }
 
   ESP_RETURN_ON_ERROR(portal->config_store_.save_cloud_credentials(cloud), kTag, "save cloud failed");
-  ESP_RETURN_ON_ERROR(portal->config_store_.save_status_source_preference(state_source), kTag,
-                      "save state source failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
+                      "save source mode failed");
   portal->cloud_client_.request_reload_from_store();
 
   const BambuCloudSnapshot before = portal->cloud_client_.snapshot();
@@ -1179,8 +1211,7 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
       .serial = trim_copy(read_string_field(root, "printer_serial")),
       .access_code = trim_copy(read_string_field(root, "printer_access_code")),
   };
-  const StatusSourcePreference state_source =
-      parse_status_source_preference(trim_copy(read_string_field(root, "state_source")));
+  const SourceMode source_mode = parse_source_mode_field(root);
   cJSON_Delete(root);
 
   if (!printer.is_ready()) {
@@ -1203,8 +1234,8 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
   }
 
   ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_config(printer), kTag, "save printer failed");
-  ESP_RETURN_ON_ERROR(portal->config_store_.save_status_source_preference(state_source), kTag,
-                      "save state source failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
+                      "save source mode failed");
 
   const PrinterSnapshot before = portal->printer_client_.snapshot();
   portal->printer_client_.configure(printer);

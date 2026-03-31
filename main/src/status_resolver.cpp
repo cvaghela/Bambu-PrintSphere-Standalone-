@@ -139,39 +139,11 @@ bool local_state_has_priority_signal(const PrinterSnapshot& snapshot) {
          !snapshot.raw_stage.empty() || !is_generic_local_stage(snapshot);
 }
 
-bool local_state_is_live_printing(const PrinterSnapshot& snapshot) {
-  return snapshot.print_active || snapshot.lifecycle == PrintLifecycleState::kPreparing ||
-         snapshot.lifecycle == PrintLifecycleState::kPrinting ||
-         snapshot.lifecycle == PrintLifecycleState::kPaused;
-}
-
-bool cloud_state_is_live_printing(const BambuCloudSnapshot& snapshot) {
-  return snapshot.lifecycle == PrintLifecycleState::kPreparing ||
-         snapshot.lifecycle == PrintLifecycleState::kPrinting ||
-         snapshot.lifecycle == PrintLifecycleState::kPaused;
-}
-
 bool cloud_state_has_signal(const BambuCloudSnapshot& snapshot) {
   return snapshot.connected &&
          (snapshot.lifecycle != PrintLifecycleState::kUnknown || snapshot.progress_percent > 0.0f ||
           !snapshot.stage.empty() || !snapshot.raw_status.empty() || !snapshot.raw_stage.empty() ||
           snapshot.has_error);
-}
-
-bool local_state_is_explicit_idle(const PrinterSnapshot& snapshot) {
-  if (snapshot.connection != PrinterConnectionState::kOnline ||
-      snapshot.lifecycle != PrintLifecycleState::kIdle) {
-    return false;
-  }
-
-  const std::string raw_status = lower_copy(snapshot.raw_status);
-  const std::string raw_stage = lower_copy(snapshot.raw_stage);
-  return raw_status == "idle" || raw_stage == "idle";
-}
-
-bool local_state_has_hard_error(const PrinterSnapshot& snapshot) {
-  return snapshot.has_error || snapshot.lifecycle == PrintLifecycleState::kError ||
-         snapshot.print_error_code != 0;
 }
 
 bool is_filament_stage(const std::string& stage) {
@@ -265,7 +237,127 @@ bool local_runtime_substate_should_override(const PrinterSnapshot& target,
   return target_stage.empty() && !local_stage.empty();
 }
 
-void apply_cloud_state(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
+constexpr uint64_t kLocalSourceFreshMs = 90ULL * 1000ULL;
+constexpr uint64_t kCloudSourceFreshMs = 5ULL * 60ULL * 1000ULL;
+constexpr uint64_t kCloudPreviewFreshMs = 30ULL * 60ULL * 1000ULL;
+
+bool is_recent_enough(uint64_t last_update_ms, uint64_t now_ms, uint64_t max_age_ms) {
+  if (last_update_ms == 0 || now_ms < last_update_ms) {
+    return false;
+  }
+  return (now_ms - last_update_ms) <= max_age_ms;
+}
+
+bool local_metrics_have_signal(const PrinterSnapshot& snapshot) {
+  return local_state_has_priority_signal(snapshot) || snapshot.progress_percent > 0.0f ||
+         snapshot.remaining_seconds > 0U || snapshot.current_layer > 0U ||
+         snapshot.total_layers > 0U || !snapshot.job_name.empty();
+}
+
+bool cloud_metrics_have_signal(const BambuCloudSnapshot& snapshot) {
+  return cloud_state_has_signal(snapshot) || snapshot.progress_percent > 0.0f ||
+         snapshot.remaining_seconds > 0U || snapshot.current_layer > 0U ||
+         snapshot.total_layers > 0U || !snapshot.preview_title.empty();
+}
+
+bool cloud_preview_available(const BambuCloudSnapshot& snapshot, uint64_t now_ms) {
+  if (!is_recent_enough(snapshot.last_update_ms, now_ms, kCloudPreviewFreshMs)) {
+    return false;
+  }
+  return !snapshot.preview_url.empty() || snapshot.preview_blob != nullptr ||
+         !snapshot.preview_title.empty();
+}
+
+bool local_camera_available(const PrinterSnapshot& snapshot) {
+  return snapshot.local_capabilities.camera_jpeg_socket || snapshot.local_capabilities.camera_rtsp ||
+         snapshot.local_model == PrinterModel::kUnknown || !snapshot.camera_rtsp_url.empty();
+}
+
+void copy_source_metadata(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot,
+                          bool local_printer_enabled, const BambuCloudSnapshot& cloud_snapshot,
+                          bool wifi_connected, const std::string& wifi_ip) {
+  target.wifi_connected = wifi_connected;
+  target.wifi_ip = wifi_ip;
+  target.local_configured = local_printer_enabled || local_snapshot.local_configured;
+  target.local_connected = local_snapshot.local_connected;
+  target.local_last_update_ms = local_snapshot.local_last_update_ms;
+  target.local_model = local_snapshot.local_model;
+  target.local_capabilities = local_snapshot.local_capabilities;
+  target.local_mqtt_signature_required = local_snapshot.local_mqtt_signature_required;
+  target.cloud_configured = cloud_snapshot.configured;
+  target.cloud_connected = cloud_snapshot.connected;
+  target.cloud_last_update_ms = cloud_snapshot.last_update_ms;
+  target.cloud_model = cloud_snapshot.model;
+  target.cloud_capabilities =
+      cloud_snapshot.capabilities.status || cloud_snapshot.capabilities.metrics ||
+              cloud_snapshot.capabilities.preview
+          ? cloud_snapshot.capabilities
+          : default_cloud_capabilities();
+  target.resolved_serial =
+      !cloud_snapshot.resolved_serial.empty() ? cloud_snapshot.resolved_serial
+                                             : local_snapshot.resolved_serial;
+  target.cloud_detail = cloud_snapshot.detail;
+  target.status_source = FieldSource::kNone;
+  target.metrics_source = FieldSource::kNone;
+  target.preview_source = FieldSource::kNone;
+  target.camera_source = FieldSource::kNone;
+}
+
+void apply_base_state_for_mode(PrinterSnapshot& target, SourceMode source_mode,
+                               const PrinterSnapshot& local_snapshot, bool local_enabled,
+                               const BambuCloudSnapshot& cloud_snapshot, bool cloud_enabled) {
+  switch (source_mode) {
+    case SourceMode::kCloudOnly:
+      if (cloud_enabled) {
+        target.connection = cloud_snapshot.connected ? PrinterConnectionState::kOnline
+                                                     : PrinterConnectionState::kConnecting;
+        target.lifecycle = cloud_snapshot.lifecycle;
+        target.stage = cloud_snapshot.connected ? "cloud-online" : "cloud";
+        target.detail = cloud_snapshot.detail.empty() ? "Cloud path ready" : cloud_snapshot.detail;
+      } else {
+        target.connection = PrinterConnectionState::kWaitingForCredentials;
+        target.lifecycle = PrintLifecycleState::kUnknown;
+        target.stage = "cloud";
+        target.detail = "Cloud login not configured";
+      }
+      break;
+    case SourceMode::kLocalOnly:
+      if (local_enabled) {
+        target.connection = local_snapshot.connection;
+        target.lifecycle = local_snapshot.lifecycle;
+        target.stage = local_snapshot.stage;
+        target.detail = local_snapshot.detail;
+      } else {
+        target.connection = PrinterConnectionState::kWaitingForCredentials;
+        target.lifecycle = PrintLifecycleState::kUnknown;
+        target.stage = "setup";
+        target.detail = "Need printer host, serial and access code";
+      }
+      break;
+    case SourceMode::kHybrid:
+    default:
+      if (local_enabled) {
+        target.connection = local_snapshot.connection;
+        target.lifecycle = local_snapshot.lifecycle;
+        target.stage = local_snapshot.stage;
+        target.detail = local_snapshot.detail;
+      } else if (cloud_enabled) {
+        target.connection = cloud_snapshot.connected ? PrinterConnectionState::kOnline
+                                                     : PrinterConnectionState::kConnecting;
+        target.lifecycle = cloud_snapshot.lifecycle;
+        target.stage = cloud_snapshot.connected ? "cloud-online" : "cloud";
+        target.detail = cloud_snapshot.detail.empty() ? "Cloud path ready" : cloud_snapshot.detail;
+      } else {
+        target.connection = PrinterConnectionState::kWaitingForCredentials;
+        target.lifecycle = PrintLifecycleState::kUnknown;
+        target.stage = "setup";
+        target.detail = "Configure cloud or local printer access";
+      }
+      break;
+  }
+}
+
+void apply_cloud_status_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
   target.connection = cloud_snapshot.connected ? PrinterConnectionState::kOnline
                                                : PrinterConnectionState::kConnecting;
   target.lifecycle = cloud_snapshot.lifecycle;
@@ -274,6 +366,27 @@ void apply_cloud_state(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_
   if (!cloud_snapshot.stage.empty()) {
     target.stage = cloud_snapshot.stage;
   }
+  target.has_error = cloud_snapshot.has_error;
+  if (!cloud_snapshot.detail.empty()) {
+    target.detail = cloud_snapshot.detail;
+  }
+}
+
+void apply_local_status_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
+  target.connection = local_snapshot.connection;
+  target.lifecycle = local_snapshot.lifecycle;
+  target.raw_status = local_snapshot.raw_status;
+  target.raw_stage = local_snapshot.raw_stage;
+  if (!local_snapshot.stage.empty()) {
+    target.stage = local_snapshot.stage;
+  }
+  target.has_error = local_snapshot.has_error;
+  if (!local_snapshot.detail.empty()) {
+    target.detail = local_snapshot.detail;
+  }
+}
+
+void apply_cloud_metrics_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
   target.progress_percent = cloud_snapshot.progress_percent;
   if (cloud_snapshot.remaining_seconds > 0U ||
       cloud_snapshot.lifecycle == PrintLifecycleState::kFinished ||
@@ -287,23 +400,12 @@ void apply_cloud_state(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_
   if (cloud_snapshot.total_layers > 0U) {
     target.total_layers = cloud_snapshot.total_layers;
   }
-  target.has_error = cloud_snapshot.has_error;
-  target.print_error_code = 0;
-  target.hms_alert_count = 0;
-  target.warn_hms = false;
-  target.non_error_stop = false;
-  target.show_stop_banner = false;
-  if (!cloud_snapshot.detail.empty()) {
-    target.detail = cloud_snapshot.detail;
+  if (target.job_name.empty() && !cloud_snapshot.preview_title.empty()) {
+    target.job_name = cloud_snapshot.preview_title;
   }
 }
 
-void apply_local_live_state(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
-  target.connection = local_snapshot.connection;
-  target.lifecycle = local_snapshot.lifecycle;
-  target.raw_status = local_snapshot.raw_status;
-  target.raw_stage = local_snapshot.raw_stage;
-  target.stage = local_snapshot.stage;
+void apply_local_metrics_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
   target.progress_percent = local_snapshot.progress_percent;
   if (local_snapshot.remaining_seconds > 0U ||
       local_snapshot.lifecycle == PrintLifecycleState::kFinished ||
@@ -311,41 +413,14 @@ void apply_local_live_state(PrinterSnapshot& target, const PrinterSnapshot& loca
       local_snapshot.lifecycle == PrintLifecycleState::kError) {
     target.remaining_seconds = local_snapshot.remaining_seconds;
   }
-  target.has_error = local_snapshot.has_error;
-  target.print_error_code = local_snapshot.print_error_code;
-  target.hms_alert_count = local_snapshot.hms_alert_count;
-  target.warn_hms = local_snapshot.warn_hms;
-  target.non_error_stop = local_snapshot.non_error_stop;
-  target.show_stop_banner = local_snapshot.show_stop_banner;
-  if (!local_snapshot.detail.empty()) {
-    target.detail = local_snapshot.detail;
-  }
-  if (!local_snapshot.job_name.empty()) {
-    target.job_name = local_snapshot.job_name;
-  }
-}
-
-void apply_local_live_metrics(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
-  target.progress_percent = local_snapshot.progress_percent;
-  if (local_snapshot.remaining_seconds > 0U ||
-      local_snapshot.lifecycle == PrintLifecycleState::kFinished ||
-      local_snapshot.lifecycle == PrintLifecycleState::kIdle ||
-      local_snapshot.lifecycle == PrintLifecycleState::kError) {
-    target.remaining_seconds = local_snapshot.remaining_seconds;
-  }
-  target.print_error_code = local_snapshot.print_error_code;
-  target.hms_alert_count = local_snapshot.hms_alert_count;
   if (local_snapshot.current_layer > 0U) {
     target.current_layer = local_snapshot.current_layer;
   }
   if (local_snapshot.total_layers > 0U) {
     target.total_layers = local_snapshot.total_layers;
   }
-  if (target.raw_status.empty()) {
-    target.raw_status = local_snapshot.raw_status;
-  }
-  if (target.raw_stage.empty()) {
-    target.raw_stage = local_snapshot.raw_stage;
+  if (!local_snapshot.job_name.empty()) {
+    target.job_name = local_snapshot.job_name;
   }
   if (local_runtime_substate_should_override(target, local_snapshot)) {
     if (!local_snapshot.raw_status.empty()) {
@@ -361,6 +436,34 @@ void apply_local_live_metrics(PrinterSnapshot& target, const PrinterSnapshot& lo
       target.detail = local_snapshot.detail;
     }
   }
+}
+
+void apply_local_temperature_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
+  target.nozzle_temp_c = local_snapshot.nozzle_temp_c;
+  target.bed_temp_c = local_snapshot.bed_temp_c;
+}
+
+void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
+  target.print_error_code = local_snapshot.print_error_code;
+  target.hms_alert_count = local_snapshot.hms_alert_count;
+  target.non_error_stop = local_snapshot.non_error_stop;
+  target.show_stop_banner = local_snapshot.show_stop_banner;
+  if ((local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
+       local_snapshot.non_error_stop || local_snapshot.has_error) &&
+      !local_snapshot.detail.empty()) {
+    target.detail = local_snapshot.detail;
+  }
+  if (target.status_source == FieldSource::kNone &&
+      (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
+       local_snapshot.non_error_stop || local_snapshot.has_error)) {
+    apply_local_status_bundle(target, local_snapshot);
+  }
+}
+
+void apply_cloud_preview_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
+  target.preview_url = cloud_snapshot.preview_url;
+  target.preview_blob = cloud_snapshot.preview_blob;
+  target.preview_title = cloud_snapshot.preview_title;
 }
 
 std::string pretty_stage(const std::string& stage) {
@@ -529,71 +632,89 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
 
 PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool local_printer_enabled,
                                      const BambuCloudSnapshot& cloud_snapshot,
-                                     StatusSourcePreference status_source_preference,
+                                     SourceMode source_mode, uint64_t now_ms,
                                      bool wifi_connected, const std::string& wifi_ip,
                                      bool print_activity_seen_this_session) {
-  PrinterSnapshot snapshot = local_snapshot;
-  snapshot.cloud_connected = cloud_snapshot.connected;
-  snapshot.cloud_detail = cloud_snapshot.detail;
-  snapshot.preview_url = cloud_snapshot.preview_url;
-  snapshot.preview_blob = cloud_snapshot.preview_blob;
-  snapshot.preview_title = cloud_snapshot.preview_title;
-  snapshot.wifi_connected = wifi_connected;
-  snapshot.wifi_ip = wifi_ip;
+  (void)print_activity_seen_this_session;
 
-  const bool cloud_has_state = cloud_state_has_signal(cloud_snapshot);
-  const bool local_has_state = local_state_has_priority_signal(local_snapshot);
-  const bool local_live_printing = local_state_is_live_printing(local_snapshot);
-  const bool cloud_live_printing = cloud_state_is_live_printing(cloud_snapshot);
-  const bool local_non_error_stop = is_non_error_stop(local_snapshot);
-  const bool local_hard_error = local_state_has_hard_error(local_snapshot);
-  const bool prefer_cloud = status_source_preference == StatusSourcePreference::kCloud;
-  const bool local_non_error_stop_should_override_cloud =
-      local_non_error_stop && (print_activity_seen_this_session || !cloud_live_printing);
-  const bool local_error_should_override_cloud =
-      local_hard_error && (cloud_has_state || cloud_live_printing || cloud_snapshot.connected);
-  const bool local_idle_should_override_cloud_error =
-      local_state_is_explicit_idle(local_snapshot) &&
-      cloud_snapshot.lifecycle == PrintLifecycleState::kError && !cloud_live_printing;
-  const bool stale_cloud_finished_after_boot =
-      prefer_cloud && cloud_snapshot.lifecycle == PrintLifecycleState::kFinished &&
-      local_state_is_explicit_idle(local_snapshot) && !print_activity_seen_this_session;
+  PrinterSnapshot snapshot;
+  const bool local_enabled = source_mode != SourceMode::kCloudOnly && local_printer_enabled;
+  const bool cloud_enabled = source_mode != SourceMode::kLocalOnly && cloud_snapshot.configured;
+  copy_source_metadata(snapshot, local_snapshot, local_printer_enabled, cloud_snapshot,
+                       wifi_connected, wifi_ip);
+  apply_base_state_for_mode(snapshot, source_mode, local_snapshot, local_enabled, cloud_snapshot,
+                            cloud_enabled);
 
-  if (!local_printer_enabled) {
-    snapshot.connection = cloud_snapshot.configured ? PrinterConnectionState::kConnecting
-                                                    : PrinterConnectionState::kWaitingForCredentials;
-    snapshot.stage = cloud_snapshot.connected ? "cloud-online" : "cloud";
-    snapshot.detail = cloud_snapshot.detail;
-    if (cloud_snapshot.connected) {
-      snapshot.connection = PrinterConnectionState::kOnline;
-    }
-    if (cloud_has_state) {
-      apply_cloud_state(snapshot, cloud_snapshot);
-    }
-    return snapshot;
+  const bool local_fresh =
+      local_enabled && local_snapshot.local_connected &&
+      is_recent_enough(local_snapshot.local_last_update_ms, now_ms, kLocalSourceFreshMs);
+  const bool cloud_fresh =
+      cloud_enabled && cloud_snapshot.connected &&
+      is_recent_enough(cloud_snapshot.last_update_ms, now_ms, kCloudSourceFreshMs);
+  const bool local_status_usable = local_fresh && local_state_has_priority_signal(local_snapshot);
+  const bool cloud_status_usable = cloud_fresh && cloud_state_has_signal(cloud_snapshot);
+  const bool local_metrics_usable = local_fresh && local_metrics_have_signal(local_snapshot);
+  const bool cloud_metrics_usable = cloud_fresh && cloud_metrics_have_signal(cloud_snapshot);
+  const bool local_temperatures_usable = local_fresh && local_snapshot.local_capabilities.temperatures;
+  const bool local_error_usable =
+      local_fresh && (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
+                      local_snapshot.non_error_stop || local_snapshot.has_error);
+
+  if (local_status_usable) {
+    snapshot.status_source = FieldSource::kLocal;
+    apply_local_status_bundle(snapshot, local_snapshot);
+  } else if (cloud_status_usable) {
+    snapshot.status_source = FieldSource::kCloud;
+    apply_cloud_status_bundle(snapshot, cloud_snapshot);
   }
 
-  if (prefer_cloud) {
-    if (local_error_should_override_cloud || local_non_error_stop_should_override_cloud ||
-        local_idle_should_override_cloud_error) {
-      apply_local_live_state(snapshot, local_snapshot);
-    } else if (cloud_has_state && !stale_cloud_finished_after_boot) {
-      apply_cloud_state(snapshot, cloud_snapshot);
-    } else if (!local_has_state && !cloud_snapshot.detail.empty()) {
-      snapshot.detail = cloud_snapshot.detail;
-    }
+  if (local_metrics_usable) {
+    snapshot.metrics_source = FieldSource::kLocal;
+    apply_local_metrics_bundle(snapshot, local_snapshot);
+  } else if (cloud_metrics_usable) {
+    snapshot.metrics_source = FieldSource::kCloud;
+    apply_cloud_metrics_bundle(snapshot, cloud_snapshot);
+  }
 
-    if (local_live_printing && !cloud_live_printing) {
-      apply_local_live_state(snapshot, local_snapshot);
-    } else if (local_live_printing) {
-      apply_local_live_metrics(snapshot, local_snapshot);
-    }
-  } else {
-    if (!local_has_state && cloud_has_state) {
-      apply_cloud_state(snapshot, cloud_snapshot);
-    } else if (!cloud_snapshot.detail.empty() &&
-               (snapshot.detail.empty() || snapshot.detail == "Status payload received")) {
+  if (local_temperatures_usable) {
+    apply_local_temperature_bundle(snapshot, local_snapshot);
+  }
+  if (local_error_usable) {
+    apply_local_error_bundle(snapshot, local_snapshot);
+  }
+
+  if (cloud_enabled && cloud_preview_available(cloud_snapshot, now_ms)) {
+    snapshot.preview_source = FieldSource::kCloud;
+    apply_cloud_preview_bundle(snapshot, cloud_snapshot);
+  }
+  if (local_enabled && local_camera_available(local_snapshot)) {
+    snapshot.camera_source = FieldSource::kLocal;
+  }
+
+  if (snapshot.job_name.empty() && !local_snapshot.job_name.empty() && local_metrics_usable) {
+    snapshot.job_name = local_snapshot.job_name;
+  }
+  if (snapshot.job_name.empty() && !cloud_snapshot.preview_title.empty() && cloud_metrics_usable) {
+    snapshot.job_name = cloud_snapshot.preview_title;
+  }
+
+  if (snapshot.detail.empty()) {
+    if (snapshot.status_source == FieldSource::kCloud && !cloud_snapshot.detail.empty()) {
       snapshot.detail = cloud_snapshot.detail;
+    } else if (snapshot.status_source == FieldSource::kLocal && !local_snapshot.detail.empty()) {
+      snapshot.detail = local_snapshot.detail;
+    } else if (!cloud_snapshot.detail.empty() && cloud_enabled) {
+      snapshot.detail = cloud_snapshot.detail;
+    } else if (!local_snapshot.detail.empty() && local_enabled) {
+      snapshot.detail = local_snapshot.detail;
+    }
+  }
+
+  if (snapshot.stage.empty()) {
+    if (snapshot.status_source == FieldSource::kLocal) {
+      snapshot.stage = local_snapshot.stage;
+    } else if (snapshot.status_source == FieldSource::kCloud) {
+      snapshot.stage = cloud_snapshot.stage;
     }
   }
 

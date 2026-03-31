@@ -27,6 +27,40 @@ enum class PrintLifecycleState : uint8_t {
   kError,
 };
 
+enum class PrinterModel : uint8_t {
+  kUnknown,
+  kA1,
+  kA1Mini,
+  kP1P,
+  kP1S,
+  kP2S,
+  kH2C,
+  kH2D,
+  kH2DPro,
+  kH2S,
+  kX1,
+  kX1C,
+  kX1E,
+};
+
+enum class FieldSource : uint8_t {
+  kNone,
+  kLocal,
+  kCloud,
+};
+
+struct SourceCapabilities {
+  bool status = false;
+  bool metrics = false;
+  bool temperatures = false;
+  bool preview = false;
+  bool hms = false;
+  bool print_error = false;
+  bool camera_jpeg_socket = false;
+  bool camera_rtsp = false;
+  bool developer_mode_required = false;
+};
+
 struct PrinterSnapshot {
   PrinterConnectionState connection = PrinterConnectionState::kBooting;
   PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
@@ -35,6 +69,7 @@ struct PrinterSnapshot {
   std::string raw_status;
   std::string raw_stage;
   std::string ui_status;
+  std::string resolved_serial;
   std::string job_name;
   std::string gcode_file;
   std::string preview_hint;
@@ -43,6 +78,7 @@ struct PrinterSnapshot {
   std::string preview_title;
   std::shared_ptr<std::vector<uint8_t>> camera_blob;
   std::string camera_detail;
+  std::string camera_rtsp_url;
   uint16_t camera_width = 0;
   uint16_t camera_height = 0;
   std::string cloud_detail;
@@ -54,6 +90,12 @@ struct PrinterSnapshot {
   uint16_t total_layers = 0;
   int print_error_code = 0;
   uint16_t hms_alert_count = 0;
+  bool local_configured = false;
+  bool local_connected = false;
+  uint64_t local_last_update_ms = 0;
+  PrinterModel local_model = PrinterModel::kUnknown;
+  SourceCapabilities local_capabilities{};
+  bool local_mqtt_signature_required = false;
   bool wifi_connected = false;
   std::string wifi_ip;
   bool setup_ap_active = false;
@@ -67,8 +109,16 @@ struct PrinterSnapshot {
   bool has_error = false;
   bool print_active = false;
   bool warn_hms = false;
+  bool cloud_configured = false;
   bool cloud_connected = false;
+  uint64_t cloud_last_update_ms = 0;
+  PrinterModel cloud_model = PrinterModel::kUnknown;
+  SourceCapabilities cloud_capabilities{};
   bool camera_connected = false;
+  FieldSource status_source = FieldSource::kNone;
+  FieldSource metrics_source = FieldSource::kNone;
+  FieldSource preview_source = FieldSource::kNone;
+  FieldSource camera_source = FieldSource::kNone;
   bool non_error_stop = false;
   bool show_stop_banner = false;
 };
@@ -85,5 +135,11 @@ class PrinterStateStore {
 
 const char* to_string(PrinterConnectionState state);
 const char* to_string(PrintLifecycleState state);
+const char* to_string(PrinterModel model);
+const char* to_string(FieldSource source);
+bool printer_model_has_jpeg_camera(PrinterModel model);
+bool printer_model_has_rtsp_camera(PrinterModel model);
+SourceCapabilities default_local_capabilities_for_model(PrinterModel model);
+SourceCapabilities default_cloud_capabilities();
 
 }  // namespace printsphere

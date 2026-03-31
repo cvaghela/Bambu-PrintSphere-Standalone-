@@ -54,4 +54,111 @@ const char* to_string(PrintLifecycleState state) {
   return "unknown";
 }
 
+const char* to_string(PrinterModel model) {
+  switch (model) {
+    case PrinterModel::kA1:
+      return "A1";
+    case PrinterModel::kA1Mini:
+      return "A1MINI";
+    case PrinterModel::kP1P:
+      return "P1P";
+    case PrinterModel::kP1S:
+      return "P1S";
+    case PrinterModel::kP2S:
+      return "P2S";
+    case PrinterModel::kH2C:
+      return "H2C";
+    case PrinterModel::kH2D:
+      return "H2D";
+    case PrinterModel::kH2DPro:
+      return "H2DPRO";
+    case PrinterModel::kH2S:
+      return "H2S";
+    case PrinterModel::kX1:
+      return "X1";
+    case PrinterModel::kX1C:
+      return "X1C";
+    case PrinterModel::kX1E:
+      return "X1E";
+    case PrinterModel::kUnknown:
+    default:
+      return "UNKNOWN";
+  }
+}
+
+const char* to_string(FieldSource source) {
+  switch (source) {
+    case FieldSource::kLocal:
+      return "local";
+    case FieldSource::kCloud:
+      return "cloud";
+    case FieldSource::kNone:
+    default:
+      return "none";
+  }
+}
+
+bool printer_model_has_jpeg_camera(PrinterModel model) {
+  switch (model) {
+    case PrinterModel::kA1:
+    case PrinterModel::kA1Mini:
+    case PrinterModel::kP1P:
+    case PrinterModel::kP1S:
+      return true;
+    case PrinterModel::kUnknown:
+    case PrinterModel::kP2S:
+    case PrinterModel::kH2C:
+    case PrinterModel::kH2D:
+    case PrinterModel::kH2DPro:
+    case PrinterModel::kH2S:
+    case PrinterModel::kX1:
+    case PrinterModel::kX1C:
+    case PrinterModel::kX1E:
+    default:
+      return false;
+  }
+}
+
+bool printer_model_has_rtsp_camera(PrinterModel model) {
+  switch (model) {
+    case PrinterModel::kP2S:
+    case PrinterModel::kH2C:
+    case PrinterModel::kH2D:
+    case PrinterModel::kH2DPro:
+    case PrinterModel::kH2S:
+    case PrinterModel::kX1:
+    case PrinterModel::kX1C:
+    case PrinterModel::kX1E:
+      return true;
+    case PrinterModel::kUnknown:
+    case PrinterModel::kA1:
+    case PrinterModel::kA1Mini:
+    case PrinterModel::kP1P:
+    case PrinterModel::kP1S:
+    default:
+      return false;
+  }
+}
+
+SourceCapabilities default_local_capabilities_for_model(PrinterModel model) {
+  SourceCapabilities capabilities;
+  capabilities.status = true;
+  capabilities.metrics = true;
+  capabilities.temperatures = true;
+  capabilities.hms = true;
+  capabilities.print_error = true;
+  capabilities.camera_jpeg_socket = printer_model_has_jpeg_camera(model);
+  capabilities.camera_rtsp = printer_model_has_rtsp_camera(model);
+  capabilities.developer_mode_required = capabilities.camera_rtsp;
+  return capabilities;
+}
+
+SourceCapabilities default_cloud_capabilities() {
+  SourceCapabilities capabilities;
+  capabilities.status = true;
+  capabilities.metrics = true;
+  capabilities.preview = true;
+  return capabilities;
+}
+
 }  // namespace printsphere

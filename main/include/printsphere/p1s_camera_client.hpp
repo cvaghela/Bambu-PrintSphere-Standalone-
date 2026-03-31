@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "printsphere/config_store.hpp"
+#include "printsphere/printer_state.hpp"
 
 namespace printsphere {
 
@@ -34,6 +35,7 @@ class P1sCameraClient {
   void set_network_ready(bool ready) { network_ready_.store(ready); }
   void set_enabled(bool enabled) { enabled_.store(enabled); }
   void request_refresh() { refresh_requested_.store(true); }
+  void observe_printer_snapshot(const PrinterSnapshot& snapshot);
   esp_err_t start();
   P1sCameraSnapshot snapshot() const;
 
@@ -50,6 +52,9 @@ class P1sCameraClient {
   void set_frame_snapshot(bool configured, bool enabled, bool connected, const char* detail,
                           std::shared_ptr<std::vector<uint8_t>> frame_blob, uint16_t width,
                           uint16_t height);
+  PrinterModel observed_model() const;
+  std::string observed_rtsp_url() const;
+  bool observed_signature_required() const;
   bool has_cached_frame() const;
   static bool read_exact(esp_tls_t* tls, void* buffer, size_t length);
   static bool write_all(esp_tls_t* tls, const void* buffer, size_t length);
@@ -61,6 +66,10 @@ class P1sCameraClient {
   P1sCameraSnapshot snapshot_{};
   mutable std::mutex config_mutex_{};
   PrinterConnection desired_connection_{};
+  mutable std::mutex observed_mutex_{};
+  PrinterModel observed_model_ = PrinterModel::kUnknown;
+  std::string observed_rtsp_url_{};
+  bool observed_signature_required_ = false;
   TaskHandle_t task_handle_ = nullptr;
   esp_tls_t* tls_ = nullptr;
   std::atomic<bool> network_ready_{false};

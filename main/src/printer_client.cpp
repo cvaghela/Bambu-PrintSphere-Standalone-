@@ -11,6 +11,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 
 namespace printsphere {
 
@@ -20,6 +21,10 @@ constexpr char kTag[] = "printsphere.printer";
 constexpr char kGetVersion[] = "{\"info\":{\"sequence_id\":\"0\",\"command\":\"get_version\"}}";
 constexpr char kPushAll[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\"}}";
 constexpr char kStartPush[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"start\"}}";
+
+uint64_t now_ms() {
+  return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+}
 
 std::string make_client_id() {
   char buffer[48] = {};
@@ -60,6 +65,340 @@ int json_int_local(const cJSON* object, const char* key, int fallback) {
     return std::atoi(item->valuestring);
   }
   return fallback;
+}
+
+float json_number_local(const cJSON* object, const char* key, float fallback) {
+  if (object == nullptr || key == nullptr) {
+    return fallback;
+  }
+
+  const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+  if (cJSON_IsNumber(item)) {
+    return static_cast<float>(item->valuedouble);
+  }
+  if (cJSON_IsString(item) && item->valuestring != nullptr) {
+    return static_cast<float>(std::atof(item->valuestring));
+  }
+  return fallback;
+}
+
+std::string json_string_local(const cJSON* object, const char* key,
+                              const std::string& fallback = {}) {
+  if (object == nullptr || key == nullptr) {
+    return fallback;
+  }
+
+  const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+  if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+    return fallback;
+  }
+  return item->valuestring;
+}
+
+const cJSON* child_object_local(const cJSON* object, const char* key) {
+  if (object == nullptr || key == nullptr) {
+    return nullptr;
+  }
+  const cJSON* child = cJSON_GetObjectItemCaseSensitive(object, key);
+  return cJSON_IsObject(child) ? child : nullptr;
+}
+
+const cJSON* child_array_local(const cJSON* object, const char* key) {
+  if (object == nullptr || key == nullptr) {
+    return nullptr;
+  }
+  const cJSON* child = cJSON_GetObjectItemCaseSensitive(object, key);
+  return cJSON_IsArray(child) ? child : nullptr;
+}
+
+std::string normalized_copy(std::string value) {
+  std::string normalized;
+  normalized.reserve(value.size());
+  for (const char ch : value) {
+    if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
+      normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+    }
+  }
+  return normalized;
+}
+
+PrinterModel model_from_product_name(const std::string& product_name) {
+  const std::string normalized = normalized_copy(product_name);
+  if (normalized.find("A1MINI") != std::string::npos) {
+    return PrinterModel::kA1Mini;
+  }
+  if (normalized.find("BAMBULABA1") != std::string::npos || normalized == "A1") {
+    return PrinterModel::kA1;
+  }
+  if (normalized.find("P1S") != std::string::npos) {
+    return PrinterModel::kP1S;
+  }
+  if (normalized.find("P1P") != std::string::npos) {
+    return PrinterModel::kP1P;
+  }
+  if (normalized.find("P2S") != std::string::npos) {
+    return PrinterModel::kP2S;
+  }
+  if (normalized.find("H2DPRO") != std::string::npos) {
+    return PrinterModel::kH2DPro;
+  }
+  if (normalized.find("H2D") != std::string::npos) {
+    return PrinterModel::kH2D;
+  }
+  if (normalized.find("H2S") != std::string::npos) {
+    return PrinterModel::kH2S;
+  }
+  if (normalized.find("H2C") != std::string::npos) {
+    return PrinterModel::kH2C;
+  }
+  if (normalized.find("X1E") != std::string::npos) {
+    return PrinterModel::kX1E;
+  }
+  if (normalized.find("X1CARBON") != std::string::npos || normalized.find("X1C") != std::string::npos) {
+    return PrinterModel::kX1C;
+  }
+  if (normalized.find("X1") != std::string::npos) {
+    return PrinterModel::kX1;
+  }
+  return PrinterModel::kUnknown;
+}
+
+PrinterModel detect_printer_model(const cJSON* modules, PrinterModel fallback) {
+  if (!cJSON_IsArray(modules)) {
+    return fallback;
+  }
+
+  const int count = cJSON_GetArraySize(modules);
+  for (int i = 0; i < count; ++i) {
+    const cJSON* module = cJSON_GetArrayItem(modules, i);
+    if (!cJSON_IsObject(module)) {
+      continue;
+    }
+
+    const PrinterModel model =
+        model_from_product_name(json_string_local(module, "product_name",
+                                                  json_string_local(module, "productName", {})));
+    if (model != PrinterModel::kUnknown) {
+      return model;
+    }
+  }
+
+  for (int i = 0; i < count; ++i) {
+    const cJSON* module = cJSON_GetArrayItem(modules, i);
+    if (!cJSON_IsObject(module)) {
+      continue;
+    }
+
+    const std::string hw_ver = json_string_local(module, "hw_ver", {});
+    const std::string project_name = json_string_local(module, "project_name", {});
+    if (hw_ver == "AP02") {
+      return PrinterModel::kX1E;
+    }
+    if (project_name == "N1") {
+      return PrinterModel::kA1Mini;
+    }
+    if (hw_ver == "AP04") {
+      if (project_name == "C11") {
+        return PrinterModel::kP1P;
+      }
+      if (project_name == "C12") {
+        return PrinterModel::kP1S;
+      }
+    }
+    if (hw_ver == "AP05") {
+      if (project_name == "N2S") {
+        return PrinterModel::kA1;
+      }
+      if (project_name.empty()) {
+        return PrinterModel::kX1C;
+      }
+    }
+  }
+
+  return fallback;
+}
+
+PrinterModel detect_printer_model_from_payload(const cJSON* object, PrinterModel fallback) {
+  if (!cJSON_IsObject(object)) {
+    return fallback;
+  }
+
+  const char* keys[] = {"product_name", "productName", "printer_model",
+                        "printerModel", "model",        "series"};
+  for (const char* key : keys) {
+    if (const PrinterModel model = model_from_product_name(json_string_local(object, key, {}));
+        model != PrinterModel::kUnknown) {
+      return model;
+    }
+  }
+
+  return fallback;
+}
+
+std::string extract_module_serial(const cJSON* modules, const std::string& fallback) {
+  if (!cJSON_IsArray(modules)) {
+    return fallback;
+  }
+
+  const int count = cJSON_GetArraySize(modules);
+  for (int i = 0; i < count; ++i) {
+    const cJSON* module = cJSON_GetArrayItem(modules, i);
+    if (!cJSON_IsObject(module)) {
+      continue;
+    }
+    const std::string serial =
+        json_string_local(module, "sn", json_string_local(module, "serial", {}));
+    if (!serial.empty()) {
+      return serial;
+    }
+  }
+
+  return fallback;
+}
+
+float packed_temp_current_value(int packed, float fallback) {
+  if (packed < 0) {
+    return fallback;
+  }
+  return static_cast<float>(packed & 0xFFFF);
+}
+
+float extract_bed_temperature_c(const cJSON* print, float fallback) {
+  const cJSON* device = child_object_local(print, "device");
+  if (const cJSON* bed_info = child_object_local(child_object_local(device, "bed"), "info");
+      bed_info != nullptr) {
+    const int packed = json_int_local(bed_info, "temp", -1);
+    if (packed >= 0) {
+      return packed_temp_current_value(packed, fallback);
+    }
+  }
+
+  const int packed = json_int_local(device, "bed_temp", -1);
+  if (packed >= 0) {
+    return packed_temp_current_value(packed, fallback);
+  }
+
+  return json_number_local(print, "bed_temper", fallback);
+}
+
+float extract_nozzle_temperature_c(const cJSON* print, float fallback) {
+  const float direct = json_number_local(print, "nozzle_temper", -1000.0f);
+  if (direct > -999.0f) {
+    return direct;
+  }
+
+  const cJSON* device = child_object_local(print, "device");
+  const cJSON* extruder = child_object_local(device, "extruder");
+  const int active_nozzle_index = std::max(json_int_local(extruder, "state", 0) >> 4, 0);
+
+  const auto pick_temp_from_info = [&](const cJSON* info_array) -> float {
+    if (!cJSON_IsArray(info_array)) {
+      return -1000.0f;
+    }
+
+    const int count = cJSON_GetArraySize(info_array);
+    float first_temp = -1000.0f;
+    for (int i = 0; i < count; ++i) {
+      const cJSON* item = cJSON_GetArrayItem(info_array, i);
+      if (!cJSON_IsObject(item)) {
+        continue;
+      }
+
+      const float temp = json_number_local(item, "temp", -1000.0f);
+      if (first_temp < -999.0f && temp > -999.0f) {
+        first_temp = temp;
+      }
+      if (json_int_local(item, "id", -1) == active_nozzle_index && temp > -999.0f) {
+        return temp;
+      }
+    }
+
+    return first_temp;
+  };
+
+  if (const float nozzle_temp =
+          pick_temp_from_info(child_array_local(child_object_local(device, "nozzle"), "info"));
+      nozzle_temp > -999.0f) {
+    return nozzle_temp;
+  }
+  if (const float extruder_temp = pick_temp_from_info(child_array_local(extruder, "info"));
+      extruder_temp > -999.0f) {
+    return extruder_temp;
+  }
+
+  return fallback;
+}
+
+float extract_progress_percent(const cJSON* print, float fallback) {
+  const char* keys[] = {"mc_percent", "percent", "progress", "task_progress", "print_progress"};
+  for (const char* key : keys) {
+    const float value = json_number_local(print, key, -1.0f);
+    if (value >= 0.0f) {
+      return value <= 1.0f ? (value * 100.0f) : value;
+    }
+  }
+  return fallback;
+}
+
+uint16_t extract_current_layer_local(const cJSON* print, uint16_t fallback) {
+  return static_cast<uint16_t>(std::max(
+      json_int_local(print, "layer_num",
+                     json_int_local(print, "current_layer",
+                                    json_int_local(print, "currentLayer", fallback))),
+      0));
+}
+
+uint16_t extract_total_layers_local(const cJSON* print, uint16_t fallback) {
+  return static_cast<uint16_t>(std::max(
+      json_int_local(print, "total_layer_num",
+                     json_int_local(print, "total_layers",
+                                    json_int_local(print, "totalLayers", fallback))),
+      0));
+}
+
+std::string extract_rtsp_url(const cJSON* print, const std::string& fallback) {
+  const cJSON* ipcam = child_object_local(print, "ipcam");
+  const std::string rtsp_url =
+      json_string_local(ipcam, "rtsp_url", json_string_local(ipcam, "rtspUrl", {}));
+  if (rtsp_url == "disable") {
+    return {};
+  }
+  if (!rtsp_url.empty()) {
+    return rtsp_url;
+  }
+  return fallback;
+}
+
+bool parse_signature_required(const cJSON* print, bool fallback) {
+  const std::string fun = json_string_local(print, "fun", {});
+  if (fun.empty()) {
+    return fallback;
+  }
+
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(fun.c_str(), &end, 16);
+  if (end == nullptr || *end != '\0') {
+    return fallback;
+  }
+
+  return (parsed & 0x20000000ULL) != 0ULL;
+}
+
+void update_local_source_metadata(PrinterSnapshot* snapshot, bool configured, bool connected) {
+  if (snapshot == nullptr) {
+    return;
+  }
+
+  snapshot->local_configured = configured;
+  snapshot->local_connected = connected;
+  snapshot->local_capabilities = default_local_capabilities_for_model(snapshot->local_model);
+  if (!snapshot->camera_rtsp_url.empty()) {
+    snapshot->local_capabilities.camera_rtsp = true;
+  }
+  if (snapshot->local_mqtt_signature_required) {
+    snapshot->local_capabilities.developer_mode_required = true;
+  }
+  snapshot->local_last_update_ms = now_ms();
 }
 
 uint32_t extract_remaining_seconds(const cJSON* print) {
@@ -266,6 +605,24 @@ std::string stage_label_from_id(int stage_id) {
       return "measuring_surface";
     case 58:
       return "thermal_preconditioning";
+    case 59:
+      return "homing_blade_holder";
+    case 60:
+      return "calibrating_camera_offset";
+    case 61:
+      return "calibrating_blade_holder_position";
+    case 62:
+      return "hotend_pick_place_test";
+    case 63:
+      return "waiting_chamber_temperature_equalize";
+    case 64:
+      return "preparing_hotend";
+    case 65:
+      return "calibrating_detection_nozzle_clumping";
+    case 66:
+      return "purifying_chamber_air";
+    case 77:
+      return "preparing_ams";
     case -1:
       return "idle";
     case 255:
@@ -398,6 +755,13 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       request_initial_sync();
 
       PrinterSnapshot snapshot = state_.snapshot();
+      std::string active_host;
+      std::string active_serial;
+      {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        active_host = active_connection_.host;
+        active_serial = active_connection_.serial;
+      }
       snapshot.connection = PrinterConnectionState::kOnline;
       snapshot.lifecycle = PrintLifecycleState::kUnknown;
       snapshot.raw_status.clear();
@@ -405,14 +769,11 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       snapshot.ui_status.clear();
       snapshot.stage = "connected";
       snapshot.detail = "Connected to local Bambu MQTT";
+      snapshot.resolved_serial = active_serial;
       snapshot.non_error_stop = false;
       snapshot.show_stop_banner = false;
+      update_local_source_metadata(&snapshot, true, true);
       state_.set_snapshot(std::move(snapshot));
-      std::string active_host;
-      {
-        std::lock_guard<std::mutex> lock(config_mutex_);
-        active_host = active_connection_.host;
-      }
       ESP_LOGI(kTag, "Connected to %s", active_host.c_str());
       break;
     }
@@ -427,6 +788,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       snapshot.detail = "MQTT disconnected, retrying";
       snapshot.non_error_stop = false;
       snapshot.show_stop_banner = false;
+      update_local_source_metadata(&snapshot, true, false);
       state_.set_snapshot(std::move(snapshot));
       ESP_LOGW(kTag, "MQTT disconnected");
       break;
@@ -502,6 +864,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         ESP_LOGE(kTag, "MQTT event error without details");
       }
 
+      update_local_source_metadata(&snapshot, true, false);
       state_.set_snapshot(std::move(snapshot));
       break;
     }
@@ -521,6 +884,11 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
   const cJSON* print = cJSON_GetObjectItemCaseSensitive(root, "print");
   if (cJSON_IsObject(print)) {
     PrinterSnapshot snapshot = state_.snapshot();
+    std::string active_serial;
+    {
+      std::lock_guard<std::mutex> lock(config_mutex_);
+      active_serial = active_connection_.serial;
+    }
     const std::string previous_raw_status = snapshot.raw_status;
     const std::string previous_raw_stage = snapshot.raw_stage;
     const std::string previous_stage = snapshot.stage;
@@ -553,13 +921,18 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     const bool has_stage_update = !resolved_stage.empty();
 
     snapshot.connection = PrinterConnectionState::kOnline;
-    snapshot.progress_percent = json_number(print, "mc_percent", snapshot.progress_percent);
-    snapshot.nozzle_temp_c = json_number(print, "nozzle_temper", snapshot.nozzle_temp_c);
-    snapshot.bed_temp_c = json_number(print, "bed_temper", snapshot.bed_temp_c);
-    snapshot.current_layer =
-        static_cast<uint16_t>(std::max(json_int(print, "layer_num", snapshot.current_layer), 0));
-    snapshot.total_layers = static_cast<uint16_t>(
-        std::max(json_int(print, "total_layer_num", snapshot.total_layers), 0));
+    snapshot.progress_percent = extract_progress_percent(print, snapshot.progress_percent);
+    snapshot.nozzle_temp_c = extract_nozzle_temperature_c(print, snapshot.nozzle_temp_c);
+    snapshot.bed_temp_c = extract_bed_temperature_c(print, snapshot.bed_temp_c);
+    snapshot.current_layer = extract_current_layer_local(print, snapshot.current_layer);
+    snapshot.total_layers = extract_total_layers_local(print, snapshot.total_layers);
+    snapshot.local_model = detect_printer_model_from_payload(print, snapshot.local_model);
+    snapshot.camera_rtsp_url = extract_rtsp_url(print, snapshot.camera_rtsp_url);
+    snapshot.local_mqtt_signature_required =
+        parse_signature_required(print, snapshot.local_mqtt_signature_required);
+    if (snapshot.resolved_serial.empty()) {
+      snapshot.resolved_serial = active_serial;
+    }
 
     const uint32_t remaining_seconds = extract_remaining_seconds(print);
     if (remaining_seconds > 0U) {
@@ -604,6 +977,12 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     if (paused_fault_latched) {
       snapshot.lifecycle = PrintLifecycleState::kError;
     }
+    if (remaining_seconds == 0U &&
+        (snapshot.lifecycle == PrintLifecycleState::kFinished ||
+         snapshot.lifecycle == PrintLifecycleState::kIdle ||
+         snapshot.lifecycle == PrintLifecycleState::kError)) {
+      snapshot.remaining_seconds = 0U;
+    }
     if (!snapshot.raw_stage.empty()) {
       snapshot.stage = snapshot.raw_stage;
     } else if (!snapshot.raw_status.empty()) {
@@ -626,6 +1005,10 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
       snapshot.detail = "Status payload received";
     } else {
       snapshot.detail = previous_detail;
+    }
+    update_local_source_metadata(&snapshot, true, true);
+    if (snapshot.local_mqtt_signature_required) {
+      snapshot.local_capabilities.developer_mode_required = true;
     }
 
     received_payload_ = true;
@@ -672,9 +1055,23 @@ void PrinterClient::handle_info_payload(const char* payload, size_t length) {
 
   PrinterSnapshot snapshot = state_.snapshot();
   snapshot.connection = PrinterConnectionState::kOnline;
-  if (snapshot.detail == "Connecting to local Bambu MQTT" || snapshot.detail.empty()) {
-    snapshot.detail = "Printer version info received";
+  std::string active_serial;
+  {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    active_serial = active_connection_.serial;
   }
+  const cJSON* modules = child_array_local(info, "module");
+  if (modules == nullptr) {
+    modules = child_array_local(info, "modules");
+  }
+  snapshot.local_model = detect_printer_model(
+      modules, detect_printer_model_from_payload(info, snapshot.local_model));
+  snapshot.resolved_serial =
+      extract_module_serial(modules, json_string(info, "sn", active_serial));
+  if (snapshot.detail == "Connecting to local Bambu MQTT" || snapshot.detail.empty()) {
+    snapshot.detail = std::string("Printer info received (") + to_string(snapshot.local_model) + ")";
+  }
+  update_local_source_metadata(&snapshot, true, true);
   state_.set_snapshot(std::move(snapshot));
   cJSON_Delete(root);
 }
@@ -736,6 +1133,8 @@ void PrinterClient::task_loop() {
       waiting.has_error = false;
       waiting.non_error_stop = false;
       waiting.show_stop_banner = false;
+      waiting.resolved_serial = connection.serial;
+      update_local_source_metadata(&waiting, true, false);
       state_.set_snapshot(std::move(waiting));
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
@@ -761,9 +1160,11 @@ void PrinterClient::task_loop() {
       snapshot.job_name.clear();
       snapshot.gcode_file.clear();
       snapshot.preview_hint.clear();
+      snapshot.resolved_serial = connection.serial;
       snapshot.has_error = false;
       snapshot.non_error_stop = false;
       snapshot.show_stop_banner = false;
+      update_local_source_metadata(&snapshot, true, false);
       state_.set_snapshot(std::move(snapshot));
 
       ESP_LOGI(kTag, "Connecting to printer MQTT %s:%u (serial=%s, user=%s)",
@@ -801,6 +1202,8 @@ void PrinterClient::task_loop() {
         failed.has_error = true;
         failed.non_error_stop = false;
         failed.show_stop_banner = false;
+        failed.resolved_serial = connection.serial;
+        update_local_source_metadata(&failed, true, false);
         state_.set_snapshot(std::move(failed));
         vTaskDelay(pdMS_TO_TICKS(1500));
         continue;
@@ -819,6 +1222,8 @@ void PrinterClient::task_loop() {
         failed.has_error = true;
         failed.non_error_stop = false;
         failed.show_stop_banner = false;
+        failed.resolved_serial = connection.serial;
+        update_local_source_metadata(&failed, true, false);
         state_.set_snapshot(std::move(failed));
         esp_mqtt_client_destroy(client_);
         client_ = nullptr;
@@ -856,6 +1261,8 @@ void PrinterClient::set_waiting_snapshot(const PrinterConnection& connection) {
     snapshot.stage = "ready";
     snapshot.detail = "Printer credentials loaded";
   }
+  snapshot.resolved_serial = connection.serial;
+  update_local_source_metadata(&snapshot, connection.is_ready(), false);
   state_.set_snapshot(std::move(snapshot));
 }
 

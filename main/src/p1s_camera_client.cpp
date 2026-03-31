@@ -104,6 +104,28 @@ P1sCameraSnapshot P1sCameraClient::snapshot() const {
   return snapshot_;
 }
 
+void P1sCameraClient::observe_printer_snapshot(const PrinterSnapshot& snapshot) {
+  std::lock_guard<std::mutex> lock(observed_mutex_);
+  observed_model_ = snapshot.local_model;
+  observed_rtsp_url_ = snapshot.camera_rtsp_url;
+  observed_signature_required_ = snapshot.local_mqtt_signature_required;
+}
+
+PrinterModel P1sCameraClient::observed_model() const {
+  std::lock_guard<std::mutex> lock(observed_mutex_);
+  return observed_model_;
+}
+
+std::string P1sCameraClient::observed_rtsp_url() const {
+  std::lock_guard<std::mutex> lock(observed_mutex_);
+  return observed_rtsp_url_;
+}
+
+bool P1sCameraClient::observed_signature_required() const {
+  std::lock_guard<std::mutex> lock(observed_mutex_);
+  return observed_signature_required_;
+}
+
 void P1sCameraClient::task_entry(void* context) {
   static_cast<P1sCameraClient*>(context)->task_loop();
 }
@@ -408,6 +430,36 @@ void P1sCameraClient::task_loop() {
       continue;
     }
     idle_notified_ = false;
+
+    const PrinterModel model = observed_model();
+    const std::string rtsp_url = observed_rtsp_url();
+    const bool signature_required = observed_signature_required();
+    const bool rtsp_camera = printer_model_has_rtsp_camera(model) || !rtsp_url.empty();
+    const bool jpeg_camera =
+        !rtsp_camera && (model == PrinterModel::kUnknown || printer_model_has_jpeg_camera(model));
+    if (rtsp_camera) {
+      disconnect();
+
+      std::string detail;
+      if (signature_required) {
+        detail = "Enable Developer Mode for RTSP live view";
+      } else if (rtsp_url.empty()) {
+        detail = "RTSP live view disabled on printer";
+      } else {
+        detail = "RTSP live view not supported yet on this model";
+      }
+
+      set_frame_snapshot(true, true, false, detail.c_str(), nullptr, 0, 0);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+    if (!jpeg_camera) {
+      disconnect();
+      set_frame_snapshot(true, true, false, "Live camera not available on this model", nullptr, 0,
+                         0);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
 
     const int64_t now_us = esp_timer_get_time();
     const bool due = last_fetch_us != 0 && (now_us - last_fetch_us) >= kAutoRefreshIntervalUs;

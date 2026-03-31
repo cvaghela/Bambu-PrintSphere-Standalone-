@@ -20,6 +20,9 @@ namespace printsphere {
 struct BambuCloudSnapshot {
   bool configured = false;
   bool connected = false;
+  uint64_t last_update_ms = 0;
+  PrinterModel model = PrinterModel::kUnknown;
+  SourceCapabilities capabilities{};
   std::string detail = "Cloud login not configured";
   std::string preview_url;
   std::shared_ptr<std::vector<uint8_t>> preview_blob;

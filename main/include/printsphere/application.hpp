@@ -29,7 +29,7 @@ class Application {
   bool print_activity_seen_this_session_ = false;
   bool last_local_print_live_ = false;
   TickType_t stop_banner_until_tick_ = 0;
-  StatusSourcePreference status_source_preference_ = StatusSourcePreference::kCloud;
+  SourceMode source_mode_ = SourceMode::kHybrid;
 };
 
 }  // namespace printsphere

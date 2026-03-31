@@ -12,7 +12,7 @@ void resolve_ui_state(PrinterSnapshot& snapshot);
 
 PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool local_printer_enabled,
                                      const BambuCloudSnapshot& cloud_snapshot,
-                                     StatusSourcePreference status_source_preference,
+                                     SourceMode source_mode, uint64_t now_ms,
                                      bool wifi_connected, const std::string& wifi_ip,
                                      bool print_activity_seen_this_session);
 

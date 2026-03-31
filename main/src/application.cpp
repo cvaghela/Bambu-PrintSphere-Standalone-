@@ -3,6 +3,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "printsphere/status_resolver.hpp"
@@ -60,7 +61,7 @@ void Application::run() {
   ESP_ERROR_CHECK(ui_.initialize());
 
   const BambuCloudCredentials cloud_credentials = config_store_.load_cloud_credentials();
-  status_source_preference_ = config_store_.load_status_source_preference();
+  source_mode_ = config_store_.load_source_mode();
   const PrinterConnection printer_connection = config_store_.load_printer_config();
   cloud_client_.configure(cloud_credentials, printer_connection.serial);
   ESP_ERROR_CHECK(cloud_client_.start());
@@ -74,8 +75,10 @@ void Application::run() {
 
   while (true) {
     const TickType_t now_tick = xTaskGetTickCount();
+    const uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
     const bool wifi_connected = wifi_manager_.is_station_connected();
     const std::string wifi_ip = wifi_manager_.station_ip();
+    source_mode_ = config_store_.load_source_mode();
     cloud_client_.set_network_ready(wifi_connected);
     printer_client_.set_network_ready(wifi_connected);
     camera_client_.set_network_ready(wifi_connected);
@@ -88,6 +91,7 @@ void Application::run() {
     local_snapshot.setup_ap_ssid = wifi_manager_.setup_access_point_ssid();
     local_snapshot.setup_ap_password = wifi_manager_.setup_access_point_password();
     local_snapshot.setup_ap_ip = wifi_manager_.setup_access_point_ip();
+    camera_client_.observe_printer_snapshot(local_snapshot);
     if (last_local_print_live_ && local_snapshot.non_error_stop) {
       stop_banner_until_tick_ = now_tick + kStopBannerDuration;
     } else if (!local_snapshot.non_error_stop) {
@@ -103,7 +107,7 @@ void Application::run() {
     }
     PrinterSnapshot snapshot =
         merge_status_sources(local_snapshot, local_printer_enabled_, cloud_snapshot,
-                             status_source_preference_, wifi_connected, wifi_ip,
+                             source_mode_, now_ms, wifi_connected, wifi_ip,
                              print_activity_seen_this_session_);
     snapshot.setup_ap_active = local_snapshot.setup_ap_active;
     snapshot.setup_ap_ssid = local_snapshot.setup_ap_ssid;
@@ -122,7 +126,8 @@ void Application::run() {
 
     const bool preview_page_active = ui_.is_page2_active();
     const bool camera_enabled =
-        local_printer_enabled_ && wifi_connected && ui_.is_camera_page_active() &&
+        source_mode_ != SourceMode::kCloudOnly && local_printer_enabled_ && wifi_connected &&
+        ui_.is_camera_page_active() &&
         ui_.screen_power_mode() != ScreenPowerMode::kOff;
     camera_client_.set_enabled(camera_enabled);
     if (ui_.consume_camera_refresh_request()) {
@@ -130,11 +135,22 @@ void Application::run() {
     }
 
     const P1sCameraSnapshot camera_snapshot = camera_client_.snapshot();
-    snapshot.camera_connected = camera_snapshot.connected;
-    snapshot.camera_detail = camera_snapshot.detail;
-    snapshot.camera_blob = camera_snapshot.frame_blob;
-    snapshot.camera_width = camera_snapshot.width;
-    snapshot.camera_height = camera_snapshot.height;
+    if (source_mode_ == SourceMode::kCloudOnly || !local_printer_enabled_) {
+      snapshot.camera_connected = false;
+      snapshot.camera_detail = source_mode_ == SourceMode::kCloudOnly
+                                   ? "Local camera disabled in cloud-only mode"
+                                   : "Local camera not configured";
+      snapshot.camera_blob.reset();
+      snapshot.camera_width = 0;
+      snapshot.camera_height = 0;
+      snapshot.camera_source = FieldSource::kNone;
+    } else {
+      snapshot.camera_connected = camera_snapshot.connected;
+      snapshot.camera_detail = camera_snapshot.detail;
+      snapshot.camera_blob = camera_snapshot.frame_blob;
+      snapshot.camera_width = camera_snapshot.width;
+      snapshot.camera_height = camera_snapshot.height;
+    }
 
     resolve_ui_state(snapshot);
     ui_.apply_snapshot(snapshot);
@@ -142,7 +158,8 @@ void Application::run() {
 
     const bool on_battery = power.available && power.battery_present && !power.usb_present;
     const bool camera_page_active = ui_.is_camera_page_active();
-    cloud_client_.set_preview_fetch_enabled(preview_page_active);
+    cloud_client_.set_preview_fetch_enabled(source_mode_ != SourceMode::kLocalOnly &&
+                                            preview_page_active);
     const bool keep_screen_awake = snapshot.print_active || camera_page_active;
     ui_.update_power_save(on_battery, keep_screen_awake);
 

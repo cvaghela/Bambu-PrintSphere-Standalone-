@@ -49,18 +49,28 @@ uint32_t parse_color_or_default(const std::string& value, uint32_t fallback) {
 }
 }
 
-const char* to_string(StatusSourcePreference preference) {
-  switch (preference) {
-    case StatusSourcePreference::kLocal:
-      return "local";
-    case StatusSourcePreference::kCloud:
+const char* to_string(SourceMode mode) {
+  switch (mode) {
+    case SourceMode::kCloudOnly:
+      return "cloud_only";
+    case SourceMode::kLocalOnly:
+      return "local_only";
+    case SourceMode::kHybrid:
     default:
-      return "cloud";
+      return "hybrid";
   }
 }
 
-StatusSourcePreference parse_status_source_preference(const std::string& value) {
-  return value == "local" ? StatusSourcePreference::kLocal : StatusSourcePreference::kCloud;
+SourceMode parse_source_mode(const std::string& value) {
+  if (value == "cloud_only") {
+    return SourceMode::kCloudOnly;
+  }
+  if (value == "local_only") {
+    return SourceMode::kLocalOnly;
+  }
+
+  // Legacy values from the old "primary source" setting are treated as hybrid mode.
+  return SourceMode::kHybrid;
 }
 
 esp_err_t ConfigStore::initialize() {
@@ -97,8 +107,12 @@ std::string ConfigStore::load_cloud_access_token() const {
   return load_string("cloud_token");
 }
 
-StatusSourcePreference ConfigStore::load_status_source_preference() const {
-  return parse_status_source_preference(load_string("state_source"));
+SourceMode ConfigStore::load_source_mode() const {
+  std::string value = load_string("source_mode");
+  if (value.empty()) {
+    value = load_string("state_source");
+  }
+  return parse_source_mode(value);
 }
 
 PrinterConnection ConfigStore::load_printer_config() const {
@@ -165,8 +179,9 @@ esp_err_t ConfigStore::clear_cloud_access_token() const {
   return save_string("cloud_token", "");
 }
 
-esp_err_t ConfigStore::save_status_source_preference(StatusSourcePreference preference) const {
-  return save_string("state_source", to_string(preference));
+esp_err_t ConfigStore::save_source_mode(SourceMode mode) const {
+  ESP_RETURN_ON_ERROR(save_string("source_mode", to_string(mode)), kTag, "save source mode failed");
+  return save_string("state_source", "");
 }
 
 esp_err_t ConfigStore::save_printer_config(const PrinterConnection& connection) const {

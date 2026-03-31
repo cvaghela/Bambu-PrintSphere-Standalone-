@@ -187,6 +187,111 @@ int lifecycle_priority(PrintLifecycleState lifecycle) {
   }
 }
 
+uint64_t now_ms() {
+  return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+}
+
+std::string normalized_copy(std::string value) {
+  std::string normalized;
+  normalized.reserve(value.size());
+  for (const char ch : value) {
+    if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
+      normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+    }
+  }
+  return normalized;
+}
+
+PrinterModel model_from_product_name(const std::string& product_name) {
+  const std::string normalized = normalized_copy(product_name);
+  if (normalized.find("A1MINI") != std::string::npos) {
+    return PrinterModel::kA1Mini;
+  }
+  if (normalized.find("BAMBULABA1") != std::string::npos || normalized == "A1") {
+    return PrinterModel::kA1;
+  }
+  if (normalized.find("P1S") != std::string::npos) {
+    return PrinterModel::kP1S;
+  }
+  if (normalized.find("P1P") != std::string::npos) {
+    return PrinterModel::kP1P;
+  }
+  if (normalized.find("P2S") != std::string::npos) {
+    return PrinterModel::kP2S;
+  }
+  if (normalized.find("H2DPRO") != std::string::npos) {
+    return PrinterModel::kH2DPro;
+  }
+  if (normalized.find("H2D") != std::string::npos) {
+    return PrinterModel::kH2D;
+  }
+  if (normalized.find("H2S") != std::string::npos) {
+    return PrinterModel::kH2S;
+  }
+  if (normalized.find("H2C") != std::string::npos) {
+    return PrinterModel::kH2C;
+  }
+  if (normalized.find("X1E") != std::string::npos) {
+    return PrinterModel::kX1E;
+  }
+  if (normalized.find("X1CARBON") != std::string::npos || normalized.find("X1C") != std::string::npos) {
+    return PrinterModel::kX1C;
+  }
+  if (normalized.find("X1") != std::string::npos) {
+    return PrinterModel::kX1;
+  }
+  return PrinterModel::kUnknown;
+}
+
+std::string json_string_local(const cJSON* object, const char* key,
+                              const std::string& fallback = {}) {
+  if (object == nullptr || key == nullptr) {
+    return fallback;
+  }
+
+  const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+  if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+    return fallback;
+  }
+  return item->valuestring;
+}
+
+const cJSON* child_object_local(const cJSON* object, const char* key) {
+  if (object == nullptr || key == nullptr) {
+    return nullptr;
+  }
+  const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+  return cJSON_IsObject(item) ? item : nullptr;
+}
+
+PrinterModel detect_cloud_model(const cJSON* item, PrinterModel fallback) {
+  if (item == nullptr) {
+    return fallback;
+  }
+
+  const cJSON* print_history = child_object_local(item, "print_history_info") != nullptr
+                                   ? child_object_local(item, "print_history_info")
+                                   : child_object_local(item, "printHistoryInfo");
+  const cJSON* subtask = print_history != nullptr ? child_object_local(print_history, "subtask") : nullptr;
+  const char* keys[] = {"dev_product_name", "device_name",  "product_name", "productName",
+                        "printer_type",     "printerType",  "model",        "series",
+                        "name"};
+
+  for (const cJSON* source : {item, print_history, subtask}) {
+    if (source == nullptr) {
+      continue;
+    }
+    for (const char* key : keys) {
+      if (const PrinterModel model = model_from_product_name(json_string_local(source, key, {}));
+          model != PrinterModel::kUnknown) {
+        return model;
+      }
+    }
+  }
+
+  return fallback;
+}
+
 }  // namespace
 
 void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string printer_serial) {
@@ -216,6 +321,7 @@ void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string 
   } else {
     snapshot.detail = "Waiting for Wi-Fi for Bambu Cloud";
   }
+  snapshot.capabilities = default_cloud_capabilities();
   snapshot.resolved_serial = requested_serial_;
   set_snapshot(std::move(snapshot));
 }
@@ -684,6 +790,12 @@ bool BambuCloudClient::fetch_bindings() {
 
   BambuCloudSnapshot current = snapshot();
   current.configured = true;
+  current.capabilities = default_cloud_capabilities();
+  current.last_update_ms = now_ms();
+  current.connected = true;
+  if (current.detail.empty() || current.detail == "Restored Bambu Cloud session") {
+    current.detail = "Connected to Bambu Cloud";
+  }
   if (!best_serial.empty()) {
     const bool serial_changed = best_serial != current.resolved_serial;
     resolved_serial_ = best_serial;
@@ -694,6 +806,7 @@ bool BambuCloudClient::fetch_bindings() {
   }
 
   if (best_device != nullptr) {
+    current.model = detect_cloud_model(best_device, current.model);
     const bool printer_online = json_bool(best_device, "online", true);
     const std::string print_status =
         json_string(best_device, "print_status",
@@ -879,6 +992,8 @@ bool BambuCloudClient::fetch_latest_preview() {
   }
 
   BambuCloudSnapshot current = snapshot();
+  current.capabilities = default_cloud_capabilities();
+  current.last_update_ms = now_ms();
   const bool selected_has_state = !selected_status.empty() ||
                                   selected_lifecycle != PrintLifecycleState::kUnknown ||
                                   selected_progress > 0.0f || selected_remaining_seconds > 0U ||
@@ -888,6 +1003,7 @@ bool BambuCloudClient::fetch_latest_preview() {
                                                             : "Connected to Bambu Cloud";
   current.configured = true;
   current.connected = true;
+  current.model = detect_cloud_model(selected_item, current.model);
   if (current.detail.empty() || current.detail == "Connected to Bambu Cloud" ||
       current.detail == "Connected to Bambu Cloud, no cover image yet") {
     current.detail = preview_detail;
@@ -1345,6 +1461,10 @@ bool BambuCloudClient::perform_json_request(const std::string& url, const char* 
 }
 
 void BambuCloudClient::set_snapshot(BambuCloudSnapshot snapshot) {
+  if (!snapshot.capabilities.status && !snapshot.capabilities.metrics &&
+      !snapshot.capabilities.preview) {
+    snapshot.capabilities = default_cloud_capabilities();
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   snapshot_ = std::move(snapshot);
 }
