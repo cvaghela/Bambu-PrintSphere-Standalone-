@@ -19,7 +19,6 @@ set(RELEASE_INITIAL_FLASH_PACKAGER "${CMAKE_SOURCE_DIR}/tools/package_initial_fl
 
 add_custom_target(
     release_initial_flash
-    ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "${RELEASE_INITIAL_FLASH_DIR}"
     COMMAND ${Python3_EXECUTABLE} "${RELEASE_INITIAL_FLASH_PACKAGER}"
             --build-dir "${CMAKE_BINARY_DIR}"
