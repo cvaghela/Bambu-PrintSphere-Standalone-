@@ -28,6 +28,7 @@ class Application {
   bool local_printer_enabled_ = false;
   bool print_activity_seen_this_session_ = false;
   bool last_local_print_live_ = false;
+  bool last_cloud_print_live_ = false;
   TickType_t stop_banner_until_tick_ = 0;
   SourceMode source_mode_ = SourceMode::kHybrid;
   SourceMode last_source_mode_ = SourceMode::kHybrid;

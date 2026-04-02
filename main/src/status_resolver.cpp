@@ -473,16 +473,16 @@ void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& lo
 void apply_cloud_error_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
   target.print_error_code = cloud_snapshot.print_error_code;
   target.hms_alert_count = cloud_snapshot.hms_alert_count;
-  target.non_error_stop = false;
+  target.non_error_stop = cloud_snapshot.non_error_stop;
   target.show_stop_banner = false;
   if ((cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
-       cloud_snapshot.has_error) &&
+       cloud_snapshot.has_error || cloud_snapshot.non_error_stop) &&
       !cloud_snapshot.detail.empty()) {
     target.detail = cloud_snapshot.detail;
   }
   if (target.status_source == FieldSource::kNone &&
       (cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
-       cloud_snapshot.has_error)) {
+       cloud_snapshot.has_error || cloud_snapshot.non_error_stop)) {
     apply_cloud_status_bundle(target, cloud_snapshot);
   }
 }
@@ -710,7 +710,7 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
                       local_snapshot.non_error_stop || local_snapshot.has_error);
   const bool cloud_error_usable =
       cloud_fresh && (cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
-                      cloud_snapshot.has_error);
+                      cloud_snapshot.has_error || cloud_snapshot.non_error_stop);
 
   if (local_status_usable) {
     snapshot.status_source = FieldSource::kLocal;

@@ -228,6 +228,57 @@ bool is_recent_optimistic_light_state(uint64_t last_update_ms) {
   return (current_ms - last_update_ms) <= kCloudOptimisticLightMs;
 }
 
+bool cloud_status_is_non_error_stop(std::string_view status_text, int print_error_code, int hms_count) {
+  if (status_text.empty() || print_error_code != 0 || hms_count > 0) {
+    return false;
+  }
+
+  std::string normalized;
+  normalized.reserve(status_text.size());
+  for (const char ch : status_text) {
+    if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
+      normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+    }
+  }
+
+  return normalized.find("FAIL") != std::string::npos ||
+         normalized.find("CANCEL") != std::string::npos;
+}
+
+bool cloud_rest_failure_looks_stale(std::string_view status_text, std::string_view stage_text,
+                                    std::string_view print_type, int hms_count) {
+  if (status_text.empty() || hms_count > 0) {
+    return false;
+  }
+
+  auto normalize = [](std::string_view value) {
+    std::string normalized;
+    normalized.reserve(value.size());
+    for (const char ch : value) {
+      if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
+        normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+      }
+    }
+    return normalized;
+  };
+
+  const std::string normalized_status = normalize(status_text);
+  const bool failed_status = normalized_status.find("FAIL") != std::string::npos ||
+                             normalized_status.find("ERROR") != std::string::npos ||
+                             normalized_status.find("CANCEL") != std::string::npos;
+  if (!failed_status) {
+    return false;
+  }
+
+  const std::string normalized_stage = normalize(stage_text);
+  const std::string normalized_type = normalize(print_type);
+  const bool idle_stage = normalized_stage.find("IDLE") != std::string::npos ||
+                          normalized_stage.find("READY") != std::string::npos;
+  const bool idle_type =
+      normalized_type == "IDLE" || (normalized_stage.empty() && normalized_type == "CLOUD");
+  return idle_stage || idle_type;
+}
+
 bool split_jwt_payload(const std::string& token, std::string* payload_b64) {
   if (payload_b64 == nullptr) {
     return false;
@@ -1372,7 +1423,10 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     current.print_error_code = extract_cloud_print_error_code(print, current.print_error_code);
     current.hms_alert_count = static_cast<uint16_t>(
         std::max(extract_cloud_hms_count(print, current.hms_alert_count), 0));
-    current.has_error = current.lifecycle == PrintLifecycleState::kError ||
+    current.non_error_stop =
+        cloud_status_is_non_error_stop(status_text, current.print_error_code, current.hms_alert_count);
+    current.has_error = (!current.non_error_stop &&
+                         current.lifecycle == PrintLifecycleState::kError) ||
                         current.print_error_code != 0 || current.hms_alert_count > 0U;
     const bool saw_light_report =
         apply_chamber_light_report(print, &current.chamber_light_supported,
@@ -2004,23 +2058,43 @@ bool BambuCloudClient::fetch_bindings() {
     const std::string current_stage =
         json_string(best_device, "current_stage",
                     json_string(best_device, "currentStage", json_string(best_device, "stage", {})));
+    const std::string print_type =
+        json_string(best_device, "print_type", json_string(best_device, "printType", {}));
     const float progress_value =
         json_number(best_device, "mc_percent", json_number(best_device, "progress", -1.0f));
     const int remaining_minutes =
         json_int(best_device, "mc_remaining_time",
                  json_int(best_device, "remaining_time", json_int(best_device, "remainingMinutes", -1)));
-    const PrintLifecycleState lifecycle = cloud_lifecycle_from_status(print_status);
-    const std::string lifecycle_stage = cloud_stage_label_for(print_status, lifecycle);
-    const std::string stage = !current_stage.empty() ? current_stage : lifecycle_stage;
     const NozzleTemperatureBundle nozzle_temps =
         extract_cloud_nozzle_temperature_bundle(best_device, current.nozzle_temp_c,
                                                current.secondary_nozzle_temp_c);
     const float bed_temp_c = extract_cloud_bed_temperature_c(best_device, current.bed_temp_c);
     const float chamber_temp_c =
         extract_cloud_chamber_temperature_c(best_device, current.chamber_temp_c);
-    const int print_error_code = extract_cloud_print_error_code(best_device, current.print_error_code);
+    int print_error_code = extract_cloud_print_error_code(best_device, current.print_error_code);
     const int hms_count = extract_cloud_hms_count(best_device, current.hms_alert_count);
-    const std::string error_detail = format_error_detail(print_error_code, hms_count);
+    std::string effective_status = print_status;
+    std::string effective_stage = current_stage;
+    float effective_progress_value = progress_value;
+    int effective_remaining_minutes = remaining_minutes;
+    const bool stale_failed_state =
+        cloud_rest_failure_looks_stale(print_status, current_stage, print_type, hms_count);
+    if (stale_failed_state) {
+      effective_status = "IDLE";
+      if (effective_stage.empty()) {
+        effective_stage = "Idle";
+      }
+      effective_progress_value = 0.0f;
+      effective_remaining_minutes = 0;
+      print_error_code = 0;
+    }
+    const PrintLifecycleState lifecycle = cloud_lifecycle_from_status(effective_status);
+    const std::string lifecycle_stage = cloud_stage_label_for(effective_status, lifecycle);
+    const std::string stage = !effective_stage.empty() ? effective_stage : lifecycle_stage;
+    const bool non_error_stop =
+        cloud_status_is_non_error_stop(effective_status, print_error_code, hms_count);
+    const std::string error_detail =
+        stale_failed_state ? std::string{} : format_error_detail(print_error_code, hms_count);
 
     current.connected = true;
     if (current.detail.empty() || current.detail == "Restored Bambu Cloud session" ||
@@ -2036,26 +2110,29 @@ bool BambuCloudClient::fetch_bindings() {
       current.chamber_temp_c = chamber_temp_c;
       current.print_error_code = print_error_code;
       current.hms_alert_count = static_cast<uint16_t>(std::max(hms_count, 0));
+      current.non_error_stop = non_error_stop;
 
-      if (progress_value >= 0.0f) {
+      if (effective_progress_value >= 0.0f) {
         current.progress_percent =
-            progress_value <= 1.0f ? (progress_value * 100.0f) : progress_value;
+            effective_progress_value <= 1.0f ? (effective_progress_value * 100.0f)
+                                             : effective_progress_value;
       }
-      if (remaining_minutes >= 0) {
-        current.remaining_seconds = static_cast<uint32_t>(remaining_minutes) * 60U;
+      if (effective_remaining_minutes >= 0) {
+        current.remaining_seconds = static_cast<uint32_t>(effective_remaining_minutes) * 60U;
       }
 
-      if (!print_status.empty()) {
+      if (!effective_status.empty()) {
         if (stage != current.stage || lifecycle != current.lifecycle ||
-            current_stage != current.raw_stage) {
-          ESP_LOGI(kTag, "Cloud printer state: %s", print_status.c_str());
+            effective_stage != current.raw_stage) {
+          ESP_LOGI(kTag, "Cloud printer state: %s", effective_status.c_str());
         }
-        current.raw_status = print_status;
-        current.raw_stage = current_stage;
+        current.raw_status = effective_status;
+        current.raw_stage = effective_stage;
         current.lifecycle = lifecycle;
         current.stage = stage;
         current.has_error =
-            lifecycle == PrintLifecycleState::kError || print_error_code != 0 || hms_count > 0;
+            ((!non_error_stop && lifecycle == PrintLifecycleState::kError) || print_error_code != 0 ||
+             hms_count > 0);
         if (lifecycle == PrintLifecycleState::kFinished && current.progress_percent < 100.0f) {
           current.progress_percent = 100.0f;
         }
@@ -2063,9 +2140,9 @@ bool BambuCloudClient::fetch_bindings() {
             lifecycle == PrintLifecycleState::kError) {
           current.remaining_seconds = 0U;
         }
-      } else if (!current_stage.empty()) {
-        current.raw_stage = current_stage;
-        current.stage = current_stage;
+      } else if (!effective_stage.empty()) {
+        current.raw_stage = effective_stage;
+        current.stage = effective_stage;
       }
 
       if (!error_detail.empty()) {
@@ -2087,12 +2164,13 @@ bool BambuCloudClient::fetch_bindings() {
       if (current.chamber_temp_c <= 0.0f && chamber_temp_c > 0.0f) {
         current.chamber_temp_c = chamber_temp_c;
       }
-      if (current.progress_percent <= 0.0f && progress_value >= 0.0f) {
+      if (current.progress_percent <= 0.0f && effective_progress_value >= 0.0f) {
         current.progress_percent =
-            progress_value <= 1.0f ? (progress_value * 100.0f) : progress_value;
+            effective_progress_value <= 1.0f ? (effective_progress_value * 100.0f)
+                                             : effective_progress_value;
       }
-      if (current.remaining_seconds == 0U && remaining_minutes >= 0) {
-        current.remaining_seconds = static_cast<uint32_t>(remaining_minutes) * 60U;
+      if (current.remaining_seconds == 0U && effective_remaining_minutes >= 0) {
+        current.remaining_seconds = static_cast<uint32_t>(effective_remaining_minutes) * 60U;
       }
       const uint16_t current_layer = extract_current_layer(best_device);
       if (current.current_layer == 0U && current_layer > 0U) {
@@ -2101,31 +2179,6 @@ bool BambuCloudClient::fetch_bindings() {
       const uint16_t total_layers = extract_total_layers(best_device);
       if (current.total_layers == 0U && total_layers > 0U) {
         current.total_layers = total_layers;
-      }
-      if ((current.raw_status.empty() || current.lifecycle == PrintLifecycleState::kUnknown) &&
-          !print_status.empty()) {
-        current.raw_status = print_status;
-        current.raw_stage = current_stage;
-        current.lifecycle = lifecycle;
-        current.stage = stage;
-      } else if (current.stage.empty() && !current_stage.empty()) {
-        current.raw_stage = current_stage;
-        current.stage = current_stage;
-      }
-      if (current.print_error_code == 0 && print_error_code != 0) {
-        current.print_error_code = print_error_code;
-      }
-      if (current.hms_alert_count == 0U && hms_count > 0) {
-        current.hms_alert_count = static_cast<uint16_t>(hms_count);
-      }
-      if (!current.has_error &&
-          (lifecycle == PrintLifecycleState::kError || print_error_code != 0 || hms_count > 0)) {
-        current.has_error = true;
-      }
-      if ((current.detail.empty() || current.detail == "Connected to Bambu Cloud" ||
-           current.detail == "Connected to Bambu Cloud, no cover image yet") &&
-          !error_detail.empty()) {
-        current.detail = error_detail;
       }
     }
   }
@@ -2207,7 +2260,14 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
       }
 
       const std::string candidate_status = extract_status_text(item);
-      const PrintLifecycleState candidate_lifecycle = cloud_lifecycle_from_status(candidate_status);
+      const std::string candidate_stage = extract_stage_text(item);
+      const std::string candidate_print_type = extract_print_type_text(item);
+      const int candidate_hms_count = extract_cloud_hms_count(item, 0);
+      const bool candidate_stale_failed_state = cloud_rest_failure_looks_stale(
+          candidate_status, candidate_stage, candidate_print_type, candidate_hms_count);
+      const PrintLifecycleState candidate_lifecycle =
+          candidate_stale_failed_state ? PrintLifecycleState::kIdle
+                                       : cloud_lifecycle_from_status(candidate_status);
       const int candidate_priority = lifecycle_priority(candidate_lifecycle);
       const std::string candidate_cover = extract_cover_url(item);
       const std::string candidate_title = extract_title(item);
@@ -2262,6 +2322,7 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
     selected_title = extract_title(selected_item);
     selected_status = extract_status_text(selected_item);
     selected_stage = extract_stage_text(selected_item);
+    const std::string selected_print_type = extract_print_type_text(selected_item);
     selected_progress = extract_progress(selected_item);
     const NozzleTemperatureBundle nozzle_temps =
         extract_cloud_nozzle_temperature_bundle(selected_item, 0.0f, 0.0f);
@@ -2274,10 +2335,25 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
     selected_total_layers = extract_total_layers(selected_item);
     selected_print_error_code = extract_cloud_print_error_code(selected_item, 0);
     selected_hms_count = extract_cloud_hms_count(selected_item, 0);
+    const bool selected_stale_failed_state = cloud_rest_failure_looks_stale(
+        selected_status, selected_stage, selected_print_type, selected_hms_count);
+    if (selected_stale_failed_state) {
+      selected_status = "IDLE";
+      if (selected_stage.empty()) {
+        selected_stage = "Idle";
+      }
+      selected_progress = 0.0f;
+      selected_remaining_seconds = 0U;
+      selected_current_layer = 0U;
+      selected_total_layers = 0U;
+      selected_print_error_code = 0;
+    }
     selected_lifecycle = cloud_lifecycle_from_status(selected_status);
+    const bool selected_non_error_stop =
+        cloud_status_is_non_error_stop(selected_status, selected_print_error_code, selected_hms_count);
     selected_has_error =
-        selected_lifecycle == PrintLifecycleState::kError || selected_print_error_code != 0 ||
-        selected_hms_count > 0;
+        ((!selected_non_error_stop && selected_lifecycle == PrintLifecycleState::kError) ||
+         selected_print_error_code != 0 || selected_hms_count > 0);
     if (selected_lifecycle == PrintLifecycleState::kFinished && selected_progress < 100.0f) {
       selected_progress = 100.0f;
     }
@@ -2409,6 +2485,8 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
       }
       current.print_error_code = selected_print_error_code;
       current.hms_alert_count = static_cast<uint16_t>(std::max(selected_hms_count, 0));
+      current.non_error_stop =
+          cloud_status_is_non_error_stop(selected_status, selected_print_error_code, selected_hms_count);
       current.has_error = current.has_error || selected_has_error;
       const std::string error_detail =
           format_error_detail(selected_print_error_code, selected_hms_count);
@@ -2416,14 +2494,6 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
         current.detail = error_detail;
       }
     } else {
-      if ((current.raw_status.empty() || current.lifecycle == PrintLifecycleState::kUnknown) &&
-          !selected_status.empty()) {
-        current.raw_status = selected_status;
-        current.raw_stage = selected_stage;
-        current.lifecycle = selected_lifecycle;
-        current.stage = !selected_stage.empty() ? selected_stage
-                                                : cloud_stage_label_for(selected_status, selected_lifecycle);
-      }
       if (current.progress_percent <= 0.0f && selected_progress > 0.0f) {
         current.progress_percent = selected_progress;
       }
@@ -2448,24 +2518,10 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
       if (current.chamber_temp_c <= 0.0f && selected_chamber_temp_c > 0.0f) {
         current.chamber_temp_c = selected_chamber_temp_c;
       }
-      if (current.print_error_code == 0 && selected_print_error_code != 0) {
-        current.print_error_code = selected_print_error_code;
-      }
-      if (current.hms_alert_count == 0U && selected_hms_count > 0) {
-        current.hms_alert_count = static_cast<uint16_t>(selected_hms_count);
-      }
-      current.has_error = current.has_error || selected_has_error;
-      if (current.detail.empty() || current.detail == "Connected to Bambu Cloud" ||
-          current.detail == "Connected to Bambu Cloud, no cover image yet") {
-        const std::string error_detail =
-            format_error_detail(selected_print_error_code, selected_hms_count);
-        if (!error_detail.empty()) {
-          current.detail = error_detail;
-        }
-      }
     }
   } else if (!selected_title.empty() || !selected_cover.empty()) {
-    current.has_error = current.lifecycle == PrintLifecycleState::kError;
+    current.has_error = current.non_error_stop ? false
+                                               : current.lifecycle == PrintLifecycleState::kError;
     if (current.detail.empty()) {
       current.detail = preview_detail;
     }
@@ -3144,6 +3200,35 @@ std::string BambuCloudClient::extract_stage_text(const cJSON* item) {
         json_string(stage, "name", json_string(stage, "stage", {}));
     if (!stage_name.empty()) {
       return stage_name;
+    }
+  }
+
+  return {};
+}
+
+std::string BambuCloudClient::extract_print_type_text(const cJSON* item) {
+  if (item == nullptr) {
+    return {};
+  }
+
+  const cJSON* print_history = child_object(item, "print_history_info") != nullptr
+                                   ? child_object(item, "print_history_info")
+                                   : child_object(item, "printHistoryInfo");
+  const cJSON* subtask = print_history != nullptr ? child_object(print_history, "subtask") : nullptr;
+
+  const char* keys[] = {"print_type", "printType", "task_type", "taskType",
+                        "subtask_type", "subtaskType"};
+
+  for (const cJSON* source : {item, print_history, subtask}) {
+    if (source == nullptr) {
+      continue;
+    }
+
+    for (const char* key : keys) {
+      const std::string value = json_string(source, key, {});
+      if (!value.empty()) {
+        return value;
+      }
     }
   }
 

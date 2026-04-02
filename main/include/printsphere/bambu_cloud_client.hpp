@@ -42,6 +42,7 @@ struct BambuCloudSnapshot {
   bool chamber_light_on = false;
   bool chamber_light_pending = false;
   uint64_t chamber_light_pending_since_ms = 0;
+  bool non_error_stop = false;
   uint32_t remaining_seconds = 0;
   uint16_t current_layer = 0;
   uint16_t total_layers = 0;
@@ -121,6 +122,7 @@ class BambuCloudClient {
   static std::string extract_device_serial(const cJSON* item);
   static std::string extract_status_text(const cJSON* item);
   static std::string extract_stage_text(const cJSON* item);
+  static std::string extract_print_type_text(const cJSON* item);
   static float extract_progress(const cJSON* item);
   static uint32_t extract_remaining_seconds(const cJSON* item);
   static uint16_t extract_current_layer(const cJSON* item);

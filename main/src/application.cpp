@@ -108,7 +108,7 @@ void Application::run() {
     camera_client_.observe_printer_snapshot(local_snapshot);
     if (last_local_print_live_ && local_snapshot.non_error_stop) {
       stop_banner_until_tick_ = now_tick + kStopBannerDuration;
-    } else if (!local_snapshot.non_error_stop) {
+    } else if (source_mode_ != SourceMode::kCloudOnly && !local_snapshot.non_error_stop) {
       stop_banner_until_tick_ = 0;
     }
     local_snapshot.show_stop_banner =
@@ -178,6 +178,13 @@ void Application::run() {
     cloud_client_.set_fetch_paused(pause_cloud_fetches);
 
     BambuCloudSnapshot cloud_snapshot = cloud_client_.snapshot();
+    if (source_mode_ == SourceMode::kCloudOnly) {
+      if (last_cloud_print_live_ && cloud_snapshot.non_error_stop) {
+        stop_banner_until_tick_ = now_tick + kStopBannerDuration;
+      } else if (!cloud_snapshot.non_error_stop) {
+        stop_banner_until_tick_ = 0;
+      }
+    }
     if (local_print_is_live(local_snapshot) || cloud_print_is_live(cloud_snapshot)) {
       print_activity_seen_this_session_ = true;
     }
@@ -291,6 +298,7 @@ void Application::run() {
     resolve_ui_state(snapshot);
     ui_.apply_snapshot(snapshot);
     last_local_print_live_ = local_print_is_live(local_snapshot);
+    last_cloud_print_live_ = cloud_print_is_live(cloud_snapshot);
 
     const bool on_battery = power.available && power.battery_present && !power.usb_present;
     const bool preview_pipeline_enabled =
