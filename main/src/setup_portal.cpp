@@ -276,7 +276,7 @@ std::string source_mode_badge_value(SourceMode mode) {
       return "Local only";
     case SourceMode::kHybrid:
     default:
-      return "Hybrid";
+      return "Hybrid (recommended)";
   }
 }
 
@@ -601,7 +601,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
 
   if (show_connection_steps) {
     html += "<section class=\"section\">";
-    html += "<div class=\"section-head\"><h2>Step 2 - Bambu Cloud</h2><p>Primary source for cover image, project metadata and cloud lifecycle. "
+    html += "<div class=\"section-head\"><h2>Step 2 - Bambu Cloud</h2><p>Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. "
             "Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.</p></div>";
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email</label><input id=\"cloud_email\" value=\"";
@@ -616,12 +616,12 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     if (source_mode == SourceMode::kHybrid) {
       html += " selected";
     }
-    html += ">Hybrid: cloud preview plus local live status</option>";
+    html += ">Hybrid (recommended): local live monitoring first, cloud preview + fallback</option>";
     html += "<option value=\"cloud_only\"";
     if (source_mode == SourceMode::kCloudOnly) {
       html += " selected";
     }
-    html += ">Cloud only</option>";
+    html += ">Cloud only: cloud monitoring and preview, local MQTT/camera disabled</option>";
     html += "<option value=\"local_only\"";
     if (source_mode == SourceMode::kLocalOnly) {
       html += " selected";
@@ -631,7 +631,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += json_escape(cloud_snapshot.detail);
     html += "</span></div>";
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"cloud-connect-button\">Connect Cloud</button>";
-    html += "<div class=\"micro\">This saves the cloud credentials immediately and starts the login without rebooting.</div></div>";
+    html += "<div class=\"micro\">This saves the cloud credentials immediately. In Hybrid and Cloud only it also starts the login without rebooting.</div></div>";
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"cloud_verification_code\" id=\"cloud-verification-label\">";
     html += json_escape(cloud_code_label);
@@ -668,8 +668,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += json_escape(local_snapshot.detail);
     html += "</span></div>";
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"local-connect-button\">Connect Local</button>";
-    html += "<div class=\"micro\">This saves the local printer credentials immediately and reconnects MQTT and camera without rebooting.</div></div>";
-    html += "<p class=\"micro\">The local path always remains available as a fallback and is still useful when the cloud is lagging behind.</p>";
+    html += "<div class=\"micro\">This saves the local printer credentials immediately. In Hybrid and Local only it also reconnects MQTT and camera without rebooting.</div></div>";
+    html += "<p class=\"micro\">In Hybrid mode the local path is preferred for fast monitoring and acts as the fallback when the cloud lags behind.</p>";
     html += "</section>";
   }
 
@@ -786,7 +786,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const cloudDetail=document.getElementById('cloud-detail');if(cloudDetail){cloudDetail.textContent=body.cloud_detail||'No cloud response yet';}"
           "applyResolvedSerial(body);"
           "const sourceMode=document.getElementById('source_mode')?valueOf('source_mode'):(savedConfig.source_mode||'hybrid');"
-          "const sourceValue=sourceMode==='cloud_only'?'Cloud only':(sourceMode==='local_only'?'Local only':'Hybrid');"
+          "const sourceValue=sourceMode==='local_only'?'Local only':(sourceMode==='cloud_only'?'Cloud only':'Hybrid (recommended)');"
           "setBadge('source-badge','Source',sourceValue,'info');"
           "let localValue='Not configured';let localState='idle';"
           "if(body.local_connected){localValue='Connected';localState='ok';}"
@@ -1129,6 +1129,12 @@ esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_cloud_credentials(cloud), kTag, "save cloud failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
                       "save source mode failed");
+  if (source_mode == SourceMode::kLocalOnly) {
+    send_json(
+        request,
+        "{\"status\":\"saved\",\"detail\":\"Cloud credentials saved. Switch source mode to Hybrid or Cloud only to connect.\",\"cloud_connected\":false,\"cloud_verification_required\":false,\"cloud_tfa_required\":false,\"cloud_configured\":true,\"cloud_detail\":\"Cloud credentials saved. Switch source mode to Hybrid or Cloud only to connect.\",\"cloud_resolved_serial\":\"\"}");
+    return ESP_OK;
+  }
   portal->cloud_client_.request_reload_from_store();
 
   const BambuCloudSnapshot before = portal->cloud_client_.snapshot();
@@ -1236,6 +1242,12 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_config(printer), kTag, "save printer failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
                       "save source mode failed");
+  if (source_mode == SourceMode::kCloudOnly) {
+    send_json(
+        request,
+        "{\"status\":\"saved\",\"detail\":\"Local printer credentials saved. Switch source mode to Hybrid or Local only to connect.\",\"local_error\":false,\"local_connected\":false,\"local_configured\":true,\"local_detail\":\"Local printer credentials saved. Switch source mode to Hybrid or Local only to connect.\"}");
+    return ESP_OK;
+  }
 
   const PrinterSnapshot before = portal->printer_client_.snapshot();
   portal->printer_client_.configure(printer);

@@ -41,6 +41,7 @@ constexpr int kPage3CameraHeight = 224;
 constexpr int kPage3CameraYOffset = 20;
 constexpr int kPage3NoteWithImageY = 150;
 constexpr int kPage3SubnoteWithImageY = 182;
+constexpr int kAuxTempRowY = 28;
 constexpr int kSwipeThresholdPx = 24;
 constexpr int kManualMinBrightnessPercent = 4;
 constexpr uint32_t kRingAnimationTickMs = 220U;
@@ -140,6 +141,16 @@ void set_label_text_if_changed(lv_obj_t* label, const char* text) {
 
 void set_label_text_if_changed(lv_obj_t* label, const std::string& text) {
   set_label_text_if_changed(label, text.c_str());
+}
+
+std::string optional_temperature_text(const char* label, float temperature_c) {
+  if (label == nullptr || temperature_c <= 0.0f) {
+    return {};
+  }
+
+  char buffer[40] = {};
+  std::snprintf(buffer, sizeof(buffer), "%s %.0f%s", label, temperature_c, kDegreeC);
+  return buffer;
 }
 
 std::string lower_copy(std::string value) {
@@ -874,6 +885,10 @@ bool Ui::consume_camera_refresh_request() {
   return requested;
 }
 
+bool Ui::consume_chamber_light_toggle_request() {
+  return chamber_light_toggle_requested_.exchange(false);
+}
+
 void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
   if (!initialized_) {
     return;
@@ -959,6 +974,7 @@ void Ui::release_preview_image_locked() {
 
 void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh) {
   deferred_snapshot_pending_ = false;
+  update_page_availability_locked(snapshot);
 
   if (!snapshot.ui_status.empty() &&
       (snapshot.ui_status != last_ui_status_ || snapshot.print_active != last_print_active_)) {
@@ -1004,6 +1020,19 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     std::snprintf(temp_buffer, sizeof(temp_buffer), "--%s", kDegreeC);
   }
   set_label_text_if_changed(bed_value_label_, temp_buffer);
+
+  const std::string nozzle_aux =
+      optional_temperature_text("Other nozzle", snapshot.secondary_nozzle_temp_c);
+  nozzle_aux_visible_ = !nozzle_aux.empty();
+  if (nozzle_aux_visible_) {
+    set_label_text_if_changed(nozzle_aux_label_, nozzle_aux);
+  }
+
+  const std::string bed_aux = optional_temperature_text("Chamber", snapshot.chamber_temp_c);
+  bed_aux_visible_ = !bed_aux.empty();
+  if (bed_aux_visible_) {
+    set_label_text_if_changed(bed_aux_label_, bed_aux);
+  }
 
   const std::string battery_icon = battery_icon_text(snapshot);
   const std::string battery_pct = battery_pct_text(snapshot);
@@ -1101,6 +1130,18 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   }
 
   show_logo_ = should_show_logo(snapshot);
+  if (snapshot.chamber_light_supported) {
+    lv_obj_add_flag(logo_badge_, LV_OBJ_FLAG_CLICKABLE);
+  } else {
+    lv_obj_clear_flag(logo_badge_, LV_OBJ_FLAG_CLICKABLE);
+  }
+  if (snapshot.chamber_light_supported && snapshot.chamber_light_state_known &&
+      !snapshot.chamber_light_on) {
+    lv_obj_set_style_image_recolor(logo_image_, lv_color_hex(0x7A7A7A), 0);
+    lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_COVER, 0);
+  } else {
+    lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_TRANSP, 0);
+  }
   apply_page_visibility();
 }
 
@@ -1252,11 +1293,13 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_clear_flag(logo_badge_, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(logo_badge_, LV_OBJ_FLAG_SCROLLABLE);
   enable_touch_bubble(logo_badge_);
+  lv_obj_add_event_cb(logo_badge_, &Ui::logo_event_cb, LV_EVENT_CLICKED, this);
 
   logo_image_ = lv_image_create(logo_badge_);
   lv_image_set_src(logo_image_, &bambuicon_small);
   lv_image_set_scale(logo_image_, 183);
   lv_image_set_antialias(logo_image_, true);
+  lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_TRANSP, 0);
   lv_obj_center(logo_image_);
   lv_obj_clear_flag(logo_image_, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(logo_image_, LV_OBJ_FLAG_SCROLLABLE);
@@ -1295,6 +1338,16 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_align(nozzle_value_label_, LV_ALIGN_CENTER, -132, -10);
   set_label_text_if_changed(nozzle_value_label_, std::string("--") + kDegreeC);
 
+  nozzle_aux_label_ = lv_label_create(page1_);
+  set_label_text_if_changed(nozzle_aux_label_, "");
+  lv_obj_set_width(nozzle_aux_label_, 170);
+  lv_label_set_long_mode(nozzle_aux_label_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(nozzle_aux_label_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(nozzle_aux_label_, dosis20, 0);
+  lv_obj_set_style_text_color(nozzle_aux_label_, lv_color_hex(0x94A3B8), 0);
+  lv_obj_align(nozzle_aux_label_, LV_ALIGN_CENTER, -132, kAuxTempRowY);
+  lv_obj_add_flag(nozzle_aux_label_, LV_OBJ_FLAG_HIDDEN);
+
   bed_prefix_label_ = lv_label_create(page1_);
   set_label_text_if_changed(bed_prefix_label_, kMdiBed);
   lv_obj_set_style_text_font(bed_prefix_label_, mdi40, 0);
@@ -1309,6 +1362,16 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_align(bed_value_label_, LV_TEXT_ALIGN_RIGHT, 0);
   lv_obj_align(bed_value_label_, LV_ALIGN_CENTER, 108, -10);
   set_label_text_if_changed(bed_value_label_, std::string("--") + kDegreeC);
+
+  bed_aux_label_ = lv_label_create(page1_);
+  set_label_text_if_changed(bed_aux_label_, "");
+  lv_obj_set_width(bed_aux_label_, 170);
+  lv_label_set_long_mode(bed_aux_label_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(bed_aux_label_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(bed_aux_label_, dosis20, 0);
+  lv_obj_set_style_text_color(bed_aux_label_, lv_color_hex(0x94A3B8), 0);
+  lv_obj_align(bed_aux_label_, LV_ALIGN_CENTER, 132, kAuxTempRowY);
+  lv_obj_add_flag(bed_aux_label_, LV_OBJ_FLAG_HIDDEN);
 
   remaining_row_ = lv_obj_create(page1_);
   make_transparent(remaining_row_);
@@ -1425,13 +1488,17 @@ void Ui::apply_page_visibility() {
   const bool show_page2 = !scrolling_ && active_page_ == 1;
   const bool show_page3 = !scrolling_ && active_page_ == 2;
 
+  set_hidden(page2_, !preview_page_available_);
+  set_hidden(page3_, !camera_page_available_);
   set_hidden(status_label_, !show_page1);
   set_hidden(detail_label_, !show_page1 || !detail_visible_);
   set_hidden(layer_label_, !show_page1);
   set_hidden(nozzle_prefix_label_, !show_page1);
   set_hidden(nozzle_value_label_, !show_page1);
+  set_hidden(nozzle_aux_label_, !show_page1 || !nozzle_aux_visible_);
   set_hidden(bed_prefix_label_, !show_page1);
   set_hidden(bed_value_label_, !show_page1);
+  set_hidden(bed_aux_label_, !show_page1 || !bed_aux_visible_);
   set_hidden(remaining_row_, !show_page1);
   set_hidden(badge_slot_, !show_page1);
   set_hidden(page2_image_, !show_page2 || !preview_image_visible_);
@@ -1454,10 +1521,136 @@ void Ui::apply_logo_visibility() {
   set_hidden(sync_label_, show_logo_);
 }
 
+void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
+  const bool preview_available = snapshot.preview_page_available;
+  const bool camera_available = snapshot.camera_page_available;
+  const bool availability_changed =
+      preview_page_available_ != preview_available || camera_page_available_ != camera_available;
+
+  preview_page_available_ = preview_available;
+  camera_page_available_ = camera_available;
+
+  if (!availability_changed) {
+    return;
+  }
+
+  set_hidden(page2_, !preview_page_available_);
+  set_hidden(page3_, !camera_page_available_);
+
+  if (!preview_page_available_) {
+    release_preview_image_locked();
+    preview_image_visible_ = false;
+  }
+
+  if (!camera_page_available_) {
+    if (last_camera_blob_) {
+      lv_image_cache_drop(&camera_image_dsc_);
+    }
+    last_camera_blob_.reset();
+    last_camera_width_ = 0;
+    last_camera_height_ = 0;
+    std::memset(&camera_image_dsc_, 0, sizeof(camera_image_dsc_));
+    camera_image_visible_ = false;
+  }
+
+  active_page_ = clamp_enabled_page(active_page_);
+  lv_obj_update_layout(pager_);
+  if (lv_obj_t* target_page = page_object(active_page_); target_page != nullptr) {
+    lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
+  }
+  scrolling_ = false;
+}
+
+bool Ui::page_enabled(int page) const {
+  switch (page) {
+    case 0:
+      return true;
+    case 1:
+      return preview_page_available_;
+    case 2:
+      return camera_page_available_;
+    default:
+      return false;
+  }
+}
+
+lv_obj_t* Ui::page_object(int page) const {
+  switch (page) {
+    case 0:
+      return page1_;
+    case 1:
+      return page2_;
+    case 2:
+      return page3_;
+    default:
+      return nullptr;
+  }
+}
+
+int Ui::next_enabled_page(int page, int direction) const {
+  int candidate = page + direction;
+  while (candidate >= 0 && candidate <= 2) {
+    if (page_enabled(candidate)) {
+      return candidate;
+    }
+    candidate += direction;
+  }
+  return page;
+}
+
+int Ui::clamp_enabled_page(int page) const {
+  if (page_enabled(page)) {
+    return page;
+  }
+
+  for (int candidate = 0; candidate <= 2; ++candidate) {
+    if (page_enabled(candidate)) {
+      return candidate;
+    }
+  }
+
+  return 0;
+}
+
+int Ui::nearest_enabled_page_for_scroll() const {
+  lv_obj_update_layout(pager_);
+  int scroll_x = lv_obj_get_scroll_x(pager_);
+  if (scroll_x < 0) {
+    scroll_x = -scroll_x;
+  }
+
+  const int viewport_center = scroll_x + (board::kDisplayWidth / 2);
+  int best_page = clamp_enabled_page(active_page_);
+  int best_distance = INT32_MAX;
+
+  for (int page = 0; page <= 2; ++page) {
+    if (!page_enabled(page)) {
+      continue;
+    }
+
+    lv_obj_t* object = page_object(page);
+    if (object == nullptr) {
+      continue;
+    }
+
+    const int page_center = lv_obj_get_x(object) + (board::kDisplayWidth / 2);
+    const int distance = std::abs(page_center - viewport_center);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_page = page;
+    }
+  }
+
+  return best_page;
+}
+
 void Ui::set_active_page(int page) {
-  const int clamped_page = std::clamp(page, 0, 2);
+  const int clamped_page = clamp_enabled_page(page);
   const int previous_page = active_page_;
-  lv_obj_scroll_to_x(pager_, clamped_page * board::kDisplayWidth, LV_ANIM_OFF);
+  lv_obj_update_layout(pager_);
+  if (lv_obj_t* target_page = page_object(clamped_page); target_page != nullptr) {
+    lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
+  }
   if (previous_page == 1 && clamped_page != 1) {
     release_preview_image_locked();
     preview_image_visible_ = false;
@@ -1492,7 +1685,8 @@ void Ui::handle_pager_event(lv_event_t* event) {
     scroll_x = -scroll_x;
   }
 
-  set_active_page((scroll_x + (board::kDisplayWidth / 2)) / board::kDisplayWidth);
+  (void)scroll_x;
+  set_active_page(nearest_enabled_page_for_scroll());
 }
 
 void Ui::handle_screen_event(lv_event_t* event) {
@@ -1562,16 +1756,35 @@ void Ui::handle_screen_event(lv_event_t* event) {
     }
 
     if (abs_dx >= kSwipeThresholdPx && abs_dx > abs_dy + 8) {
-      if (dx < 0 && active_page_ < 2) {
-        set_active_page(active_page_ + 1);
-      } else if (dx > 0 && active_page_ > 0) {
-        set_active_page(active_page_ - 1);
+      if (dx < 0) {
+        const int next_page = next_enabled_page(active_page_, 1);
+        if (next_page != active_page_) {
+          set_active_page(next_page);
+        }
+      } else if (dx > 0) {
+        const int previous_page = next_enabled_page(active_page_, -1);
+        if (previous_page != active_page_) {
+          set_active_page(previous_page);
+        }
       }
-    } else if (active_page_ == 2 && abs_dx < 12 && abs_dy < 12) {
+    } else if (active_page_ == 2 && camera_page_available_ && abs_dx < 12 && abs_dy < 12) {
       std::lock_guard<std::mutex> lock(camera_refresh_mutex_);
       camera_refresh_requested_ = true;
     }
   }
+}
+
+void Ui::handle_logo_event(lv_event_t* event) {
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  if (scrolling_ || !show_logo_ || !last_snapshot_.chamber_light_supported) {
+    return;
+  }
+
+  note_activity(false);
+  chamber_light_toggle_requested_.store(true);
 }
 
 void Ui::set_brightness_percent(int brightness_percent) {
@@ -1652,6 +1865,13 @@ void Ui::screen_event_cb(lv_event_t* event) {
   auto* ui = static_cast<Ui*>(lv_event_get_user_data(event));
   if (ui != nullptr) {
     ui->handle_screen_event(event);
+  }
+}
+
+void Ui::logo_event_cb(lv_event_t* event) {
+  auto* ui = static_cast<Ui*>(lv_event_get_user_data(event));
+  if (ui != nullptr) {
+    ui->handle_logo_event(event);
   }
 }
 

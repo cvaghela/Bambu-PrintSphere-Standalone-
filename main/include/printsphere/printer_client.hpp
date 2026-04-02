@@ -22,6 +22,7 @@ class PrinterClient {
   void configure(PrinterConnection connection);
   bool is_configured() const;
   void set_network_ready(bool ready) { network_ready_.store(ready); }
+  bool set_chamber_light(bool on);
   esp_err_t start();
   PrinterSnapshot snapshot() const { return state_.snapshot(); }
 
@@ -34,9 +35,11 @@ class PrinterClient {
   void handle_info_payload(const char* payload, size_t length);
   void task_loop();
   void stop_client();
+  void schedule_client_rebuild(const char* reason, uint32_t delay_ms = 1500);
+  void cancel_client_rebuild();
   PrinterConnection desired_connection() const;
   void set_waiting_snapshot(const PrinterConnection& connection);
-  void publish_request(const char* payload);
+  bool publish_request(const char* payload);
   void request_initial_sync();
   static PrintLifecycleState lifecycle_from_state(const std::string& gcode_state,
                                                   bool has_concrete_error);
@@ -71,8 +74,13 @@ class PrinterClient {
   std::atomic<bool> first_payload_observed_{false};
   std::atomic<bool> network_ready_{false};
   std::atomic<bool> reconfigure_requested_{false};
+  std::atomic<bool> client_rebuild_requested_{false};
   std::atomic<uint32_t> last_message_tick_{0};
   std::atomic<uint32_t> initial_sync_tick_{0};
+  std::atomic<uint32_t> connection_state_tick_{0};
+  std::atomic<uint32_t> watchdog_probe_tick_{0};
+  std::atomic<uint32_t> rebuild_request_tick_{0};
+  std::atomic<uint32_t> rebuild_delay_ticks_{0};
 };
 
 }  // namespace printsphere

@@ -10,6 +10,7 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mqtt_client.h"
 #include "printsphere/config_store.hpp"
 #include "printsphere/printer_state.hpp"
 
@@ -32,9 +33,21 @@ struct BambuCloudSnapshot {
   std::string raw_stage;
   std::string stage;
   float progress_percent = 0.0f;
+  float nozzle_temp_c = 0.0f;
+  float bed_temp_c = 0.0f;
+  float chamber_temp_c = 0.0f;
+  float secondary_nozzle_temp_c = 0.0f;
+  bool chamber_light_supported = false;
+  bool chamber_light_state_known = false;
+  bool chamber_light_on = false;
+  bool chamber_light_pending = false;
+  uint64_t chamber_light_pending_since_ms = 0;
   uint32_t remaining_seconds = 0;
   uint16_t current_layer = 0;
   uint16_t total_layers = 0;
+  int print_error_code = 0;
+  uint16_t hms_alert_count = 0;
+  uint64_t live_data_last_update_ms = 0;
   PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
   bool has_error = false;
   bool verification_required = false;
@@ -49,9 +62,12 @@ class BambuCloudClient {
   void configure(BambuCloudCredentials credentials, std::string printer_serial);
   void set_network_ready(bool ready) { network_ready_.store(ready); }
   void set_low_power_mode(bool enabled) { low_power_mode_.store(enabled); }
-  void set_preview_fetch_enabled(bool enabled) { preview_fetch_enabled_.store(enabled); }
+  void set_fetch_paused(bool paused);
+  void set_live_mqtt_enabled(bool enabled) { live_mqtt_enabled_.store(enabled); }
+  void set_preview_fetch_enabled(bool enabled);
   void request_reload_from_store() { reload_requested_.store(true); }
   void submit_verification_code(std::string code);
+  bool set_chamber_light(bool on);
   esp_err_t start();
   BambuCloudSnapshot snapshot() const;
 
@@ -62,15 +78,25 @@ class BambuCloudClient {
     kTfaCode,
   };
 
+  static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_t event_id,
+                                 void* event_data);
   static void task_entry(void* context);
 
+  void handle_mqtt_event(esp_mqtt_event_handle_t event);
+  void stop_mqtt_client();
   void task_loop();
   bool login();
   bool authenticate_with_password();
   bool authenticate_with_email_code(const std::string& code);
   bool authenticate_with_tfa_code(const std::string& code);
+  bool ensure_cloud_mqtt_identity();
+  bool ensure_mqtt_client_started();
+  void request_initial_sync();
+  bool publish_request(const char* payload);
+  void handle_report_payload(const char* payload, size_t length);
+  void handle_info_payload(const char* payload, size_t length);
   bool fetch_bindings();
-  bool fetch_latest_preview();
+  bool fetch_latest_preview(bool allow_preview_download);
   std::shared_ptr<std::vector<uint8_t>> download_preview_image(const std::string& url);
   bool request_email_verification_code();
   bool perform_json_request(const std::string& url, const char* method,
@@ -112,12 +138,28 @@ class BambuCloudClient {
   std::string requested_serial_{};
   std::string resolved_serial_{};
   std::string access_token_{};
+  std::string mqtt_username_{};
   int64_t token_expiry_us_ = 0;
   TaskHandle_t task_handle_ = nullptr;
+  esp_mqtt_client_handle_t mqtt_client_ = nullptr;
+  std::string mqtt_client_id_{};
+  std::string mqtt_report_topic_{};
+  std::string mqtt_request_topic_{};
+  std::string incoming_topic_{};
+  std::string incoming_payload_{};
+  mutable std::mutex incoming_mutex_{};
+  std::atomic<bool> mqtt_connected_{false};
+  std::atomic<bool> mqtt_subscription_acknowledged_{false};
   std::atomic<bool> network_ready_{false};
   std::atomic<bool> low_power_mode_{false};
+  std::atomic<bool> fetch_paused_{false};
+  std::atomic<bool> live_mqtt_enabled_{true};
   std::atomic<bool> preview_fetch_enabled_{false};
   std::atomic<bool> reload_requested_{false};
+  std::atomic<bool> received_live_payload_{false};
+  std::atomic<bool> initial_sync_sent_{false};
+  std::atomic<bool> delayed_start_sent_{false};
+  std::atomic<uint32_t> initial_sync_tick_{0};
   mutable std::mutex auth_mutex_{};
   AuthMode auth_mode_ = AuthMode::kPassword;
   std::string tfa_key_{};

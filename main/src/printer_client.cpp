@@ -22,9 +22,60 @@ constexpr char kTag[] = "printsphere.printer";
 constexpr char kGetVersion[] = "{\"info\":{\"sequence_id\":\"0\",\"command\":\"get_version\"}}";
 constexpr char kPushAll[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\"}}";
 constexpr char kStartPush[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"start\"}}";
+constexpr uint32_t kDelayedPushallMs = 3000;
+constexpr uint32_t kInitialSyncTimeoutMs = 12000;
+constexpr uint32_t kNoDataProbeMs = 60000;
+constexpr uint32_t kNoDataReconnectMs = 15000;
+constexpr uint32_t kDisconnectedStallMs = 20000;
+constexpr uint32_t kRebuildDelayMs = 1500;
+
+extern const uint8_t bambu_root_cert_start[] asm("_binary_bambu_cert_start");
+extern const uint8_t bambu_root_cert_end[] asm("_binary_bambu_cert_end");
+extern const uint8_t bambu_p2s_cert_start[] asm("_binary_bambu_p2s_250626_cert_start");
+extern const uint8_t bambu_p2s_cert_end[] asm("_binary_bambu_p2s_250626_cert_end");
+extern const uint8_t bambu_h2c_cert_start[] asm("_binary_bambu_h2c_251122_cert_start");
+extern const uint8_t bambu_h2c_cert_end[] asm("_binary_bambu_h2c_251122_cert_end");
 
 uint64_t now_ms() {
   return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+}
+
+bool tick_elapsed(uint32_t start_tick, uint32_t now_tick, TickType_t duration) {
+  if (start_tick == 0) {
+    return false;
+  }
+  return static_cast<int32_t>(now_tick - start_tick) >= static_cast<int32_t>(duration);
+}
+
+void append_embedded_cert(std::string* target, const uint8_t* begin, const uint8_t* end) {
+  if (target == nullptr || begin == nullptr || end == nullptr || end <= begin) {
+    return;
+  }
+
+  size_t length = static_cast<size_t>(end - begin);
+  if (length > 0U && begin[length - 1] == '\0') {
+    --length;
+  }
+  if (length == 0U) {
+    return;
+  }
+
+  target->append(reinterpret_cast<const char*>(begin), length);
+  if (target->empty() || target->back() != '\n') {
+    target->push_back('\n');
+  }
+}
+
+const std::string& local_bambu_ca_bundle() {
+  static const std::string bundle = []() {
+    std::string certs;
+    certs.reserve(5500);
+    append_embedded_cert(&certs, bambu_root_cert_start, bambu_root_cert_end);
+    append_embedded_cert(&certs, bambu_p2s_cert_start, bambu_p2s_cert_end);
+    append_embedded_cert(&certs, bambu_h2c_cert_start, bambu_h2c_cert_end);
+    return certs;
+  }();
+  return bundle;
 }
 
 void log_heap_status(const char* context) {
@@ -125,6 +176,59 @@ const cJSON* child_array_local(const cJSON* object, const char* key) {
   }
   const cJSON* child = cJSON_GetObjectItemCaseSensitive(object, key);
   return cJSON_IsArray(child) ? child : nullptr;
+}
+
+bool is_chamber_light_node(const std::string& node) {
+  return node == "chamber_light" || node == "chamber_light2";
+}
+
+bool is_light_mode_on(const std::string& mode) {
+  return mode == "on";
+}
+
+std::string build_ledctrl_payload(const char* node, bool on) {
+  if (node == nullptr || *node == '\0') {
+    return {};
+  }
+
+  char payload[192];
+  std::snprintf(payload, sizeof(payload),
+                "{\"system\":{\"sequence_id\":\"%u\",\"command\":\"ledctrl\","
+                "\"led_node\":\"%s\",\"led_mode\":\"%s\"}}",
+                static_cast<unsigned int>(esp_random()), node, on ? "on" : "off");
+  return payload;
+}
+
+void apply_chamber_light_report(const cJSON* object, PrinterSnapshot* snapshot) {
+  if (object == nullptr || snapshot == nullptr) {
+    return;
+  }
+
+  const cJSON* lights_report = child_array_local(object, "lights_report");
+  if (!cJSON_IsArray(lights_report)) {
+    return;
+  }
+
+  bool seen = false;
+  bool any_on = false;
+  const int count = cJSON_GetArraySize(lights_report);
+  for (int i = 0; i < count; ++i) {
+    const cJSON* item = cJSON_GetArrayItem(lights_report, i);
+    const std::string node = json_string_local(item, "node", {});
+    if (!is_chamber_light_node(node)) {
+      continue;
+    }
+    seen = true;
+    if (is_light_mode_on(json_string_local(item, "mode", {}))) {
+      any_on = true;
+    }
+  }
+
+  if (seen) {
+    snapshot->chamber_light_supported = true;
+    snapshot->chamber_light_state_known = true;
+    snapshot->chamber_light_on = any_on;
+  }
 }
 
 std::string normalized_copy(std::string value) {
@@ -279,6 +383,58 @@ float packed_temp_current_value(int packed, float fallback) {
   return static_cast<float>(packed & 0xFFFF);
 }
 
+struct NozzleTemperatureBundle {
+  float active = 0.0f;
+  float secondary = 0.0f;
+};
+
+int extract_active_nozzle_index(const cJSON* device) {
+  const cJSON* extruder = child_object_local(device, "extruder");
+  return std::max(json_int_local(extruder, "state", 0) >> 4, 0);
+}
+
+void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_index,
+                                  float* active_temp, float* secondary_temp) {
+  if (!cJSON_IsArray(info_array) || active_temp == nullptr || secondary_temp == nullptr) {
+    return;
+  }
+
+  const int count = cJSON_GetArraySize(info_array);
+  float first_temp = -1000.0f;
+  float fallback_secondary = -1000.0f;
+  for (int i = 0; i < count; ++i) {
+    const cJSON* item = cJSON_GetArrayItem(info_array, i);
+    if (!cJSON_IsObject(item)) {
+      continue;
+    }
+
+    const float temp = json_number_local(item, "temp", -1000.0f);
+    if (temp <= -999.0f) {
+      continue;
+    }
+
+    if (first_temp < -999.0f) {
+      first_temp = temp;
+    }
+
+    const int id = json_int_local(item, "id", -1);
+    if (id == active_nozzle_index) {
+      *active_temp = temp;
+    } else if (id >= 0 && *secondary_temp <= 0.0f) {
+      *secondary_temp = temp;
+    } else if (fallback_secondary < -999.0f) {
+      fallback_secondary = temp;
+    }
+  }
+
+  if (*active_temp <= 0.0f && first_temp > -999.0f) {
+    *active_temp = first_temp;
+  }
+  if (*secondary_temp <= 0.0f && fallback_secondary > -999.0f) {
+    *secondary_temp = fallback_secondary;
+  }
+}
+
 float extract_bed_temperature_c(const cJSON* print, float fallback) {
   const cJSON* device = child_object_local(print, "device");
   if (const cJSON* bed_info = child_object_local(child_object_local(device, "bed"), "info");
@@ -297,52 +453,43 @@ float extract_bed_temperature_c(const cJSON* print, float fallback) {
   return json_number_local(print, "bed_temper", fallback);
 }
 
-float extract_nozzle_temperature_c(const cJSON* print, float fallback) {
+float extract_chamber_temperature_c(const cJSON* print, float fallback) {
+  const cJSON* device = child_object_local(print, "device");
+  if (const cJSON* ctc_info = child_object_local(child_object_local(device, "ctc"), "info");
+      ctc_info != nullptr) {
+    const int packed = json_int_local(ctc_info, "temp", -1);
+    if (packed >= 0) {
+      return packed_temp_current_value(packed, fallback);
+    }
+  }
+
+  if (const cJSON* chamber_info = child_object_local(child_object_local(device, "chamber"), "info");
+      chamber_info != nullptr) {
+    const int packed = json_int_local(chamber_info, "temp", -1);
+    if (packed >= 0) {
+      return packed_temp_current_value(packed, fallback);
+    }
+  }
+
+  return json_number_local(print, "chamber_temper", fallback);
+}
+
+NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, float active_fallback,
+                                                          float secondary_fallback) {
+  NozzleTemperatureBundle bundle{active_fallback, secondary_fallback};
   const float direct = json_number_local(print, "nozzle_temper", -1000.0f);
   if (direct > -999.0f) {
-    return direct;
+    bundle.active = direct;
   }
 
   const cJSON* device = child_object_local(print, "device");
   const cJSON* extruder = child_object_local(device, "extruder");
-  const int active_nozzle_index = std::max(json_int_local(extruder, "state", 0) >> 4, 0);
-
-  const auto pick_temp_from_info = [&](const cJSON* info_array) -> float {
-    if (!cJSON_IsArray(info_array)) {
-      return -1000.0f;
-    }
-
-    const int count = cJSON_GetArraySize(info_array);
-    float first_temp = -1000.0f;
-    for (int i = 0; i < count; ++i) {
-      const cJSON* item = cJSON_GetArrayItem(info_array, i);
-      if (!cJSON_IsObject(item)) {
-        continue;
-      }
-
-      const float temp = json_number_local(item, "temp", -1000.0f);
-      if (first_temp < -999.0f && temp > -999.0f) {
-        first_temp = temp;
-      }
-      if (json_int_local(item, "id", -1) == active_nozzle_index && temp > -999.0f) {
-        return temp;
-      }
-    }
-
-    return first_temp;
-  };
-
-  if (const float nozzle_temp =
-          pick_temp_from_info(child_array_local(child_object_local(device, "nozzle"), "info"));
-      nozzle_temp > -999.0f) {
-    return nozzle_temp;
-  }
-  if (const float extruder_temp = pick_temp_from_info(child_array_local(extruder, "info"));
-      extruder_temp > -999.0f) {
-    return extruder_temp;
-  }
-
-  return fallback;
+  const int active_nozzle_index = extract_active_nozzle_index(device);
+  merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "nozzle"), "info"),
+                               active_nozzle_index, &bundle.active, &bundle.secondary);
+  merge_nozzle_temp_candidates(child_array_local(extruder, "info"), active_nozzle_index,
+                               &bundle.active, &bundle.secondary);
+  return bundle;
 }
 
 float extract_progress_percent(const cJSON* print, float fallback) {
@@ -727,6 +874,43 @@ bool PrinterClient::is_configured() const {
   return desired_connection().is_ready();
 }
 
+bool PrinterClient::set_chamber_light(bool on) {
+  PrinterSnapshot snapshot = state_.snapshot();
+  const bool supports_secondary =
+      printer_model_has_secondary_chamber_light(snapshot.local_model);
+
+  auto publish_ledctrl = [&](const char* node) {
+    const std::string payload = build_ledctrl_payload(node, on);
+    if (!mqtt_connected_ || client_ == nullptr || payload.empty()) {
+      return false;
+    }
+
+    const int msg_id =
+        esp_mqtt_client_publish(client_, request_topic_.c_str(), payload.c_str(), 0, 0, 0);
+    if (msg_id < 0) {
+      ESP_LOGW(kTag, "Failed to publish chamber light command for %s", node);
+      return false;
+    }
+    return true;
+  };
+
+  const bool primary_ok = publish_ledctrl("chamber_light");
+  const bool secondary_ok = !supports_secondary || publish_ledctrl("chamber_light2");
+  if (!primary_ok || !secondary_ok) {
+    return false;
+  }
+
+  publish_request(kPushAll);
+
+  snapshot.chamber_light_supported = true;
+  snapshot.chamber_light_state_known = true;
+  snapshot.chamber_light_on = on;
+  update_local_source_metadata(&snapshot, true, mqtt_connected_.load());
+  state_.set_snapshot(std::move(snapshot));
+  ESP_LOGI(kTag, "Local chamber light set to %s", on ? "on" : "off");
+  return true;
+}
+
 PrinterConnection PrinterClient::desired_connection() const {
   std::lock_guard<std::mutex> lock(config_mutex_);
   return desired_connection_;
@@ -763,6 +947,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
 
   switch (static_cast<esp_mqtt_event_id_t>(event->event_id)) {
     case MQTT_EVENT_CONNECTED: {
+      cancel_client_rebuild();
       mqtt_connected_ = true;
       received_payload_ = false;
       subscription_acknowledged_ = false;
@@ -770,6 +955,8 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       delayed_pushall_sent_ = false;
       first_payload_observed_ = false;
       initial_sync_tick_ = 0;
+      connection_state_tick_ = xTaskGetTickCount();
+      watchdog_probe_tick_ = 0;
       last_message_tick_ = xTaskGetTickCount();
 
       const int msg_id = esp_mqtt_client_subscribe(client_, report_topic_.c_str(), 1);
@@ -805,10 +992,12 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
     }
 
     case MQTT_EVENT_SUBSCRIBED: {
+      cancel_client_rebuild();
       subscription_acknowledged_ = true;
       initial_sync_sent_ = true;
       delayed_pushall_sent_ = false;
       initial_sync_tick_ = xTaskGetTickCount();
+      watchdog_probe_tick_ = 0;
 
       PrinterSnapshot snapshot = state_.snapshot();
       snapshot.connection = PrinterConnectionState::kOnline;
@@ -835,12 +1024,14 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       initial_sync_sent_ = false;
       delayed_pushall_sent_ = false;
       initial_sync_tick_ = 0;
+      connection_state_tick_ = xTaskGetTickCount();
+      watchdog_probe_tick_ = 0;
       PrinterSnapshot snapshot = state_.snapshot();
       snapshot.connection = PrinterConnectionState::kConnecting;
       snapshot.raw_status.clear();
       snapshot.raw_stage.clear();
       snapshot.ui_status.clear();
-      snapshot.detail = "MQTT disconnected, retrying";
+      snapshot.detail = "MQTT disconnected, waiting for reconnect";
       snapshot.non_error_stop = false;
       snapshot.show_stop_banner = false;
       update_local_source_metadata(&snapshot, true, false);
@@ -873,9 +1064,11 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       if (!payload.empty() && topic == report_topic_) {
         const bool first_payload = !first_payload_observed_.exchange(true);
         if (first_payload) {
+          cancel_client_rebuild();
           log_heap_status("Before first MQTT payload");
         }
         last_message_tick_ = xTaskGetTickCount();
+        watchdog_probe_tick_ = 0;
         handle_report_payload(payload.data(), payload.size());
         if (first_payload) {
           log_heap_status("After first MQTT payload");
@@ -890,6 +1083,8 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       initial_sync_sent_ = false;
       delayed_pushall_sent_ = false;
       initial_sync_tick_ = 0;
+      connection_state_tick_ = xTaskGetTickCount();
+      watchdog_probe_tick_ = 0;
       log_heap_status("MQTT error");
       PrinterSnapshot snapshot = state_.snapshot();
       snapshot.connection = PrinterConnectionState::kError;
@@ -933,6 +1128,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
 
       update_local_source_metadata(&snapshot, true, false);
       state_.set_snapshot(std::move(snapshot));
+      schedule_client_rebuild("mqtt error");
       break;
     }
 
@@ -989,14 +1185,22 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 
     snapshot.connection = PrinterConnectionState::kOnline;
     snapshot.progress_percent = extract_progress_percent(print, snapshot.progress_percent);
-    snapshot.nozzle_temp_c = extract_nozzle_temperature_c(print, snapshot.nozzle_temp_c);
+    const NozzleTemperatureBundle nozzle_temps =
+        extract_nozzle_temperature_bundle(print, snapshot.nozzle_temp_c,
+                                          snapshot.secondary_nozzle_temp_c);
+    snapshot.nozzle_temp_c = nozzle_temps.active;
+    snapshot.secondary_nozzle_temp_c = nozzle_temps.secondary;
     snapshot.bed_temp_c = extract_bed_temperature_c(print, snapshot.bed_temp_c);
+    snapshot.chamber_temp_c = extract_chamber_temperature_c(print, snapshot.chamber_temp_c);
     snapshot.current_layer = extract_current_layer_local(print, snapshot.current_layer);
     snapshot.total_layers = extract_total_layers_local(print, snapshot.total_layers);
     snapshot.local_model = detect_printer_model_from_payload(print, snapshot.local_model);
+    snapshot.chamber_light_supported =
+        snapshot.chamber_light_supported || printer_model_has_chamber_light(snapshot.local_model);
     snapshot.camera_rtsp_url = extract_rtsp_url(print, snapshot.camera_rtsp_url);
     snapshot.local_mqtt_signature_required =
         parse_signature_required(print, snapshot.local_mqtt_signature_required);
+    apply_chamber_light_report(print, &snapshot);
     if (snapshot.resolved_serial.empty()) {
       snapshot.resolved_serial = active_serial;
     }
@@ -1133,6 +1337,8 @@ void PrinterClient::handle_info_payload(const char* payload, size_t length) {
   }
   snapshot.local_model = detect_printer_model(
       modules, detect_printer_model_from_payload(info, snapshot.local_model));
+  snapshot.chamber_light_supported =
+      snapshot.chamber_light_supported || printer_model_has_chamber_light(snapshot.local_model);
   snapshot.resolved_serial =
       extract_module_serial(modules, json_string(info, "sn", active_serial));
   if (snapshot.detail == "Connecting to local Bambu MQTT" || snapshot.detail.empty()) {
@@ -1151,8 +1357,13 @@ void PrinterClient::stop_client() {
   delayed_pushall_sent_ = false;
   first_payload_observed_ = false;
   client_started_ = false;
+  client_rebuild_requested_ = false;
   last_message_tick_ = 0;
   initial_sync_tick_ = 0;
+  connection_state_tick_ = 0;
+  watchdog_probe_tick_ = 0;
+  rebuild_request_tick_ = 0;
+  rebuild_delay_ticks_ = 0;
 
   {
     std::lock_guard<std::mutex> lock(incoming_mutex_);
@@ -1167,10 +1378,44 @@ void PrinterClient::stop_client() {
   }
 }
 
+void PrinterClient::schedule_client_rebuild(const char* reason, uint32_t delay_ms) {
+  if (client_rebuild_requested_.exchange(true)) {
+    return;
+  }
+  const uint32_t delay_ticks = pdMS_TO_TICKS(delay_ms == 0 ? kRebuildDelayMs : delay_ms);
+  rebuild_request_tick_ = xTaskGetTickCount();
+  rebuild_delay_ticks_ = delay_ticks;
+  ESP_LOGW(kTag, "Scheduling MQTT client rebuild in %u ms (%s)",
+           static_cast<unsigned int>(delay_ms == 0 ? kRebuildDelayMs : delay_ms),
+           reason != nullptr ? reason : "unspecified");
+}
+
+void PrinterClient::cancel_client_rebuild() {
+  client_rebuild_requested_ = false;
+  rebuild_request_tick_ = 0;
+  rebuild_delay_ticks_ = 0;
+}
+
 void PrinterClient::task_loop() {
   while (true) {
     if (reconfigure_requested_.exchange(false)) {
       stop_client();
+    }
+
+    uint32_t now = xTaskGetTickCount();
+    if (client_rebuild_requested_.load()) {
+      if (mqtt_connected_.load()) {
+        cancel_client_rebuild();
+      } else {
+        const uint32_t requested_at = rebuild_request_tick_.load();
+        const uint32_t delay_ticks = rebuild_delay_ticks_.load();
+        if (requested_at == 0 || tick_elapsed(requested_at, now, delay_ticks)) {
+          ESP_LOGW(kTag, "Rebuilding MQTT client after disconnect/error");
+          stop_client();
+          vTaskDelay(pdMS_TO_TICKS(250));
+          continue;
+        }
+      }
     }
 
     const PrinterConnection connection = desired_connection();
@@ -1242,11 +1487,22 @@ void PrinterClient::task_loop() {
       ESP_LOGI(kTag, "Connecting to printer MQTT %s:%u (serial=%s, user=%s)",
                connection.host.c_str(), static_cast<unsigned int>(connection.mqtt_port),
                connection.serial.c_str(), connection.mqtt_username.c_str());
-      ESP_LOGW(kTag, "TLS server certificate verification is disabled for local Bambu MQTT");
 
       esp_mqtt_client_config_t mqtt_cfg = {};
       mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
-      mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
+      const std::string& local_ca_bundle = local_bambu_ca_bundle();
+      if (!local_ca_bundle.empty()) {
+        mqtt_cfg.broker.verification.certificate = local_ca_bundle.c_str();
+        mqtt_cfg.broker.verification.certificate_len = local_ca_bundle.size() + 1U;
+        mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
+        ESP_LOGI(kTag,
+                 "Using embedded local Bambu CA bundle for MQTT TLS verification "
+                 "(hostname check disabled)");
+      } else {
+        mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
+        ESP_LOGW(kTag,
+                 "Embedded local Bambu CA bundle is empty; falling back to insecure local MQTT TLS");
+      }
       mqtt_cfg.credentials.client_id = client_id_.c_str();
       mqtt_cfg.session.keepalive = 30;
       mqtt_cfg.session.disable_clean_session = false;
@@ -1304,26 +1560,52 @@ void PrinterClient::task_loop() {
       }
 
       client_started_ = true;
+      connection_state_tick_ = xTaskGetTickCount();
       last_message_tick_ = xTaskGetTickCount();
+      now = xTaskGetTickCount();
     }
 
     if (mqtt_connected_ && subscription_acknowledged_ && initial_sync_sent_ && !received_payload_ &&
         !delayed_pushall_sent_) {
-      const uint32_t now = xTaskGetTickCount();
       const uint32_t initial_sync_tick = initial_sync_tick_.load();
-      if (initial_sync_tick != 0 && now - initial_sync_tick > pdMS_TO_TICKS(3000)) {
+      if (tick_elapsed(initial_sync_tick, now, pdMS_TO_TICKS(kDelayedPushallMs))) {
         ESP_LOGW(kTag, "No status payload received after subscribe, sending delayed pushall");
         publish_request(kPushAll);
         delayed_pushall_sent_ = true;
       }
     }
 
+    if (mqtt_connected_ && subscription_acknowledged_ && initial_sync_sent_ && !received_payload_ &&
+        delayed_pushall_sent_) {
+      const uint32_t initial_sync_tick = initial_sync_tick_.load();
+      if (tick_elapsed(initial_sync_tick, now, pdMS_TO_TICKS(kInitialSyncTimeoutMs))) {
+        ESP_LOGW(kTag, "Still no status payload after delayed pushall, forcing reconnect");
+        schedule_client_rebuild("initial sync timeout");
+      }
+    }
+
     if (mqtt_connected_ && subscription_acknowledged_ && received_payload_) {
-      const uint32_t now = xTaskGetTickCount();
       const uint32_t last = last_message_tick_.load();
-      if (now - last > pdMS_TO_TICKS(60000)) {
-        publish_request(kStartPush);
-        last_message_tick_ = now;
+      if (tick_elapsed(last, now, pdMS_TO_TICKS(kNoDataProbeMs))) {
+        const uint32_t probe_tick = watchdog_probe_tick_.load();
+        if (probe_tick == 0) {
+          ESP_LOGW(kTag, "No MQTT data for 60s, sending keepalive start request");
+          publish_request(kStartPush);
+          watchdog_probe_tick_ = now;
+        } else if (tick_elapsed(probe_tick, now, pdMS_TO_TICKS(kNoDataReconnectMs))) {
+          ESP_LOGW(kTag, "Still no MQTT data after keepalive probe, forcing reconnect");
+          schedule_client_rebuild("no data watchdog");
+        }
+      } else {
+        watchdog_probe_tick_ = 0;
+      }
+    }
+
+    if (client_ != nullptr && !mqtt_connected_) {
+      const uint32_t state_tick = connection_state_tick_.load();
+      if (tick_elapsed(state_tick, now, pdMS_TO_TICKS(kDisconnectedStallMs))) {
+        ESP_LOGW(kTag, "MQTT client stayed disconnected too long, forcing rebuild");
+        schedule_client_rebuild("disconnected stall");
       }
     }
 
@@ -1349,15 +1631,17 @@ void PrinterClient::set_waiting_snapshot(const PrinterConnection& connection) {
   state_.set_snapshot(std::move(snapshot));
 }
 
-void PrinterClient::publish_request(const char* payload) {
+bool PrinterClient::publish_request(const char* payload) {
   if (!mqtt_connected_ || client_ == nullptr || payload == nullptr) {
-    return;
+    return false;
   }
 
   const int msg_id = esp_mqtt_client_publish(client_, request_topic_.c_str(), payload, 0, 1, 0);
   if (msg_id < 0) {
     ESP_LOGW(kTag, "Failed to publish to %s", request_topic_.c_str());
+    return false;
   }
+  return true;
 }
 
 void PrinterClient::request_initial_sync() {

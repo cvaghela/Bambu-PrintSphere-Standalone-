@@ -31,6 +31,7 @@ class Ui {
   bool is_page2_active() const { return active_page_ == 1; }
   bool is_camera_page_active() const { return active_page_ == 2; }
   bool consume_camera_refresh_request();
+  bool consume_chamber_light_toggle_request();
 
  private:
   esp_err_t build_dashboard();
@@ -40,17 +41,25 @@ class Ui {
   void release_preview_image_locked();
   void apply_page_visibility();
   void apply_logo_visibility();
+  void update_page_availability_locked(const PrinterSnapshot& snapshot);
   void handle_ring_timer();
   void note_activity(bool wake_display);
   void wake_display();
   void apply_brightness_policy();
   void set_active_page(int page);
+  int clamp_enabled_page(int page) const;
+  int next_enabled_page(int page, int direction) const;
+  int nearest_enabled_page_for_scroll() const;
+  bool page_enabled(int page) const;
+  lv_obj_t* page_object(int page) const;
   void handle_pager_event(lv_event_t* event);
   void handle_screen_event(lv_event_t* event);
+  void handle_logo_event(lv_event_t* event);
   void set_brightness_percent(int brightness_percent);
   static void ring_timer_cb(lv_timer_t* timer);
   static void pager_event_cb(lv_event_t* event);
   static void screen_event_cb(lv_event_t* event);
+  static void logo_event_cb(lv_event_t* event);
 
   bool initialized_ = false;
   lv_display_t* display_ = nullptr;
@@ -74,8 +83,10 @@ class Ui {
   lv_obj_t* layer_label_ = nullptr;
   lv_obj_t* nozzle_prefix_label_ = nullptr;
   lv_obj_t* nozzle_value_label_ = nullptr;
+  lv_obj_t* nozzle_aux_label_ = nullptr;
   lv_obj_t* bed_prefix_label_ = nullptr;
   lv_obj_t* bed_value_label_ = nullptr;
+  lv_obj_t* bed_aux_label_ = nullptr;
   lv_obj_t* remaining_prefix_label_ = nullptr;
   lv_obj_t* remaining_label_ = nullptr;
   lv_obj_t* remaining_row_ = nullptr;
@@ -97,10 +108,14 @@ class Ui {
   bool detail_visible_ = true;
   bool show_logo_ = false;
   bool accent_initialized_ = false;
+  bool preview_page_available_ = true;
   bool preview_image_visible_ = false;
   bool preview_text_image_mode_ = false;
+  bool camera_page_available_ = true;
   bool camera_image_visible_ = false;
   bool camera_text_image_mode_ = false;
+  bool nozzle_aux_visible_ = false;
+  bool bed_aux_visible_ = false;
   bool ring_animation_active_ = false;
   bool swipe_switched_ = false;
   lv_coord_t gesture_start_x_ = 0;
@@ -122,6 +137,7 @@ class Ui {
   uint16_t last_camera_height_ = 0;
   mutable std::mutex camera_refresh_mutex_{};
   bool camera_refresh_requested_ = false;
+  std::atomic<bool> chamber_light_toggle_requested_{false};
   PrinterSnapshot deferred_snapshot_{};
   PrinterSnapshot last_snapshot_{};
 };

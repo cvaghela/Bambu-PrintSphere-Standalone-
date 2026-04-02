@@ -30,6 +30,12 @@ class Application {
   bool last_local_print_live_ = false;
   TickType_t stop_banner_until_tick_ = 0;
   SourceMode source_mode_ = SourceMode::kHybrid;
+  SourceMode last_source_mode_ = SourceMode::kHybrid;
+  bool last_wifi_connected_ = false;
+  bool last_camera_page_active_ = false;
+  bool hybrid_cloud_gate_open_ = false;
+  TickType_t hybrid_cloud_gate_deadline_ = 0;
+  TickType_t hybrid_camera_cooldown_deadline_ = 0;
 };
 
 }  // namespace printsphere

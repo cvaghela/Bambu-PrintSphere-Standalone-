@@ -85,6 +85,11 @@ struct PrinterSnapshot {
   float progress_percent = 0.0f;
   float nozzle_temp_c = 0.0f;
   float bed_temp_c = 0.0f;
+  float chamber_temp_c = 0.0f;
+  float secondary_nozzle_temp_c = 0.0f;
+  bool chamber_light_supported = false;
+  bool chamber_light_state_known = false;
+  bool chamber_light_on = false;
   uint32_t remaining_seconds = 0;
   uint16_t current_layer = 0;
   uint16_t total_layers = 0;
@@ -114,6 +119,8 @@ struct PrinterSnapshot {
   uint64_t cloud_last_update_ms = 0;
   PrinterModel cloud_model = PrinterModel::kUnknown;
   SourceCapabilities cloud_capabilities{};
+  bool preview_page_available = true;
+  bool camera_page_available = true;
   bool camera_connected = false;
   FieldSource status_source = FieldSource::kNone;
   FieldSource metrics_source = FieldSource::kNone;
@@ -139,6 +146,11 @@ const char* to_string(PrinterModel model);
 const char* to_string(FieldSource source);
 bool printer_model_has_jpeg_camera(PrinterModel model);
 bool printer_model_has_rtsp_camera(PrinterModel model);
+bool printer_model_has_chamber_temperature(PrinterModel model);
+bool printer_model_has_secondary_nozzle_temperature(PrinterModel model);
+bool printer_model_has_chamber_light(PrinterModel model);
+bool printer_model_has_secondary_chamber_light(PrinterModel model);
+bool printer_serial_family_has_no_chamber_temperature(const std::string& serial);
 SourceCapabilities default_local_capabilities_for_model(PrinterModel model);
 SourceCapabilities default_cloud_capabilities();
 

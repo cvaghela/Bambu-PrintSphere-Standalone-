@@ -8,6 +8,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(printsphere_idf)
 
+# Work around an Xtensa GCC ICE seen in ESP-IDF 5.5.2 while compiling
+# esp_lcd_panel_rgb.c with the default debug/-Og flags on Windows.
+idf_component_get_property(ESP_LCD_DIR esp_lcd COMPONENT_DIR)
+if(ESP_LCD_DIR)
+    set_source_files_properties(
+        "${ESP_LCD_DIR}/rgb/esp_lcd_panel_rgb.c"
+        PROPERTIES
+            COMPILE_OPTIONS "-O0"
+    )
+endif()
+
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(PRINTSPHERE_RELEASE_VERSION "v1")

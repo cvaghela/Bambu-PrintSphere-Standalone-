@@ -65,11 +65,11 @@ SourceMode parse_source_mode(const std::string& value) {
   if (value == "cloud_only") {
     return SourceMode::kCloudOnly;
   }
+
   if (value == "local_only") {
     return SourceMode::kLocalOnly;
   }
 
-  // Legacy values from the old "primary source" setting are treated as hybrid mode.
   return SourceMode::kHybrid;
 }
 

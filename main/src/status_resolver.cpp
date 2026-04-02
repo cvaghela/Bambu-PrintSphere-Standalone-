@@ -290,7 +290,8 @@ void copy_source_metadata(PrinterSnapshot& target, const PrinterSnapshot& local_
   target.cloud_model = cloud_snapshot.model;
   target.cloud_capabilities =
       cloud_snapshot.capabilities.status || cloud_snapshot.capabilities.metrics ||
-              cloud_snapshot.capabilities.preview
+              cloud_snapshot.capabilities.temperatures || cloud_snapshot.capabilities.preview ||
+              cloud_snapshot.capabilities.hms || cloud_snapshot.capabilities.print_error
           ? cloud_snapshot.capabilities
           : default_cloud_capabilities();
   target.resolved_serial =
@@ -441,6 +442,15 @@ void apply_local_metrics_bundle(PrinterSnapshot& target, const PrinterSnapshot& 
 void apply_local_temperature_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
   target.nozzle_temp_c = local_snapshot.nozzle_temp_c;
   target.bed_temp_c = local_snapshot.bed_temp_c;
+  target.chamber_temp_c = local_snapshot.chamber_temp_c;
+  target.secondary_nozzle_temp_c = local_snapshot.secondary_nozzle_temp_c;
+}
+
+void apply_cloud_temperature_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
+  target.nozzle_temp_c = cloud_snapshot.nozzle_temp_c;
+  target.bed_temp_c = cloud_snapshot.bed_temp_c;
+  target.chamber_temp_c = cloud_snapshot.chamber_temp_c;
+  target.secondary_nozzle_temp_c = cloud_snapshot.secondary_nozzle_temp_c;
 }
 
 void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
@@ -457,6 +467,23 @@ void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& lo
       (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
        local_snapshot.non_error_stop || local_snapshot.has_error)) {
     apply_local_status_bundle(target, local_snapshot);
+  }
+}
+
+void apply_cloud_error_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
+  target.print_error_code = cloud_snapshot.print_error_code;
+  target.hms_alert_count = cloud_snapshot.hms_alert_count;
+  target.non_error_stop = false;
+  target.show_stop_banner = false;
+  if ((cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
+       cloud_snapshot.has_error) &&
+      !cloud_snapshot.detail.empty()) {
+    target.detail = cloud_snapshot.detail;
+  }
+  if (target.status_source == FieldSource::kNone &&
+      (cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
+       cloud_snapshot.has_error)) {
+    apply_cloud_status_bundle(target, cloud_snapshot);
   }
 }
 
@@ -489,6 +516,19 @@ std::string pretty_status(const std::string& status) {
   if (contains_token(status, "pause")) return "paused";
   if (contains_token(status, "cool")) return "cooling";
   return {};
+}
+
+PrinterModel effective_model_for_snapshot(const PrinterSnapshot& snapshot) {
+  if (snapshot.status_source == FieldSource::kLocal && snapshot.local_model != PrinterModel::kUnknown) {
+    return snapshot.local_model;
+  }
+  if (snapshot.status_source == FieldSource::kCloud && snapshot.cloud_model != PrinterModel::kUnknown) {
+    return snapshot.cloud_model;
+  }
+  if (snapshot.local_model != PrinterModel::kUnknown) {
+    return snapshot.local_model;
+  }
+  return snapshot.cloud_model;
 }
 
 }  // namespace
@@ -656,9 +696,21 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
   const bool local_metrics_usable = local_fresh && local_metrics_have_signal(local_snapshot);
   const bool cloud_metrics_usable = cloud_fresh && cloud_metrics_have_signal(cloud_snapshot);
   const bool local_temperatures_usable = local_fresh && local_snapshot.local_capabilities.temperatures;
+  const bool cloud_temperatures_usable =
+      cloud_fresh && cloud_snapshot.capabilities.temperatures &&
+      (cloud_snapshot.nozzle_temp_c > 0.0f || cloud_snapshot.bed_temp_c > 0.0f ||
+       cloud_snapshot.chamber_temp_c > 0.0f || cloud_snapshot.secondary_nozzle_temp_c > 0.0f);
+  const bool local_light_usable =
+      local_fresh && local_snapshot.chamber_light_supported && local_snapshot.chamber_light_state_known;
+  const bool cloud_light_usable =
+      cloud_fresh && cloud_snapshot.chamber_light_supported &&
+      cloud_snapshot.chamber_light_state_known;
   const bool local_error_usable =
       local_fresh && (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
                       local_snapshot.non_error_stop || local_snapshot.has_error);
+  const bool cloud_error_usable =
+      cloud_fresh && (cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
+                      cloud_snapshot.has_error);
 
   if (local_status_usable) {
     snapshot.status_source = FieldSource::kLocal;
@@ -678,9 +730,25 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
 
   if (local_temperatures_usable) {
     apply_local_temperature_bundle(snapshot, local_snapshot);
+  } else if (cloud_temperatures_usable) {
+    apply_cloud_temperature_bundle(snapshot, cloud_snapshot);
+  }
+  snapshot.chamber_light_supported =
+      (local_enabled && local_snapshot.chamber_light_supported) ||
+      (cloud_enabled && cloud_snapshot.chamber_light_supported);
+  snapshot.chamber_light_state_known = false;
+  snapshot.chamber_light_on = false;
+  if (local_light_usable) {
+    snapshot.chamber_light_state_known = true;
+    snapshot.chamber_light_on = local_snapshot.chamber_light_on;
+  } else if (cloud_light_usable) {
+    snapshot.chamber_light_state_known = true;
+    snapshot.chamber_light_on = cloud_snapshot.chamber_light_on;
   }
   if (local_error_usable) {
     apply_local_error_bundle(snapshot, local_snapshot);
+  } else if (cloud_error_usable) {
+    apply_cloud_error_bundle(snapshot, cloud_snapshot);
   }
 
   if (cloud_enabled && cloud_preview_available(cloud_snapshot, now_ms)) {
@@ -716,6 +784,25 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
     } else if (snapshot.status_source == FieldSource::kCloud) {
       snapshot.stage = cloud_snapshot.stage;
     }
+  }
+
+  const PrinterModel effective_model = effective_model_for_snapshot(snapshot);
+  if (effective_model != PrinterModel::kUnknown) {
+    if (!printer_model_has_chamber_temperature(effective_model)) {
+      snapshot.chamber_temp_c = 0.0f;
+    }
+    if (!printer_model_has_secondary_nozzle_temperature(effective_model)) {
+      snapshot.secondary_nozzle_temp_c = 0.0f;
+    }
+    if (!printer_model_has_chamber_light(effective_model)) {
+      snapshot.chamber_light_supported = false;
+      snapshot.chamber_light_state_known = false;
+      snapshot.chamber_light_on = false;
+    } else {
+      snapshot.chamber_light_supported = true;
+    }
+  } else if (printer_serial_family_has_no_chamber_temperature(snapshot.resolved_serial)) {
+    snapshot.chamber_temp_c = 0.0f;
   }
 
   return snapshot;
