@@ -757,6 +757,13 @@ float packed_temp_current_value(int packed, float fallback) {
   return static_cast<float>(packed & 0xFFFF);
 }
 
+float normalize_temperature_candidate(float value) {
+  if (value > static_cast<float>(0xFFFF)) {
+    return packed_temp_current_value(static_cast<int>(value), value);
+  }
+  return value;
+}
+
 struct NozzleTemperatureBundle {
   float active = 0.0f;
   float secondary = 0.0f;
@@ -782,7 +789,8 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
       continue;
     }
 
-    const float temp = json_number_local(item, "temp", -1000.0f);
+    const float temp = normalize_temperature_candidate(
+        json_number_local(item, "temp", -1000.0f));
     if (temp <= -999.0f) {
       continue;
     }
@@ -826,8 +834,9 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
       continue;
     }
 
-    const float direct = json_number_local(source, "nozzle_temper",
-                                           json_number_local(source, "nozzle_temp", -1000.0f));
+    const float direct = normalize_temperature_candidate(
+        json_number_local(source, "nozzle_temper",
+                          json_number_local(source, "nozzle_temp", -1000.0f)));
     if (direct > -999.0f) {
       bundle.active = direct;
     }
@@ -845,21 +854,25 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
   }
 
   if (bundle.active <= 0.0f) {
-    find_number_for_keys_recursive(item,
-                                   {"nozzle_temper", "nozzle_temp", "nozzle_temperature",
-                                    "nozzleTemperature", "hotend_temp", "hotend_temperature",
-                                    "hotendTemperature"},
-                                   &bundle.active);
+    if (find_number_for_keys_recursive(item,
+                                       {"nozzle_temper", "nozzle_temp", "nozzle_temperature",
+                                        "nozzleTemperature", "hotend_temp", "hotend_temperature",
+                                        "hotendTemperature"},
+                                       &bundle.active)) {
+      bundle.active = normalize_temperature_candidate(bundle.active);
+    }
   }
   if (bundle.secondary <= 0.0f) {
-    find_number_for_keys_recursive(item,
-                                   {"secondary_nozzle_temper", "secondary_nozzle_temp",
-                                    "secondary_nozzle_temperature", "secondaryNozzleTemperature",
-                                    "right_nozzle_temper", "right_nozzle_temp",
-                                    "right_nozzle_temperature", "rightNozzleTemperature",
-                                    "second_nozzle_temper", "second_nozzle_temp",
-                                    "tool1_nozzle_temper", "tool1_nozzle_temp"},
-                                   &bundle.secondary);
+    if (find_number_for_keys_recursive(item,
+                                       {"secondary_nozzle_temper", "secondary_nozzle_temp",
+                                        "secondary_nozzle_temperature", "secondaryNozzleTemperature",
+                                        "right_nozzle_temper", "right_nozzle_temp",
+                                        "right_nozzle_temperature", "rightNozzleTemperature",
+                                        "second_nozzle_temper", "second_nozzle_temp",
+                                        "tool1_nozzle_temper", "tool1_nozzle_temp"},
+                                       &bundle.secondary)) {
+      bundle.secondary = normalize_temperature_candidate(bundle.secondary);
+    }
   }
 
   return bundle;
