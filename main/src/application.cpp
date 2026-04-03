@@ -15,6 +15,7 @@ constexpr char kTag[] = "printsphere.app";
 constexpr TickType_t kStopBannerDuration = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCloudFallbackDelay = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCameraCloudCooldown = pdMS_TO_TICKS(8000);
+constexpr uint64_t kChamberLightOverrideMs = 6000;
 
 bool local_print_is_live(const PrinterSnapshot& snapshot) {
   return snapshot.print_active || snapshot.lifecycle == PrintLifecycleState::kPreparing ||
@@ -204,7 +205,24 @@ void Application::run() {
       merged.camera_page_available = source_mode_ != SourceMode::kCloudOnly;
       return merged;
     };
+    auto apply_chamber_light_override = [&](PrinterSnapshot* target_snapshot) {
+      if (target_snapshot == nullptr) {
+        return;
+      }
+      if (!chamber_light_override_active_) {
+        return;
+      }
+      if (now_ms >= chamber_light_override_until_ms_) {
+        chamber_light_override_active_ = false;
+        chamber_light_override_until_ms_ = 0;
+        return;
+      }
+      target_snapshot->chamber_light_supported = true;
+      target_snapshot->chamber_light_state_known = true;
+      target_snapshot->chamber_light_on = chamber_light_override_on_;
+    };
     PrinterSnapshot snapshot = build_merged_snapshot(local_snapshot, cloud_snapshot);
+    apply_chamber_light_override(&snapshot);
 
     if (ui_.consume_chamber_light_toggle_request()) {
       const bool requested_on =
@@ -252,7 +270,11 @@ void Application::run() {
       if (!command_sent) {
         ESP_LOGW(kTag, "Chamber light toggle failed in %s mode", to_string(source_mode_));
       } else {
+        chamber_light_override_active_ = true;
+        chamber_light_override_on_ = requested_on;
+        chamber_light_override_until_ms_ = now_ms + kChamberLightOverrideMs;
         snapshot = build_merged_snapshot(local_snapshot, cloud_snapshot);
+        apply_chamber_light_override(&snapshot);
       }
     }
 
