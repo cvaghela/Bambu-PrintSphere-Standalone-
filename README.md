@@ -77,6 +77,8 @@ Arc colors can be customized from web config menu
 
 /release/firmware.bin can be flashed on emtpy devices via known methods
 
+The latest versioned merged firmware stays directly in `/release/`; older versioned builds are moved to `/release/archive/`.
+
 via webflasher like the one from ESPHome 
 https://web.esphome.io/
 connect USB - choose COM Port 
