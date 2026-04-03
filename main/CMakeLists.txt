@@ -2,8 +2,10 @@ idf_component_register(
     SRCS
         "app_main.cpp"
         "src/application.cpp"
+        "src/bambu_status.cpp"
         "src/bambu_cloud_client.cpp"
         "src/config_store.cpp"
+        "src/error_lookup.cpp"
         "include/font/dosis_20.c"
         "include/font/dosis_32.c"
         "include/font/dosis_40.c"

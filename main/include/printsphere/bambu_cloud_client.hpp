@@ -34,9 +34,13 @@ struct BambuCloudSnapshot {
   std::string stage;
   float progress_percent = 0.0f;
   float nozzle_temp_c = 0.0f;
+  uint64_t nozzle_temp_last_update_ms = 0;
   float bed_temp_c = 0.0f;
+  uint64_t bed_temp_last_update_ms = 0;
   float chamber_temp_c = 0.0f;
+  uint64_t chamber_temp_last_update_ms = 0;
   float secondary_nozzle_temp_c = 0.0f;
+  uint64_t secondary_nozzle_temp_last_update_ms = 0;
   bool chamber_light_supported = false;
   bool chamber_light_state_known = false;
   bool chamber_light_on = false;

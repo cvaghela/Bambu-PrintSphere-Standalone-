@@ -321,7 +321,7 @@ esp_err_t SetupPortal::start() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.stack_size = 8192;
-  config.max_uri_handlers = 12;
+  config.max_uri_handlers = 13;
 
   ESP_RETURN_ON_ERROR(httpd_start(&server_, &config), kTag, "httpd_start failed");
 
@@ -387,6 +387,14 @@ esp_err_t SetupPortal::start() {
   arc_commit_uri.user_ctx = this;
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &arc_commit_uri), kTag,
                       "arc commit handler failed");
+
+  httpd_uri_t source_mode_uri = {};
+  source_mode_uri.uri = "/api/source-mode";
+  source_mode_uri.method = HTTP_POST;
+  source_mode_uri.handler = &SetupPortal::handle_source_mode_post;
+  source_mode_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &source_mode_uri), kTag,
+                      "source mode handler failed");
 
   httpd_uri_t cloud_connect_uri = {};
   cloud_connect_uri.uri = "/api/cloud/connect";
@@ -601,16 +609,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
 
   if (show_connection_steps) {
     html += "<section class=\"section\">";
-    html += "<div class=\"section-head\"><h2>Step 2 - Bambu Cloud</h2><p>Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. "
-            "Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.</p></div>";
-    html += "<div class=\"grid-2\">";
-    html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email</label><input id=\"cloud_email\" value=\"";
-    html += json_escape(cloud.email);
-    html += "\" autocomplete=\"username\"></div>";
-    html += "<div class=\"field\"><label for=\"cloud_password\">Bambu Password</label><input id=\"cloud_password\" type=\"password\" value=\"";
-    html += json_escape(cloud.password);
-    html += "\" autocomplete=\"current-password\"></div>";
-    html += "</div>";
+    html += "<div class=\"section-head\"><h2>Connection Mode</h2><p>This decides which printer path drives the UI. Changing it needs a reboot because the active runtime wiring changes between cloud, local and hybrid.</p></div>";
     html += "<div class=\"field\"><label for=\"source_mode\">Connection Mode</label><select id=\"source_mode\">";
     html += "<option value=\"hybrid\"";
     if (source_mode == SourceMode::kHybrid) {
@@ -627,6 +626,23 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += " selected";
     }
     html += ">Local only</option></select></div>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"source-mode-apply-button\">Apply + Restart</button>";
+    html += "<div class=\"micro hidden\" id=\"source-mode-apply-hint\">A mode change rewires the active clients, so the ESP restarts right away after saving it.</div></div>";
+    html += "</section>";
+  }
+
+  if (show_connection_steps) {
+    html += "<section class=\"section\">";
+    html += "<div class=\"section-head\"><h2>Step 2 - Bambu Cloud</h2><p>Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. "
+            "Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.</p></div>";
+    html += "<div class=\"grid-2\">";
+    html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email</label><input id=\"cloud_email\" value=\"";
+    html += json_escape(cloud.email);
+    html += "\" autocomplete=\"username\"></div>";
+    html += "<div class=\"field\"><label for=\"cloud_password\">Bambu Password</label><input id=\"cloud_password\" type=\"password\" value=\"";
+    html += json_escape(cloud.password);
+    html += "\" autocomplete=\"current-password\"></div>";
+    html += "</div>";
     html += "<div class=\"hint-box\"><strong>Cloud Status:</strong> <span id=\"cloud-detail\">";
     html += json_escape(cloud_snapshot.detail);
     html += "</span></div>";
@@ -720,6 +736,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const wifiScanButton=document.getElementById('wifi-scan-button');";
   html += "const wifiSsidSelect=document.getElementById('wifi_ssid_select');";
   html += "const wifiScanDetail=document.getElementById('wifi-scan-detail');";
+  html += "const sourceModeSelect=document.getElementById('source_mode');";
+  html += "const sourceModeApplyButton=document.getElementById('source-mode-apply-button');";
+  html += "const sourceModeApplyHint=document.getElementById('source-mode-apply-hint');";
   html += "const cloudConnectButton=document.getElementById('cloud-connect-button');";
   html += "const localConnectButton=document.getElementById('local-connect-button');";
   html += "const verifyButton=document.getElementById('verify-button');";
@@ -763,6 +782,13 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "finally{if(wifiScanButton){wifiScanButton.disabled=false;}}}";
   html += "function setBadge(id,label,value,stateClass){const badge=document.getElementById(id);if(!badge)return;"
           "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}";
+  html += "function updateSourceModeControls(){"
+          "if(!sourceModeSelect||!sourceModeApplyButton||!sourceModeApplyHint)return;"
+          "const selected=valueOf('source_mode')||'hybrid';"
+          "const changed=selected!==(savedConfig.source_mode||'hybrid');"
+          "sourceModeApplyButton.classList.toggle('hidden',!changed);"
+          "sourceModeApplyHint.classList.toggle('hidden',!changed);"
+          "if(!changed){sourceModeApplyButton.disabled=false;}}";
   html += "function updateCloudVerification(body){const note=document.getElementById('cloud-verify-note');"
           "const label=document.getElementById('cloud-verification-label');"
           "const input=document.getElementById('cloud_verification_code');"
@@ -785,7 +811,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "setBadge('cloud-badge','Cloud',cloudValue,cloudState);"
           "const cloudDetail=document.getElementById('cloud-detail');if(cloudDetail){cloudDetail.textContent=body.cloud_detail||'No cloud response yet';}"
           "applyResolvedSerial(body);"
-          "const sourceMode=document.getElementById('source_mode')?valueOf('source_mode'):(savedConfig.source_mode||'hybrid');"
+          "const sourceMode=body.source_mode||savedConfig.source_mode||'hybrid';"
           "const sourceValue=sourceMode==='local_only'?'Local only':(sourceMode==='cloud_only'?'Cloud only':'Hybrid (recommended)');"
           "setBadge('source-badge','Source',sourceValue,'info');"
           "let localValue='Not configured';let localState='idle';"
@@ -822,9 +848,18 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(response.ok){setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
           "else{setStatus(body.error||'Saving failed','Please review the fields and try again.',8000);saveButton.disabled=false;}}"
           "catch(error){setStatus('Saving failed','The request to the ESP could not be completed.',8000);saveButton.disabled=false;}});";
+  html += "if(sourceModeSelect){sourceModeSelect.addEventListener('change',updateSourceModeControls);}";
+  html += "if(sourceModeApplyButton){sourceModeApplyButton.addEventListener('click',async()=>{const source_mode=valueOf('source_mode')||'hybrid';"
+          "if(source_mode===(savedConfig.source_mode||'hybrid')){updateSourceModeControls();return;}"
+          "sourceModeApplyButton.disabled=true;setStatus('Applying connection mode...','Saving the new mode and restarting the ESP now.',15000);"
+          "try{const response=await fetch('/api/source-mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_mode})});"
+          "const body=await response.json().catch(()=>({}));"
+          "if(response.ok){savedConfig.source_mode=source_mode;updateSourceModeControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
+          "else{setStatus(body.error||'Mode change failed',body.detail||'The new connection mode could not be saved.',8000);sourceModeApplyButton.disabled=false;updateSourceModeControls();}}"
+          "catch(error){setStatus('Mode change failed','The request to the ESP could not be completed.',8000);sourceModeApplyButton.disabled=false;updateSourceModeControls();}});}";
   html += "if(cloudConnectButton){cloudConnectButton.addEventListener('click',async()=>{const cloud_email=trimmedValue('cloud_email');"
           "const cloud_password=valueOf('cloud_password');"
-          "const source_mode=document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode;"
+          "const source_mode=savedConfig.source_mode||'hybrid';"
           "if(!cloud_email||!cloud_password){setStatus('Cloud credentials missing','Enter both Bambu email and password first.',5000);return;}"
           "cloudConnectButton.disabled=true;setStatus('Connecting cloud...','Saving credentials and starting the login now.',8000);"
           "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,source_mode})});"
@@ -837,7 +872,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "if(localConnectButton){localConnectButton.addEventListener('click',async()=>{const printer_host=trimmedValue('printer_host');"
           "const printer_serial=trimmedValue('printer_serial');"
           "const printer_access_code=trimmedValue('printer_access_code');"
-          "const source_mode=document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode;"
+          "const source_mode=savedConfig.source_mode||'hybrid';"
           "if(!printer_host||!printer_serial||!printer_access_code){setStatus('Local credentials missing','Enter printer host, serial and access code first.',5000);return;}"
           "localConnectButton.disabled=true;setStatus('Connecting local path...','Saving printer credentials and reconnecting MQTT now.',8000);"
           "try{const response=await fetch('/api/local/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer_host,printer_serial,printer_access_code,source_mode})});"
@@ -859,7 +894,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "if(wifiScanButton){wifiScanButton.addEventListener('click',refreshWifiScan);}";
   html += "arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(!input)return;"
           "input.addEventListener('input',queueArcPreview);input.addEventListener('change',commitArcColors);});";
-  html += "refreshWifiScan();updateHealth();setInterval(updateHealth,4000);";
+  html += "updateSourceModeControls();refreshWifiScan();updateHealth();setInterval(updateHealth,4000);";
   html += "</script>";
   html += "</main></body></html>";
 
@@ -880,6 +915,9 @@ esp_err_t SetupPortal::handle_health(httpd_req_t* request) {
   std::string body = "{";
   body += "\"status\":\"ok\",";
   body += "\"portal\":\"setup\",";
+  body += "\"source_mode\":\"";
+  body += to_string(portal->config_store_.load_source_mode());
+  body += "\",";
   body += "\"wifi_connected\":";
   body += (portal->wifi_manager_.is_station_connected() ? "true" : "false");
   body += ",";
@@ -1090,6 +1128,34 @@ esp_err_t SetupPortal::handle_arc_update(httpd_req_t* request, bool persist) {
   body += persist ? "true" : "false";
   body += "}";
   send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_source_mode_post(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) {
+    return parse_err;
+  }
+
+  const SourceMode source_mode = parse_source_mode_field(root);
+  cJSON_Delete(root);
+
+  ESP_LOGI(kTag, "Saving source mode only: %s", to_string(source_mode));
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
+                      "save source mode failed");
+
+  if (!portal->reboot_requested_) {
+    portal->reboot_requested_ = true;
+    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  }
+
+  send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
   return ESP_OK;
 }
 

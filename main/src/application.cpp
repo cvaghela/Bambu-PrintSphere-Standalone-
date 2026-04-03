@@ -6,6 +6,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "printsphere/error_lookup.hpp"
 #include "printsphere/status_resolver.hpp"
 
 namespace printsphere {
@@ -72,6 +73,9 @@ void Application::run() {
            static_cast<unsigned int>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
   ui_.set_arc_color_scheme(config_store_.load_arc_color_scheme());
   ESP_ERROR_CHECK(ui_.initialize());
+  if (!initialize_error_lookup_storage()) {
+    ESP_LOGW(kTag, "Storage-backed error lookup unavailable; falling back to generic error text");
+  }
 
   const BambuCloudCredentials cloud_credentials = config_store_.load_cloud_credentials();
   source_mode_ = config_store_.load_source_mode();

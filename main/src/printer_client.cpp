@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "cJSON.h"
+#include "printsphere/bambu_status.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -608,11 +609,13 @@ bool is_placeholder_stage_name(const std::string& stage_name) {
 
 bool is_active_gcode_state(const std::string& gcode_state) {
   return gcode_state == "RUNNING" || gcode_state == "PREPARE" ||
-         gcode_state == "PAUSE" || gcode_state == "PAUSED";
+         gcode_state == "PAUSE" || gcode_state == "PAUSED" ||
+         gcode_state == "INIT" || gcode_state == "SLICING";
 }
 
 bool is_terminal_gcode_state(const std::string& gcode_state) {
-  return gcode_state == "FAILED" || gcode_state == "FINISH" || gcode_state == "IDLE";
+  return gcode_state == "FAILED" || gcode_state == "FINISH" || gcode_state == "IDLE" ||
+         gcode_state == "OFFLINE";
 }
 
 bool is_idle_stage_marker(int stage_id, const std::string& stage_name) {
@@ -631,7 +634,7 @@ bool is_meaningful_active_stage(const std::string& stage_name) {
 }
 
 bool is_paused_gcode_state(const std::string& gcode_state) {
-  return gcode_state == "PAUSE" || gcode_state == "PAUSED";
+  return bambu_status_is_paused(gcode_state);
 }
 
 bool is_fault_pause_stage(const std::string& stage_name) {
@@ -646,153 +649,6 @@ bool is_fault_pause_stage(const std::string& stage_name) {
   }
 
   return lower.rfind("paused_", 0) == 0;
-}
-
-std::string stage_label_from_id(int stage_id) {
-  switch (stage_id) {
-    case 0:
-      return "printing";
-    case 1:
-      return "auto_bed_leveling";
-    case 2:
-      return "heatbed_preheating";
-    case 3:
-      return "sweeping_xy_mech_mode";
-    case 4:
-      return "changing_filament";
-    case 5:
-      return "m400_pause";
-    case 6:
-      return "paused_filament_runout";
-    case 7:
-      return "heating_hotend";
-    case 8:
-      return "calibrating_extrusion";
-    case 9:
-      return "scanning_bed_surface";
-    case 10:
-      return "inspecting_first_layer";
-    case 11:
-      return "identifying_build_plate_type";
-    case 12:
-      return "calibrating_micro_lidar";
-    case 13:
-      return "homing_toolhead";
-    case 14:
-      return "cleaning_nozzle_tip";
-    case 15:
-      return "checking_extruder_temperature";
-    case 16:
-      return "paused_user";
-    case 17:
-      return "paused_front_cover_falling";
-    case 18:
-      return "calibrating_micro_lidar";
-    case 19:
-      return "calibrating_extrusion_flow";
-    case 20:
-      return "paused_nozzle_temperature_malfunction";
-    case 21:
-      return "paused_heat_bed_temperature_malfunction";
-    case 22:
-      return "filament_unloading";
-    case 23:
-      return "paused_skipped_step";
-    case 24:
-      return "filament_loading";
-    case 25:
-      return "calibrating_motor_noise";
-    case 26:
-      return "paused_ams_lost";
-    case 27:
-      return "paused_low_fan_speed_heat_break";
-    case 28:
-      return "paused_chamber_temperature_control_error";
-    case 29:
-      return "cooling_chamber";
-    case 30:
-      return "paused_user_gcode";
-    case 31:
-      return "motor_noise_showoff";
-    case 32:
-      return "paused_nozzle_filament_covered_detected";
-    case 33:
-      return "paused_cutter_error";
-    case 34:
-      return "paused_first_layer_error";
-    case 35:
-      return "paused_nozzle_clog";
-    case 36:
-      return "check_absolute_accuracy_before_calibration";
-    case 37:
-      return "absolute_accuracy_calibration";
-    case 38:
-      return "check_absolute_accuracy_after_calibration";
-    case 39:
-      return "calibrate_nozzle_offset";
-    case 40:
-      return "bed_level_high_temperature";
-    case 41:
-      return "check_quick_release";
-    case 42:
-      return "check_door_and_cover";
-    case 43:
-      return "laser_calibration";
-    case 44:
-      return "check_plaform";
-    case 45:
-      return "check_birdeye_camera_position";
-    case 46:
-      return "calibrate_birdeye_camera";
-    case 47:
-      return "bed_level_phase_1";
-    case 48:
-      return "bed_level_phase_2";
-    case 49:
-      return "heating_chamber";
-    case 50:
-      return "heated_bedcooling";
-    case 51:
-      return "print_calibration_lines";
-    case 52:
-      return "check_material";
-    case 53:
-      return "calibrating_live_view_camera";
-    case 54:
-      return "waiting_for_heatbed_temperature";
-    case 55:
-      return "check_material_position";
-    case 56:
-      return "calibrating_cutter_model_offset";
-    case 57:
-      return "measuring_surface";
-    case 58:
-      return "thermal_preconditioning";
-    case 59:
-      return "homing_blade_holder";
-    case 60:
-      return "calibrating_camera_offset";
-    case 61:
-      return "calibrating_blade_holder_position";
-    case 62:
-      return "hotend_pick_place_test";
-    case 63:
-      return "waiting_chamber_temperature_equalize";
-    case 64:
-      return "preparing_hotend";
-    case 65:
-      return "calibrating_detection_nozzle_clumping";
-    case 66:
-      return "purifying_chamber_air";
-    case 77:
-      return "preparing_ams";
-    case -1:
-      return "idle";
-    case 255:
-      return "idle";
-    default:
-      return {};
-  }
 }
 
 std::string resolved_stage_from_payload(const std::string& effective_gcode_state,
@@ -829,32 +685,11 @@ std::string resolved_stage_from_payload(const std::string& effective_gcode_state
     return {};
   }
 
-  if (const std::string stage_label = stage_label_from_id(stage_id); !stage_label.empty()) {
+  if (const std::string stage_label = bambu_stage_label_from_id(stage_id); !stage_label.empty()) {
     return stage_label;
   }
 
-  if (!effective_gcode_state.empty()) {
-    if (effective_gcode_state == "RUNNING") {
-      return "Printing";
-    }
-    if (effective_gcode_state == "PREPARE") {
-      return "Preparing";
-    }
-    if (effective_gcode_state == "PAUSE" || effective_gcode_state == "PAUSED") {
-      return "Paused";
-    }
-    if (effective_gcode_state == "FINISH") {
-      return "Finished";
-    }
-    if (effective_gcode_state == "IDLE") {
-      return "Idle";
-    }
-    if (effective_gcode_state == "FAILED") {
-      return has_concrete_error ? "Failed" : "Stopped";
-    }
-  }
-
-  return {};
+  return bambu_default_stage_label_for_status(effective_gcode_state, has_concrete_error);
 }
 
 }  // namespace
@@ -1651,54 +1486,21 @@ void PrinterClient::request_initial_sync() {
 
 PrintLifecycleState PrinterClient::lifecycle_from_state(const std::string& gcode_state,
                                                         bool has_concrete_error) {
-  if (has_concrete_error) {
-    return PrintLifecycleState::kError;
-  }
-
-  if (gcode_state == "RUNNING") {
-    return PrintLifecycleState::kPrinting;
-  }
-  if (gcode_state == "PREPARE") {
-    return PrintLifecycleState::kPreparing;
-  }
-  if (gcode_state == "PAUSE" || gcode_state == "PAUSED") {
-    return PrintLifecycleState::kPaused;
-  }
-  if (gcode_state == "FINISH") {
-    return PrintLifecycleState::kFinished;
-  }
-  if (gcode_state == "IDLE") {
+  const PrintLifecycleState lifecycle = lifecycle_from_bambu_status(gcode_state, has_concrete_error);
+  if (gcode_state == "FAILED" && !has_concrete_error) {
     return PrintLifecycleState::kIdle;
   }
-  if (gcode_state == "FAILED") {
-    return PrintLifecycleState::kIdle;
-  }
-  return PrintLifecycleState::kUnknown;
+  return lifecycle;
 }
 
 std::string PrinterClient::stage_label_for(const std::string& gcode_state, int stage_id,
                                            bool has_concrete_error) {
-  if (const std::string stage_label = stage_label_from_id(stage_id); !stage_label.empty()) {
+  if (const std::string stage_label = bambu_stage_label_from_id(stage_id); !stage_label.empty()) {
     return stage_label;
   }
-
-  if (gcode_state == "RUNNING") {
-    return "Printing";
-  }
-  if (gcode_state == "PREPARE") {
-    return "Preparing";
-  }
-  if (gcode_state == "PAUSE" || gcode_state == "PAUSED") {
-    return "Paused";
-  }
-  if (gcode_state == "FINISH") {
-    return "Finished";
-  }
-  if (gcode_state == "IDLE") {
-    return "Idle";
-  }
-  if (gcode_state == "FAILED") {
-    return has_concrete_error ? "Failed" : "Stopped";
+  const std::string fallback = bambu_default_stage_label_for_status(gcode_state, has_concrete_error);
+  if (fallback != "Status") {
+    return fallback;
   }
   if (stage_id >= 0) {
     char buffer[24] = {};

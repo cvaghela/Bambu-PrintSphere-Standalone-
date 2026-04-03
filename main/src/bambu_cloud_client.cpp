@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cJSON.h"
+#include "printsphere/bambu_status.hpp"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_system.h"
@@ -767,6 +768,13 @@ float normalize_temperature_candidate(float value) {
 struct NozzleTemperatureBundle {
   float active = 0.0f;
   float secondary = 0.0f;
+  bool active_present = false;
+  bool secondary_present = false;
+};
+
+struct TemperatureSample {
+  float value = 0.0f;
+  bool present = false;
 };
 
 int extract_active_nozzle_index(const cJSON* device) {
@@ -775,8 +783,10 @@ int extract_active_nozzle_index(const cJSON* device) {
 }
 
 void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_index,
-                                  float* active_temp, float* secondary_temp) {
-  if (!cJSON_IsArray(info_array) || active_temp == nullptr || secondary_temp == nullptr) {
+                                  float* active_temp, bool* active_present,
+                                  float* secondary_temp, bool* secondary_present) {
+  if (!cJSON_IsArray(info_array) || active_temp == nullptr || active_present == nullptr ||
+      secondary_temp == nullptr || secondary_present == nullptr) {
     return;
   }
 
@@ -802,8 +812,10 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
     const int id = json_int_local(item, "id", -1);
     if (id == active_nozzle_index) {
       *active_temp = temp;
+      *active_present = true;
     } else if (id >= 0 && *secondary_temp <= 0.0f) {
       *secondary_temp = temp;
+      *secondary_present = true;
     } else if (fallback_secondary < -999.0f) {
       fallback_secondary = temp;
     }
@@ -811,9 +823,11 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
 
   if (*active_temp <= 0.0f && first_temp > -999.0f) {
     *active_temp = first_temp;
+    *active_present = true;
   }
   if (*secondary_temp <= 0.0f && fallback_secondary > -999.0f) {
     *secondary_temp = fallback_secondary;
+    *secondary_present = true;
   }
 }
 
@@ -839,6 +853,7 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
                           json_number_local(source, "nozzle_temp", -1000.0f)));
     if (direct > -999.0f) {
       bundle.active = direct;
+      bundle.active_present = true;
     }
 
     const cJSON* device = child_object_local(source, "device");
@@ -848,9 +863,11 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
 
     const int active_nozzle_index = extract_active_nozzle_index(device);
     merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "nozzle"), "info"),
-                                 active_nozzle_index, &bundle.active, &bundle.secondary);
+                                 active_nozzle_index, &bundle.active, &bundle.active_present,
+                                 &bundle.secondary, &bundle.secondary_present);
     merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "extruder"), "info"),
-                                 active_nozzle_index, &bundle.active, &bundle.secondary);
+                                 active_nozzle_index, &bundle.active, &bundle.active_present,
+                                 &bundle.secondary, &bundle.secondary_present);
   }
 
   if (bundle.active <= 0.0f) {
@@ -860,6 +877,7 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
                                         "hotendTemperature"},
                                        &bundle.active)) {
       bundle.active = normalize_temperature_candidate(bundle.active);
+      bundle.active_present = true;
     }
   }
   if (bundle.secondary <= 0.0f) {
@@ -872,13 +890,15 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
                                         "tool1_nozzle_temper", "tool1_nozzle_temp"},
                                        &bundle.secondary)) {
       bundle.secondary = normalize_temperature_candidate(bundle.secondary);
+      bundle.secondary_present = true;
     }
   }
 
   return bundle;
 }
 
-float extract_cloud_bed_temperature_c(const cJSON* item, float fallback) {
+TemperatureSample extract_cloud_bed_temperature_c(const cJSON* item, float fallback) {
+  TemperatureSample sample{fallback, false};
   const cJSON* print_history = child_object_local(item, "print_history_info") != nullptr
                                    ? child_object_local(item, "print_history_info")
                                    : child_object_local(item, "printHistoryInfo");
@@ -896,34 +916,43 @@ float extract_cloud_bed_temperature_c(const cJSON* item, float fallback) {
         bed_info != nullptr) {
       const int packed = json_int_local(bed_info, "temp", -1);
       if (packed >= 0) {
-        return packed_temp_current_value(packed, fallback);
+        sample.value = packed_temp_current_value(packed, fallback);
+        sample.present = true;
+        return sample;
       }
     }
 
     const int packed = json_int_local(device, "bed_temp", -1);
     if (packed >= 0) {
-      return packed_temp_current_value(packed, fallback);
+      sample.value = packed_temp_current_value(packed, fallback);
+      sample.present = true;
+      return sample;
     }
 
     const float direct = normalize_temperature_candidate(
         json_number_local(source, "bed_temper",
                           json_number_local(source, "bed_temp", -1000.0f)));
     if (direct > -999.0f) {
-      return direct;
+      sample.value = direct;
+      sample.present = true;
+      return sample;
     }
   }
 
   float value = fallback;
-  return find_number_for_keys_recursive(item,
-                                        {"bed_temper", "bed_temp", "bed_temperature",
-                                         "bedTemperature", "hotbed_temper", "hotbed_temp",
-                                         "hotbed_temperature", "hotbedTemperature"},
-                                        &value)
-             ? normalize_temperature_candidate(value)
-             : fallback;
+  if (find_number_for_keys_recursive(item,
+                                     {"bed_temper", "bed_temp", "bed_temperature",
+                                      "bedTemperature", "hotbed_temper", "hotbed_temp",
+                                      "hotbed_temperature", "hotbedTemperature"},
+                                     &value)) {
+    sample.value = normalize_temperature_candidate(value);
+    sample.present = true;
+  }
+  return sample;
 }
 
-float extract_cloud_chamber_temperature_c(const cJSON* item, float fallback) {
+TemperatureSample extract_cloud_chamber_temperature_c(const cJSON* item, float fallback) {
+  TemperatureSample sample{fallback, false};
   const cJSON* print_history = child_object_local(item, "print_history_info") != nullptr
                                    ? child_object_local(item, "print_history_info")
                                    : child_object_local(item, "printHistoryInfo");
@@ -941,14 +970,18 @@ float extract_cloud_chamber_temperature_c(const cJSON* item, float fallback) {
         ctc_info != nullptr) {
       const int packed = json_int_local(ctc_info, "temp", -1);
       if (packed >= 0) {
-        return packed_temp_current_value(packed, fallback);
+        sample.value = packed_temp_current_value(packed, fallback);
+        sample.present = true;
+        return sample;
       }
     }
     if (const cJSON* chamber_info = child_object_local(child_object_local(device, "chamber"), "info");
         chamber_info != nullptr) {
       const int packed = json_int_local(chamber_info, "temp", -1);
       if (packed >= 0) {
-        return packed_temp_current_value(packed, fallback);
+        sample.value = packed_temp_current_value(packed, fallback);
+        sample.present = true;
+        return sample;
       }
     }
 
@@ -956,18 +989,22 @@ float extract_cloud_chamber_temperature_c(const cJSON* item, float fallback) {
         json_number_local(source, "chamber_temper",
                           json_number_local(source, "chamber_temp", -1000.0f)));
     if (direct > -999.0f) {
-      return direct;
+      sample.value = direct;
+      sample.present = true;
+      return sample;
     }
   }
 
   float value = fallback;
-  return find_number_for_keys_recursive(item,
-                                        {"chamber_temper", "chamber_temp",
-                                         "chamber_temperature", "chamberTemperature",
-                                         "ctc_temperature", "ctcTemperature"},
-                                        &value)
-             ? normalize_temperature_candidate(value)
-             : fallback;
+  if (find_number_for_keys_recursive(item,
+                                     {"chamber_temper", "chamber_temp",
+                                      "chamber_temperature", "chamberTemperature",
+                                      "ctc_temperature", "ctcTemperature"},
+                                     &value)) {
+    sample.value = normalize_temperature_candidate(value);
+    sample.present = true;
+  }
+  return sample;
 }
 
 int extract_cloud_print_error_code(const cJSON* item, int fallback) {
@@ -1449,11 +1486,26 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     const NozzleTemperatureBundle nozzle_temps =
         extract_cloud_nozzle_temperature_bundle(print, current.nozzle_temp_c,
                                                 current.secondary_nozzle_temp_c);
+    const TemperatureSample bed_temp =
+        extract_cloud_bed_temperature_c(print, current.bed_temp_c);
+    const TemperatureSample chamber_temp =
+        extract_cloud_chamber_temperature_c(print, current.chamber_temp_c);
     current.nozzle_temp_c = nozzle_temps.active;
     current.secondary_nozzle_temp_c = nozzle_temps.secondary;
-    current.bed_temp_c = extract_cloud_bed_temperature_c(print, current.bed_temp_c);
-    current.chamber_temp_c =
-        extract_cloud_chamber_temperature_c(print, current.chamber_temp_c);
+    current.bed_temp_c = bed_temp.value;
+    current.chamber_temp_c = chamber_temp.value;
+    if (nozzle_temps.active_present) {
+      current.nozzle_temp_last_update_ms = current.last_update_ms;
+    }
+    if (nozzle_temps.secondary_present) {
+      current.secondary_nozzle_temp_last_update_ms = current.last_update_ms;
+    }
+    if (bed_temp.present) {
+      current.bed_temp_last_update_ms = current.last_update_ms;
+    }
+    if (chamber_temp.present) {
+      current.chamber_temp_last_update_ms = current.last_update_ms;
+    }
 
     current.print_error_code =
         normalize_cloud_print_error_code(extract_cloud_print_error_code(print, current.print_error_code));
@@ -2112,8 +2164,8 @@ bool BambuCloudClient::fetch_bindings() {
     const NozzleTemperatureBundle nozzle_temps =
         extract_cloud_nozzle_temperature_bundle(best_device, current.nozzle_temp_c,
                                                current.secondary_nozzle_temp_c);
-    const float bed_temp_c = extract_cloud_bed_temperature_c(best_device, current.bed_temp_c);
-    const float chamber_temp_c =
+    const TemperatureSample bed_temp = extract_cloud_bed_temperature_c(best_device, current.bed_temp_c);
+    const TemperatureSample chamber_temp =
         extract_cloud_chamber_temperature_c(best_device, current.chamber_temp_c);
     int print_error_code = normalize_cloud_print_error_code(
         extract_cloud_print_error_code(best_device, current.print_error_code));
@@ -2150,8 +2202,20 @@ bool BambuCloudClient::fetch_bindings() {
     if (!preserve_live_state) {
       current.nozzle_temp_c = nozzle_temps.active;
       current.secondary_nozzle_temp_c = nozzle_temps.secondary;
-      current.bed_temp_c = bed_temp_c;
-      current.chamber_temp_c = chamber_temp_c;
+      current.bed_temp_c = bed_temp.value;
+      current.chamber_temp_c = chamber_temp.value;
+      if (nozzle_temps.active_present) {
+        current.nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (nozzle_temps.secondary_present) {
+        current.secondary_nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (bed_temp.present) {
+        current.bed_temp_last_update_ms = current.last_update_ms;
+      }
+      if (chamber_temp.present) {
+        current.chamber_temp_last_update_ms = current.last_update_ms;
+      }
       current.print_error_code = print_error_code;
       current.hms_alert_count = static_cast<uint16_t>(std::max(hms_count, 0));
       current.non_error_stop = non_error_stop;
@@ -2196,17 +2260,29 @@ bool BambuCloudClient::fetch_bindings() {
         current.has_error = true;
       }
     } else {
+      if (nozzle_temps.active_present) {
+        current.nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (nozzle_temps.secondary_present) {
+        current.secondary_nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (bed_temp.present) {
+        current.bed_temp_last_update_ms = current.last_update_ms;
+      }
+      if (chamber_temp.present) {
+        current.chamber_temp_last_update_ms = current.last_update_ms;
+      }
       if (current.nozzle_temp_c <= 0.0f && nozzle_temps.active > 0.0f) {
         current.nozzle_temp_c = nozzle_temps.active;
       }
       if (current.secondary_nozzle_temp_c <= 0.0f && nozzle_temps.secondary > 0.0f) {
         current.secondary_nozzle_temp_c = nozzle_temps.secondary;
       }
-      if (current.bed_temp_c <= 0.0f && bed_temp_c > 0.0f) {
-        current.bed_temp_c = bed_temp_c;
+      if (current.bed_temp_c <= 0.0f && bed_temp.value > 0.0f) {
+        current.bed_temp_c = bed_temp.value;
       }
-      if (current.chamber_temp_c <= 0.0f && chamber_temp_c > 0.0f) {
-        current.chamber_temp_c = chamber_temp_c;
+      if (current.chamber_temp_c <= 0.0f && chamber_temp.value > 0.0f) {
+        current.chamber_temp_c = chamber_temp.value;
       }
       if (current.progress_percent <= 0.0f && effective_progress_value >= 0.0f) {
         current.progress_percent =
@@ -2281,6 +2357,9 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
   float selected_bed_temp_c = 0.0f;
   float selected_chamber_temp_c = 0.0f;
   float selected_secondary_nozzle_temp_c = 0.0f;
+  NozzleTemperatureBundle selected_nozzle_temps{};
+  TemperatureSample selected_bed_temp{};
+  TemperatureSample selected_chamber_temp{};
   uint32_t selected_remaining_seconds = 0U;
   uint16_t selected_current_layer = 0U;
   uint16_t selected_total_layers = 0U;
@@ -2370,12 +2449,14 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
     selected_stage = extract_stage_text(selected_item);
     selected_print_type = extract_print_type_text(selected_item);
     selected_progress = extract_progress(selected_item);
-    const NozzleTemperatureBundle nozzle_temps =
+    selected_nozzle_temps =
         extract_cloud_nozzle_temperature_bundle(selected_item, 0.0f, 0.0f);
-    selected_nozzle_temp_c = nozzle_temps.active;
-    selected_secondary_nozzle_temp_c = nozzle_temps.secondary;
-    selected_bed_temp_c = extract_cloud_bed_temperature_c(selected_item, 0.0f);
-    selected_chamber_temp_c = extract_cloud_chamber_temperature_c(selected_item, 0.0f);
+    selected_bed_temp = extract_cloud_bed_temperature_c(selected_item, 0.0f);
+    selected_chamber_temp = extract_cloud_chamber_temperature_c(selected_item, 0.0f);
+    selected_nozzle_temp_c = selected_nozzle_temps.active;
+    selected_secondary_nozzle_temp_c = selected_nozzle_temps.secondary;
+    selected_bed_temp_c = selected_bed_temp.value;
+    selected_chamber_temp_c = selected_chamber_temp.value;
     selected_remaining_seconds = extract_remaining_seconds(selected_item);
     selected_current_layer = extract_current_layer(selected_item);
     selected_total_layers = extract_total_layers(selected_item);
@@ -2422,9 +2503,9 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
                                   selected_lifecycle != PrintLifecycleState::kUnknown ||
                                   selected_progress > 0.0f || selected_remaining_seconds > 0U ||
                                   selected_current_layer > 0U || selected_total_layers > 0U ||
-                                  selected_nozzle_temp_c > 0.0f ||
-                                  selected_secondary_nozzle_temp_c > 0.0f ||
-                                  selected_bed_temp_c > 0.0f || selected_chamber_temp_c > 0.0f ||
+                                  selected_nozzle_temps.active_present ||
+                                  selected_nozzle_temps.secondary_present ||
+                                  selected_bed_temp.present || selected_chamber_temp.present ||
                                   selected_has_error;
   const std::string preview_detail = selected_cover.empty() ? "Connected to Bambu Cloud, no cover image yet"
                                                             : "Connected to Bambu Cloud";
@@ -2518,17 +2599,29 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
           selected_lifecycle == PrintLifecycleState::kError) {
         current.total_layers = selected_total_layers;
       }
-      if (selected_nozzle_temp_c > 0.0f) {
+      if (selected_nozzle_temps.active_present) {
         current.nozzle_temp_c = selected_nozzle_temp_c;
       }
-      if (selected_secondary_nozzle_temp_c > 0.0f) {
+      if (selected_nozzle_temps.secondary_present) {
         current.secondary_nozzle_temp_c = selected_secondary_nozzle_temp_c;
       }
-      if (selected_bed_temp_c > 0.0f) {
+      if (selected_bed_temp.present) {
         current.bed_temp_c = selected_bed_temp_c;
       }
-      if (selected_chamber_temp_c > 0.0f) {
+      if (selected_chamber_temp.present) {
         current.chamber_temp_c = selected_chamber_temp_c;
+      }
+      if (selected_nozzle_temps.active_present) {
+        current.nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (selected_nozzle_temps.secondary_present) {
+        current.secondary_nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (selected_bed_temp.present) {
+        current.bed_temp_last_update_ms = current.last_update_ms;
+      }
+      if (selected_chamber_temp.present) {
+        current.chamber_temp_last_update_ms = current.last_update_ms;
       }
       current.print_error_code = selected_print_error_code;
       current.hms_alert_count = static_cast<uint16_t>(std::max(selected_hms_count, 0));
@@ -2541,6 +2634,18 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
         current.detail = error_detail;
       }
     } else {
+      if (selected_nozzle_temps.active_present) {
+        current.nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (selected_nozzle_temps.secondary_present) {
+        current.secondary_nozzle_temp_last_update_ms = current.last_update_ms;
+      }
+      if (selected_bed_temp.present) {
+        current.bed_temp_last_update_ms = current.last_update_ms;
+      }
+      if (selected_chamber_temp.present) {
+        current.chamber_temp_last_update_ms = current.last_update_ms;
+      }
       if (current.progress_percent <= 0.0f && selected_progress > 0.0f) {
         current.progress_percent = selected_progress;
       }
@@ -2553,16 +2658,16 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
       if (current.total_layers == 0U && selected_total_layers > 0U) {
         current.total_layers = selected_total_layers;
       }
-      if (current.nozzle_temp_c <= 0.0f && selected_nozzle_temp_c > 0.0f) {
+      if (selected_nozzle_temps.active_present) {
         current.nozzle_temp_c = selected_nozzle_temp_c;
       }
-      if (current.secondary_nozzle_temp_c <= 0.0f && selected_secondary_nozzle_temp_c > 0.0f) {
+      if (selected_nozzle_temps.secondary_present) {
         current.secondary_nozzle_temp_c = selected_secondary_nozzle_temp_c;
       }
-      if (current.bed_temp_c <= 0.0f && selected_bed_temp_c > 0.0f) {
+      if (selected_bed_temp.present) {
         current.bed_temp_c = selected_bed_temp_c;
       }
-      if (current.chamber_temp_c <= 0.0f && selected_chamber_temp_c > 0.0f) {
+      if (selected_chamber_temp.present) {
         current.chamber_temp_c = selected_chamber_temp_c;
       }
     }
@@ -3450,81 +3555,14 @@ uint16_t BambuCloudClient::extract_total_layers(const cJSON* item) {
 }
 
 PrintLifecycleState BambuCloudClient::cloud_lifecycle_from_status(const std::string& status_text) {
-  if (status_text.empty()) {
-    return PrintLifecycleState::kUnknown;
-  }
-
-  std::string normalized;
-  normalized.reserve(status_text.size());
-  for (const char ch : status_text) {
-    if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
-      normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
-    }
-  }
-
-  if (normalized.find("FAIL") != std::string::npos || normalized.find("ERROR") != std::string::npos ||
-      normalized.find("CANCEL") != std::string::npos) {
-    return PrintLifecycleState::kError;
-  }
-  if (normalized.find("PAUSE") != std::string::npos) {
-    return PrintLifecycleState::kPaused;
-  }
-  if (normalized.find("PREPARE") != std::string::npos ||
-      normalized.find("PREPARING") != std::string::npos ||
-      normalized.find("STARTING") != std::string::npos ||
-      normalized.find("HEATING") != std::string::npos ||
-      normalized.find("DOWNLOAD") != std::string::npos) {
-    return PrintLifecycleState::kPreparing;
-  }
-  if (normalized.find("RUNNING") != std::string::npos ||
-      normalized.find("PRINTING") != std::string::npos ||
-      normalized.find("PROCESSING") != std::string::npos) {
-    return PrintLifecycleState::kPrinting;
-  }
-  if (normalized.find("DONE") != std::string::npos ||
-      normalized.find("SUCCESS") != std::string::npos ||
-      normalized.find("COMPLETE") != std::string::npos ||
-      normalized.find("COMPLETED") != std::string::npos ||
-      normalized.find("FINISH") != std::string::npos) {
-    return PrintLifecycleState::kFinished;
-  }
-  if (normalized.find("IDLE") != std::string::npos || normalized.find("WAIT") != std::string::npos) {
-    return PrintLifecycleState::kIdle;
-  }
-
-  return PrintLifecycleState::kUnknown;
+  return lifecycle_from_bambu_status(status_text);
 }
 
 std::string BambuCloudClient::cloud_stage_label_for(const std::string& status_text,
                                                     PrintLifecycleState lifecycle) {
-  std::string normalized;
-  normalized.reserve(status_text.size());
-  for (const char ch : status_text) {
-    if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
-      normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
-    }
-  }
-  if (normalized.find("DOWNLOAD") != std::string::npos) {
-    return "Model Download";
-  }
-
-  switch (lifecycle) {
-    case PrintLifecycleState::kPreparing:
-      return "Preparing";
-    case PrintLifecycleState::kPrinting:
-      return "Printing";
-    case PrintLifecycleState::kPaused:
-      return "Paused";
-    case PrintLifecycleState::kFinished:
-      return "Finished";
-    case PrintLifecycleState::kIdle:
-      return "Idle";
-    case PrintLifecycleState::kError:
-      return "Failed";
-    case PrintLifecycleState::kUnknown:
-    default:
-      return status_text;
-  }
+  (void)lifecycle;
+  const std::string stage = bambu_default_stage_label_for_status(status_text, false);
+  return stage == "Status" ? status_text : stage;
 }
 
 const cJSON* BambuCloudClient::child_object(const cJSON* object, const char* key) {

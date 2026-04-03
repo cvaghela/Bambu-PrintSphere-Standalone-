@@ -5,6 +5,9 @@
 #include <cmath>
 #include <string>
 
+#include "printsphere/bambu_status.hpp"
+#include "printsphere/error_lookup.hpp"
+
 namespace printsphere {
 
 namespace {
@@ -55,16 +58,15 @@ std::string titlecase_words(std::string value) {
 }
 
 bool is_failed_status(const std::string& status) {
-  return status == "failed" || contains_token(status, "fail") || contains_token(status, "cancel");
+  return bambu_status_is_failed(status);
 }
 
 bool is_finished_status(const std::string& status) {
-  return status == "finish" || status == "finished" || contains_token(status, "finish") ||
-         contains_token(status, "success") || contains_token(status, "complete");
+  return bambu_status_is_finished(status);
 }
 
 bool is_prepare_status(const std::string& status, const std::string& stage) {
-  return status == "prepare" || contains_token(stage, "heatbed_preheating") ||
+  return bambu_status_is_preparing(status) || contains_token(stage, "heatbed_preheating") ||
          contains_token(stage, "nozzle_preheating") || contains_token(stage, "heating_hotend") ||
          contains_token(stage, "heating_chamber") ||
          contains_token(stage, "waiting_for_heatbed_temperature") ||
@@ -74,7 +76,7 @@ bool is_prepare_status(const std::string& status, const std::string& stage) {
 }
 
 bool is_paused_status(const std::string& status, const std::string& stage) {
-  return contains_token(status, "pause") || contains_token(stage, "pause");
+  return bambu_status_is_paused(status) || contains_token(stage, "pause");
 }
 
 bool is_non_error_stop(const PrinterSnapshot& snapshot) {
@@ -239,6 +241,7 @@ bool local_runtime_substate_should_override(const PrinterSnapshot& target,
 
 constexpr uint64_t kLocalSourceFreshMs = 90ULL * 1000ULL;
 constexpr uint64_t kCloudSourceFreshMs = 5ULL * 60ULL * 1000ULL;
+constexpr uint64_t kCloudTemperatureRetainMs = 60ULL * 1000ULL;
 constexpr uint64_t kCloudPreviewFreshMs = 30ULL * 60ULL * 1000ULL;
 
 bool is_recent_enough(uint64_t last_update_ms, uint64_t now_ms, uint64_t max_age_ms) {
@@ -266,6 +269,10 @@ bool cloud_preview_available(const BambuCloudSnapshot& snapshot, uint64_t now_ms
   }
   return !snapshot.preview_url.empty() || snapshot.preview_blob != nullptr ||
          !snapshot.preview_title.empty();
+}
+
+bool cloud_temperature_recent(float value, uint64_t last_update_ms, uint64_t now_ms) {
+  return value > 0.0f && is_recent_enough(last_update_ms, now_ms, kCloudTemperatureRetainMs);
 }
 
 bool local_camera_available(const PrinterSnapshot& snapshot) {
@@ -446,11 +453,26 @@ void apply_local_temperature_bundle(PrinterSnapshot& target, const PrinterSnapsh
   target.secondary_nozzle_temp_c = local_snapshot.secondary_nozzle_temp_c;
 }
 
-void apply_cloud_temperature_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
-  target.nozzle_temp_c = cloud_snapshot.nozzle_temp_c;
-  target.bed_temp_c = cloud_snapshot.bed_temp_c;
-  target.chamber_temp_c = cloud_snapshot.chamber_temp_c;
-  target.secondary_nozzle_temp_c = cloud_snapshot.secondary_nozzle_temp_c;
+void apply_cloud_temperature_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot,
+                                    uint64_t now_ms) {
+  target.nozzle_temp_c = cloud_temperature_recent(cloud_snapshot.nozzle_temp_c,
+                                                  cloud_snapshot.nozzle_temp_last_update_ms, now_ms)
+                             ? cloud_snapshot.nozzle_temp_c
+                             : 0.0f;
+  target.bed_temp_c = cloud_temperature_recent(cloud_snapshot.bed_temp_c,
+                                               cloud_snapshot.bed_temp_last_update_ms, now_ms)
+                          ? cloud_snapshot.bed_temp_c
+                          : 0.0f;
+  target.chamber_temp_c =
+      cloud_temperature_recent(cloud_snapshot.chamber_temp_c,
+                               cloud_snapshot.chamber_temp_last_update_ms, now_ms)
+          ? cloud_snapshot.chamber_temp_c
+          : 0.0f;
+  target.secondary_nozzle_temp_c =
+      cloud_temperature_recent(cloud_snapshot.secondary_nozzle_temp_c,
+                               cloud_snapshot.secondary_nozzle_temp_last_update_ms, now_ms)
+          ? cloud_snapshot.secondary_nozzle_temp_c
+          : 0.0f;
 }
 
 void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
@@ -507,15 +529,40 @@ std::string pretty_stage(const std::string& stage) {
   return {};
 }
 
+PrinterModel effective_model_for_snapshot(const PrinterSnapshot& snapshot);
+
 std::string pretty_status(const std::string& status) {
-  if (contains_token(status, "download")) return "downloading";
-  if (status == "prepare") return "preparing";
-  if (status == "running") return "printing";
-  if (status == "finish" || status == "finished") return "printing";
-  if (status == "failed") return "failed";
-  if (contains_token(status, "pause")) return "paused";
   if (contains_token(status, "cool")) return "cooling";
-  return {};
+  return bambu_pretty_status(status);
+}
+
+bool is_generic_finished_detail(const std::string& detail, const std::string& stage) {
+  if (detail.empty()) {
+    return true;
+  }
+  const std::string normalized_detail = lower_copy(detail);
+  const std::string normalized_stage = lower_copy(stage);
+  return normalized_detail == normalized_stage || normalized_detail == "printing" ||
+         normalized_detail == "preparing" || normalized_detail == "paused" ||
+         normalized_detail == "running" || normalized_detail == "finished" ||
+         normalized_detail == "done" || normalized_detail == "status";
+}
+
+void apply_resolved_detail(PrinterSnapshot& snapshot) {
+  const PrinterModel model = effective_model_for_snapshot(snapshot);
+  const std::string resolved_error =
+      format_resolved_error_detail(snapshot.print_error_code, snapshot.hms_alert_count, model);
+  if (!resolved_error.empty()) {
+    snapshot.detail = resolved_error;
+    return;
+  }
+
+  if (snapshot.lifecycle == PrintLifecycleState::kFinished || snapshot.ui_status == "done") {
+    snapshot.remaining_seconds = 0U;
+    if (is_generic_finished_detail(snapshot.detail, snapshot.stage)) {
+      snapshot.detail.clear();
+    }
+  }
 }
 
 PrinterModel effective_model_for_snapshot(const PrinterSnapshot& snapshot) {
@@ -575,11 +622,15 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
   const bool input_error = snapshot.has_error;
   const bool paused = is_paused_status(status, stage);
   const bool preparing = is_prepare_status(status, stage);
+  const bool idle_status = status == "idle" || status == "offline" || contains_token(status, "wait");
   const bool idleish = contains_token(stage, "idle") || contains_token(stage, "offline");
   const bool done_strict =
-      is_finished_status(status) && contains_token(stage, "idle") && progress == 100;
-  const bool running_like = status == "running" || status == "prepare" ||
-                            contains_token(status, "print") || contains_token(status, "download") ||
+      snapshot.lifecycle == PrintLifecycleState::kFinished ||
+      (is_finished_status(status) &&
+       (progress == 100 || snapshot.remaining_seconds == 0U || contains_token(stage, "idle")));
+  const bool running_like =
+      bambu_status_is_printing(status) || bambu_status_is_preparing(status) ||
+      contains_token(status, "print") || contains_token(status, "download") ||
                             (progress > 0 && progress < 100);
   const bool active_hint =
       running_like || paused || preparing || filament_stage || download_stage ||
@@ -609,7 +660,7 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
     snapshot.lifecycle = PrintLifecycleState::kPreparing;
   } else if (snapshot.print_active) {
     snapshot.lifecycle = PrintLifecycleState::kPrinting;
-  } else if (idleish || status == "idle" || status == "offline") {
+  } else if (idleish || idle_status) {
     snapshot.lifecycle = PrintLifecycleState::kIdle;
   }
 
@@ -631,7 +682,7 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
     snapshot.ui_status = "bed level";
   } else if (cooling_stage) {
     snapshot.ui_status = "cooling";
-  } else if (setup_stage || status == "prepare") {
+  } else if (setup_stage || preparing) {
     snapshot.ui_status = "preparing";
   } else {
     const bool offline =
@@ -642,7 +693,7 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
     if (idleish || offline) {
       if (offline) {
         snapshot.ui_status = "offline";
-      } else if (status == "prepare") {
+      } else if (preparing) {
         snapshot.ui_status = "preparing";
       } else if ((progress > 0 && progress < 100) || snapshot.print_active) {
         snapshot.ui_status = "printing";
@@ -668,6 +719,8 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
       }
     }
   }
+
+  apply_resolved_detail(snapshot);
 }
 
 PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool local_printer_enabled,
@@ -698,8 +751,14 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
   const bool local_temperatures_usable = local_fresh && local_snapshot.local_capabilities.temperatures;
   const bool cloud_temperatures_usable =
       cloud_fresh && cloud_snapshot.capabilities.temperatures &&
-      (cloud_snapshot.nozzle_temp_c > 0.0f || cloud_snapshot.bed_temp_c > 0.0f ||
-       cloud_snapshot.chamber_temp_c > 0.0f || cloud_snapshot.secondary_nozzle_temp_c > 0.0f);
+      (cloud_temperature_recent(cloud_snapshot.nozzle_temp_c,
+                                cloud_snapshot.nozzle_temp_last_update_ms, now_ms) ||
+       cloud_temperature_recent(cloud_snapshot.bed_temp_c,
+                                cloud_snapshot.bed_temp_last_update_ms, now_ms) ||
+       cloud_temperature_recent(cloud_snapshot.chamber_temp_c,
+                                cloud_snapshot.chamber_temp_last_update_ms, now_ms) ||
+       cloud_temperature_recent(cloud_snapshot.secondary_nozzle_temp_c,
+                                cloud_snapshot.secondary_nozzle_temp_last_update_ms, now_ms));
   const bool local_light_usable =
       local_fresh && local_snapshot.chamber_light_supported && local_snapshot.chamber_light_state_known;
   const bool cloud_light_usable =
@@ -731,7 +790,7 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
   if (local_temperatures_usable) {
     apply_local_temperature_bundle(snapshot, local_snapshot);
   } else if (cloud_temperatures_usable) {
-    apply_cloud_temperature_bundle(snapshot, cloud_snapshot);
+    apply_cloud_temperature_bundle(snapshot, cloud_snapshot, now_ms);
   }
   snapshot.chamber_light_supported =
       (local_enabled && local_snapshot.chamber_light_supported) ||
@@ -771,10 +830,12 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
       snapshot.detail = cloud_snapshot.detail;
     } else if (snapshot.status_source == FieldSource::kLocal && !local_snapshot.detail.empty()) {
       snapshot.detail = local_snapshot.detail;
-    } else if (!cloud_snapshot.detail.empty() && cloud_enabled) {
-      snapshot.detail = cloud_snapshot.detail;
     } else if (!local_snapshot.detail.empty() && local_enabled) {
       snapshot.detail = local_snapshot.detail;
+    } else if (!cloud_snapshot.detail.empty() && cloud_enabled &&
+               (source_mode == SourceMode::kCloudOnly || !local_enabled ||
+                snapshot.status_source == FieldSource::kCloud)) {
+      snapshot.detail = cloud_snapshot.detail;
     }
   }
 
