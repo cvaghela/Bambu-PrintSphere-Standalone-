@@ -118,6 +118,23 @@ void set_hidden(lv_obj_t* obj, bool hidden) {
   }
 }
 
+void set_clickable(lv_obj_t* obj, bool clickable) {
+  if (obj == nullptr) {
+    return;
+  }
+
+  const bool currently_clickable = lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+  if (currently_clickable == clickable) {
+    return;
+  }
+
+  if (clickable) {
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+  } else {
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+  }
+}
+
 void enable_touch_bubble(lv_obj_t* obj) {
   if (obj == nullptr) {
     return;
@@ -925,18 +942,27 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
 void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
   const int progress = std::clamp(static_cast<int>(snapshot.progress_percent + 0.5f), 0, 100);
   const RingVisual ring = lifecycle_ring_visual(snapshot, arc_colors_);
-  const lv_color_t main_color = lv_color_hex(ring.main_hex);
-  const lv_color_t indicator_color = lv_color_hex(ring.indicator_hex);
-  const lv_color_t text_color = lv_color_hex(stable_status_text_hex(snapshot, arc_colors_));
+  const uint32_t text_hex = stable_status_text_hex(snapshot, arc_colors_);
   const int displayed_value = (ring.value_override >= 0) ? ring.value_override : progress;
 
   if (lv_arc_get_value(status_arc_) != displayed_value) {
     lv_arc_set_value(status_arc_, displayed_value);
   }
-  lv_obj_set_style_arc_color(status_arc_, main_color, LV_PART_MAIN);
-  lv_obj_set_style_arc_color(status_arc_, indicator_color, LV_PART_INDICATOR);
-  lv_obj_set_style_text_color(progress_label_, text_color, 0);
-  lv_obj_set_style_text_color(status_label_, text_color, 0);
+
+  if (last_ring_main_hex_ != ring.main_hex) {
+    lv_obj_set_style_arc_color(status_arc_, lv_color_hex(ring.main_hex), LV_PART_MAIN);
+    last_ring_main_hex_ = ring.main_hex;
+  }
+  if (last_ring_indicator_hex_ != ring.indicator_hex) {
+    lv_obj_set_style_arc_color(status_arc_, lv_color_hex(ring.indicator_hex), LV_PART_INDICATOR);
+    last_ring_indicator_hex_ = ring.indicator_hex;
+  }
+  if (last_ring_text_hex_ != text_hex) {
+    const lv_color_t text_color = lv_color_hex(text_hex);
+    lv_obj_set_style_text_color(progress_label_, text_color, 0);
+    lv_obj_set_style_text_color(status_label_, text_color, 0);
+    last_ring_text_hex_ = text_hex;
+  }
 }
 
 bool Ui::ensure_preview_image_loaded_locked(bool force_reload) {
@@ -1072,41 +1098,60 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     preview_text_image_mode_ = has_page2_image;
   }
   set_label_text_if_changed(page2_note_, preview_note);
+  set_hidden(page2_subnote_, preview_subnote.empty());
   if (!preview_subnote.empty()) {
     set_label_text_if_changed(page2_subnote_, preview_subnote);
-    lv_obj_clear_flag(page2_subnote_, LV_OBJ_FLAG_HIDDEN);
-  } else {
-    lv_obj_add_flag(page2_subnote_, LV_OBJ_FLAG_HIDDEN);
   }
 
-  bool has_camera_image = last_camera_blob_ && !last_camera_blob_->empty();
+  bool has_camera_image =
+      camera_slot_initialized_ && camera_blobs_[active_camera_slot_] &&
+      !camera_blobs_[active_camera_slot_]->empty();
   if (snapshot.camera_blob && !snapshot.camera_blob->empty() && snapshot.camera_width > 0U &&
       snapshot.camera_height > 0U) {
-    if (last_camera_blob_.get() != snapshot.camera_blob.get() ||
+    const bool camera_blob_changed =
+        !camera_slot_initialized_ || camera_blobs_[active_camera_slot_].get() != snapshot.camera_blob.get();
+    if (camera_blob_changed ||
         last_camera_width_ != snapshot.camera_width || last_camera_height_ != snapshot.camera_height) {
-      lv_image_cache_drop(&camera_image_dsc_);
+      const uint8_t next_slot =
+          camera_slot_initialized_ ? static_cast<uint8_t>((active_camera_slot_ + 1U) % 2U) : 0U;
+      lv_image_cache_drop(&camera_image_dscs_[next_slot]);
+      lv_image_dsc_t next_dsc = {};
       if (configure_camera_rgb565(snapshot.camera_blob, snapshot.camera_width, snapshot.camera_height,
-                                  &camera_image_dsc_)) {
-        last_camera_blob_ = snapshot.camera_blob;
+                                  &next_dsc)) {
+        camera_blobs_[next_slot] = snapshot.camera_blob;
+        camera_image_dscs_[next_slot] = next_dsc;
+        active_camera_slot_ = next_slot;
+        camera_slot_initialized_ = true;
         last_camera_width_ = snapshot.camera_width;
         last_camera_height_ = snapshot.camera_height;
-        lv_image_set_src(page3_image_, &camera_image_dsc_);
+        lv_image_set_src(page3_image_, &camera_image_dscs_[active_camera_slot_]);
       } else {
-        std::memset(&camera_image_dsc_, 0, sizeof(camera_image_dsc_));
-        last_camera_blob_.reset();
+        camera_blobs_[next_slot].reset();
+        std::memset(&camera_image_dscs_[next_slot], 0, sizeof(camera_image_dscs_[next_slot]));
+        if (!camera_slot_initialized_) {
+          active_camera_slot_ = 0;
+        }
         last_camera_width_ = 0;
         last_camera_height_ = 0;
       }
     }
-    has_camera_image = last_camera_blob_ && !last_camera_blob_->empty();
+    has_camera_image =
+        camera_slot_initialized_ && camera_blobs_[active_camera_slot_] &&
+        !camera_blobs_[active_camera_slot_]->empty();
   } else {
-    if (last_camera_blob_) {
-      lv_image_cache_drop(&camera_image_dsc_);
+    if (camera_slot_initialized_ && page3_image_ != nullptr) {
+      lv_image_set_src(page3_image_, nullptr);
     }
-    last_camera_blob_.reset();
+    lv_image_cache_drop(&camera_image_dscs_[0]);
+    lv_image_cache_drop(&camera_image_dscs_[1]);
+    camera_blobs_[0].reset();
+    camera_blobs_[1].reset();
+    camera_slot_initialized_ = false;
+    active_camera_slot_ = 0;
     last_camera_width_ = 0;
     last_camera_height_ = 0;
-    std::memset(&camera_image_dsc_, 0, sizeof(camera_image_dsc_));
+    std::memset(&camera_image_dscs_[0], 0, sizeof(camera_image_dscs_[0]));
+    std::memset(&camera_image_dscs_[1], 0, sizeof(camera_image_dscs_[1]));
     has_camera_image = false;
   }
   camera_image_visible_ = has_camera_image;
@@ -1122,25 +1167,32 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     camera_text_image_mode_ = has_camera_image;
   }
   set_label_text_if_changed(page3_note_, camera_note);
+  set_hidden(page3_subnote_, camera_subnote.empty());
   if (!camera_subnote.empty()) {
     set_label_text_if_changed(page3_subnote_, camera_subnote);
-    lv_obj_clear_flag(page3_subnote_, LV_OBJ_FLAG_HIDDEN);
-  } else {
-    lv_obj_add_flag(page3_subnote_, LV_OBJ_FLAG_HIDDEN);
   }
 
   show_logo_ = should_show_logo(snapshot);
-  if (snapshot.chamber_light_supported) {
-    lv_obj_add_flag(logo_badge_, LV_OBJ_FLAG_CLICKABLE);
-  } else {
-    lv_obj_clear_flag(logo_badge_, LV_OBJ_FLAG_CLICKABLE);
+  const bool chamber_light_clickable = snapshot.chamber_light_supported;
+  if (logo_clickable_ != chamber_light_clickable) {
+    set_clickable(logo_badge_, chamber_light_clickable);
+    logo_clickable_ = chamber_light_clickable;
   }
-  if (snapshot.chamber_light_supported && snapshot.chamber_light_state_known &&
-      !snapshot.chamber_light_on) {
-    lv_obj_set_style_image_recolor(logo_image_, lv_color_hex(0x7A7A7A), 0);
-    lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_COVER, 0);
-  } else {
-    lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_TRANSP, 0);
+
+  const bool logo_recolor_enabled =
+      snapshot.chamber_light_supported && snapshot.chamber_light_state_known &&
+      !snapshot.chamber_light_on;
+  const uint32_t logo_recolor_hex = logo_recolor_enabled ? 0x7A7A7A : 0U;
+  if (logo_recolor_enabled != logo_recolor_enabled_ ||
+      (logo_recolor_enabled && logo_recolor_hex != logo_recolor_hex_)) {
+    if (logo_recolor_enabled) {
+      lv_obj_set_style_image_recolor(logo_image_, lv_color_hex(logo_recolor_hex), 0);
+      lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_COVER, 0);
+    } else {
+      lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_TRANSP, 0);
+    }
+    logo_recolor_enabled_ = logo_recolor_enabled;
+    logo_recolor_hex_ = logo_recolor_hex;
   }
   apply_page_visibility();
 }
@@ -1543,13 +1595,19 @@ void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
   }
 
   if (!camera_page_available_) {
-    if (last_camera_blob_) {
-      lv_image_cache_drop(&camera_image_dsc_);
+    if (camera_slot_initialized_ && page3_image_ != nullptr) {
+      lv_image_set_src(page3_image_, nullptr);
     }
-    last_camera_blob_.reset();
+    lv_image_cache_drop(&camera_image_dscs_[0]);
+    lv_image_cache_drop(&camera_image_dscs_[1]);
+    camera_blobs_[0].reset();
+    camera_blobs_[1].reset();
+    camera_slot_initialized_ = false;
+    active_camera_slot_ = 0;
     last_camera_width_ = 0;
     last_camera_height_ = 0;
-    std::memset(&camera_image_dsc_, 0, sizeof(camera_image_dsc_));
+    std::memset(&camera_image_dscs_[0], 0, sizeof(camera_image_dscs_[0]));
+    std::memset(&camera_image_dscs_[1], 0, sizeof(camera_image_dscs_[1]));
     camera_image_visible_ = false;
   }
 

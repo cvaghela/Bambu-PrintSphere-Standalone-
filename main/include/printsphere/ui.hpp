@@ -124,6 +124,9 @@ class Ui {
   int active_page_ = 0;
   ArcColorScheme arc_colors_{};
   uint32_t last_accent_hex_ = 0;
+  uint32_t last_ring_main_hex_ = UINT32_MAX;
+  uint32_t last_ring_indicator_hex_ = UINT32_MAX;
+  uint32_t last_ring_text_hex_ = UINT32_MAX;
   std::atomic<uint32_t> last_activity_tick_ms_{0};
   ScreenPowerMode screen_power_mode_ = ScreenPowerMode::kAwake;
   std::string last_ui_status_;
@@ -131,10 +134,15 @@ class Ui {
   lv_image_dsc_t preview_image_dsc_{};
   std::shared_ptr<std::vector<uint8_t>> last_preview_blob_{};
   std::shared_ptr<std::vector<uint8_t>> last_preview_raw_{};
-  lv_image_dsc_t camera_image_dsc_{};
-  std::shared_ptr<std::vector<uint8_t>> last_camera_blob_{};
+  lv_image_dsc_t camera_image_dscs_[2]{};
+  std::shared_ptr<std::vector<uint8_t>> camera_blobs_[2]{};
+  uint8_t active_camera_slot_ = 0;
+  bool camera_slot_initialized_ = false;
   uint16_t last_camera_width_ = 0;
   uint16_t last_camera_height_ = 0;
+  bool logo_clickable_ = false;
+  bool logo_recolor_enabled_ = false;
+  uint32_t logo_recolor_hex_ = 0;
   mutable std::mutex camera_refresh_mutex_{};
   bool camera_refresh_requested_ = false;
   std::atomic<bool> chamber_light_toggle_requested_{false};
