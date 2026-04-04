@@ -225,6 +225,69 @@ bool printer_model_has_secondary_chamber_light(PrinterModel model) {
   }
 }
 
+bool printer_model_supports_local_status(PrinterModel model) {
+  switch (model) {
+    case PrinterModel::kP2S:
+      return false;
+    case PrinterModel::kUnknown:
+    case PrinterModel::kA1:
+    case PrinterModel::kA1Mini:
+    case PrinterModel::kP1P:
+    case PrinterModel::kP1S:
+    case PrinterModel::kH2C:
+    case PrinterModel::kH2D:
+    case PrinterModel::kH2DPro:
+    case PrinterModel::kH2S:
+    case PrinterModel::kX1:
+    case PrinterModel::kX1C:
+    case PrinterModel::kX1E:
+    default:
+      return true;
+  }
+}
+
+bool printer_model_requires_developer_mode_for_local_status(PrinterModel model) {
+  switch (model) {
+    case PrinterModel::kH2C:
+    case PrinterModel::kH2D:
+    case PrinterModel::kH2DPro:
+    case PrinterModel::kH2S:
+      return true;
+    case PrinterModel::kUnknown:
+    case PrinterModel::kA1:
+    case PrinterModel::kA1Mini:
+    case PrinterModel::kP1P:
+    case PrinterModel::kP1S:
+    case PrinterModel::kP2S:
+    case PrinterModel::kX1:
+    case PrinterModel::kX1C:
+    case PrinterModel::kX1E:
+    default:
+      return false;
+  }
+}
+
+bool printer_model_prefers_cloud_status(PrinterModel model) {
+  switch (model) {
+    case PrinterModel::kP2S:
+    case PrinterModel::kH2C:
+    case PrinterModel::kH2D:
+    case PrinterModel::kH2DPro:
+    case PrinterModel::kH2S:
+      return true;
+    case PrinterModel::kUnknown:
+    case PrinterModel::kA1:
+    case PrinterModel::kA1Mini:
+    case PrinterModel::kP1P:
+    case PrinterModel::kP1S:
+    case PrinterModel::kX1:
+    case PrinterModel::kX1C:
+    case PrinterModel::kX1E:
+    default:
+      return false;
+  }
+}
+
 bool printer_serial_family_has_no_chamber_temperature(const std::string& serial) {
   if (serial.size() < 3U) {
     return false;
@@ -238,14 +301,15 @@ bool printer_serial_family_has_no_chamber_temperature(const std::string& serial)
 
 SourceCapabilities default_local_capabilities_for_model(PrinterModel model) {
   SourceCapabilities capabilities;
-  capabilities.status = true;
-  capabilities.metrics = true;
-  capabilities.temperatures = true;
-  capabilities.hms = true;
-  capabilities.print_error = true;
+  capabilities.status = printer_model_supports_local_status(model);
+  capabilities.metrics = capabilities.status;
+  capabilities.temperatures = capabilities.status;
+  capabilities.hms = capabilities.status;
+  capabilities.print_error = capabilities.status;
   capabilities.camera_jpeg_socket = printer_model_has_jpeg_camera(model);
   capabilities.camera_rtsp = printer_model_has_rtsp_camera(model);
-  capabilities.developer_mode_required = capabilities.camera_rtsp;
+  capabilities.developer_mode_required =
+      printer_model_requires_developer_mode_for_local_status(model);
   return capabilities;
 }
 

@@ -13,8 +13,16 @@ enum class SourceMode : uint8_t {
   kHybrid,
 };
 
+enum class CloudRegion : uint8_t {
+  kUS,
+  kEU,
+  kCN,
+};
+
 const char* to_string(SourceMode mode);
 SourceMode parse_source_mode(const std::string& value);
+const char* to_string(CloudRegion region);
+CloudRegion parse_cloud_region(const std::string& value);
 
 struct WifiCredentials {
   std::string ssid;
@@ -26,8 +34,11 @@ struct WifiCredentials {
 struct BambuCloudCredentials {
   std::string email;
   std::string password;
+  CloudRegion region = CloudRegion::kEU;
 
-  bool is_configured() const { return !email.empty() && !password.empty(); }
+  bool has_identity() const { return !email.empty(); }
+  bool can_password_login() const { return has_identity() && !password.empty(); }
+  bool is_configured() const { return can_password_login(); }
 };
 
 struct PrinterConnection {

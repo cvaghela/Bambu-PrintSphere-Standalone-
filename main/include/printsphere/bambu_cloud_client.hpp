@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -63,6 +64,56 @@ class BambuCloudClient {
  public:
   BambuCloudClient() = default;
 
+  struct CloudLiveRuntimeState {
+    bool configured = false;
+    bool connected = false;
+    uint64_t last_update_ms = 0;
+    uint64_t live_data_last_update_ms = 0;
+    PrinterModel model = PrinterModel::kUnknown;
+    SourceCapabilities capabilities{};
+    PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
+    float progress_percent = 0.0f;
+    float nozzle_temp_c = 0.0f;
+    uint64_t nozzle_temp_last_update_ms = 0;
+    float bed_temp_c = 0.0f;
+    uint64_t bed_temp_last_update_ms = 0;
+    float chamber_temp_c = 0.0f;
+    uint64_t chamber_temp_last_update_ms = 0;
+    float secondary_nozzle_temp_c = 0.0f;
+    uint64_t secondary_nozzle_temp_last_update_ms = 0;
+    bool chamber_light_supported = false;
+    bool chamber_light_state_known = false;
+    bool chamber_light_on = false;
+    bool chamber_light_pending = false;
+    uint64_t chamber_light_pending_since_ms = 0;
+    bool non_error_stop = false;
+    uint32_t remaining_seconds = 0;
+    uint16_t current_layer = 0;
+    uint16_t total_layers = 0;
+    int print_error_code = 0;
+    uint16_t hms_alert_count = 0;
+    bool has_error = false;
+    std::array<char, 96> detail{};
+    std::array<char, 24> resolved_serial{};
+    std::array<char, 16> raw_status{};
+    std::array<char, 32> raw_stage{};
+    std::array<char, 32> stage{};
+  };
+
+  struct CloudRestRuntimeState {
+    bool configured = false;
+    bool session_ready = false;
+    uint64_t last_update_ms = 0;
+    PrinterModel model = PrinterModel::kUnknown;
+    SourceCapabilities capabilities{};
+    bool chamber_light_supported = false;
+    std::array<char, 96> detail{};
+    std::array<char, 24> resolved_serial{};
+    std::string preview_url{};
+    std::shared_ptr<std::vector<uint8_t>> preview_blob{};
+    std::string preview_title{};
+  };
+
   void set_config_store(const ConfigStore* config_store) { config_store_ = config_store; }
   void configure(BambuCloudCredentials credentials, std::string printer_serial);
   void set_network_ready(bool ready) { network_ready_.store(ready); }
@@ -99,7 +150,6 @@ class BambuCloudClient {
   void request_initial_sync();
   bool publish_request(const char* payload);
   void handle_report_payload(const char* payload, size_t length);
-  void handle_info_payload(const char* payload, size_t length);
   bool fetch_bindings();
   bool fetch_latest_preview(bool allow_preview_download);
   std::shared_ptr<std::vector<uint8_t>> download_preview_image(const std::string& url);
@@ -114,7 +164,7 @@ class BambuCloudClient {
   void set_auth_mode(AuthMode mode, std::string tfa_key = {});
   void clear_auth_state();
   void clear_pending_code();
-  void persist_access_token() const;
+  bool persist_access_token() const;
   void clear_persisted_access_token();
   static std::string json_string(const cJSON* object, const char* key,
                                  const std::string& fallback = {});
@@ -136,9 +186,18 @@ class BambuCloudClient {
                                            PrintLifecycleState lifecycle);
   static const cJSON* child_object(const cJSON* object, const char* key);
   static const cJSON* child_array(const cJSON* object, const char* key);
+  CloudLiveRuntimeState live_runtime_copy() const;
+  void store_live_runtime(CloudLiveRuntimeState runtime, bool notify_task);
+  CloudRestRuntimeState rest_runtime_copy() const;
+  void store_rest_runtime(CloudRestRuntimeState runtime, bool notify_task);
+  void publish_combined_snapshot();
 
   mutable std::mutex mutex_{};
   BambuCloudSnapshot snapshot_{};
+  mutable std::mutex live_runtime_mutex_{};
+  CloudLiveRuntimeState live_runtime_{};
+  mutable std::mutex rest_runtime_mutex_{};
+  CloudRestRuntimeState rest_runtime_{};
   const ConfigStore* config_store_ = nullptr;
   BambuCloudCredentials credentials_{};
   std::string requested_serial_{};
@@ -166,6 +225,8 @@ class BambuCloudClient {
   std::atomic<bool> initial_sync_sent_{false};
   std::atomic<bool> delayed_start_sent_{false};
   std::atomic<uint32_t> initial_sync_tick_{0};
+  std::atomic<bool> live_runtime_dirty_{false};
+  std::atomic<bool> rest_runtime_dirty_{false};
   mutable std::mutex auth_mutex_{};
   AuthMode auth_mode_ = AuthMode::kPassword;
   std::string tfa_key_{};

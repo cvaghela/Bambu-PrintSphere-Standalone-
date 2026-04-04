@@ -10,7 +10,9 @@
 #include "cJSON.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "printsphere/ui.hpp"
@@ -21,6 +23,9 @@ namespace {
 
 constexpr char kTag[] = "printsphere.portal";
 constexpr size_t kMaxRequestBody = 4096;
+constexpr char kPortalSessionCookieName[] = "printsphere_portal_session";
+constexpr uint64_t kPortalPinLifetimeMs = 2ULL * 60ULL * 1000ULL;
+constexpr uint64_t kPortalSessionLifetimeMs = 10ULL * 60ULL * 1000ULL;
 constexpr char kFaviconSvg[] =
     "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">"
     "<rect width=\"64\" height=\"64\" rx=\"16\" fill=\"#121a23\"/>"
@@ -77,6 +82,38 @@ std::string trim_copy(const std::string& input) {
   }
 
   return input.substr(start, end - start);
+}
+
+WifiCredentials merge_wifi_credentials(WifiCredentials submitted,
+                                       const WifiCredentials& stored) {
+  if (submitted.password.empty() && !submitted.ssid.empty() && submitted.ssid == stored.ssid) {
+    submitted.password = stored.password;
+  }
+  return submitted;
+}
+
+BambuCloudCredentials merge_cloud_credentials(BambuCloudCredentials submitted,
+                                              const BambuCloudCredentials& stored) {
+  if (submitted.password.empty() && !submitted.email.empty() && submitted.email == stored.email) {
+    submitted.password = stored.password;
+  }
+  return submitted;
+}
+
+PrinterConnection merge_printer_connection(PrinterConnection submitted,
+                                           const PrinterConnection& stored) {
+  if (submitted.access_code.empty() && !submitted.serial.empty() &&
+      submitted.serial == stored.serial) {
+    submitted.access_code = stored.access_code;
+  }
+  return submitted;
+}
+
+bool can_reuse_cloud_session(const BambuCloudCredentials& submitted,
+                             const BambuCloudCredentials& stored,
+                             const std::string& access_token) {
+  return !access_token.empty() && !submitted.email.empty() && submitted.email == stored.email &&
+         submitted.region == stored.region;
 }
 
 std::string color_to_html_hex(uint32_t color) {
@@ -176,6 +213,94 @@ bool is_valid_hostname(const std::string& host) {
 
 bool is_valid_printer_host(const std::string& host) {
   return is_valid_ipv4(host) || is_valid_hostname(host);
+}
+
+uint64_t now_ms() {
+  return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+}
+
+uint32_t remaining_seconds(uint64_t expiry_ms, uint64_t current_ms) {
+  if (expiry_ms <= current_ms) {
+    return 0;
+  }
+  return static_cast<uint32_t>((expiry_ms - current_ms + 999ULL) / 1000ULL);
+}
+
+std::string duration_text(uint32_t total_seconds) {
+  const uint32_t minutes = total_seconds / 60U;
+  const uint32_t seconds = total_seconds % 60U;
+  char buffer[32] = {};
+  if (minutes > 0U) {
+    std::snprintf(buffer, sizeof(buffer), "%um %us", static_cast<unsigned int>(minutes),
+                  static_cast<unsigned int>(seconds));
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%us", static_cast<unsigned int>(seconds));
+  }
+  return buffer;
+}
+
+std::string cookie_value(const std::string& header, const char* key) {
+  if (key == nullptr || key[0] == '\0') {
+    return {};
+  }
+
+  const std::string needle = std::string(key) + "=";
+  size_t start = 0;
+  while (start < header.size()) {
+    size_t end = header.find(';', start);
+    if (end == std::string::npos) {
+      end = header.size();
+    }
+
+    std::string part = trim_copy(header.substr(start, end - start));
+    if (part.rfind(needle, 0) == 0) {
+      return part.substr(needle.size());
+    }
+
+    start = end + 1U;
+  }
+  return {};
+}
+
+std::string request_cookie(httpd_req_t* request, const char* key) {
+  if (request == nullptr) {
+    return {};
+  }
+
+  const size_t header_len = httpd_req_get_hdr_value_len(request, "Cookie");
+  if (header_len == 0U) {
+    return {};
+  }
+
+  std::vector<char> buffer(header_len + 1U, '\0');
+  if (httpd_req_get_hdr_value_str(request, "Cookie", buffer.data(), buffer.size()) != ESP_OK) {
+    return {};
+  }
+
+  return cookie_value(buffer.data(), key);
+}
+
+std::string session_cookie_header(const std::string& token, uint32_t max_age_s) {
+  return std::string(kPortalSessionCookieName) + "=" + token + "; Max-Age=" +
+         std::to_string(max_age_s) + "; HttpOnly; SameSite=Strict; Path=/";
+}
+
+void append_portal_access_fields(std::string* body, const PortalAccessSnapshot& access) {
+  if (body == nullptr) {
+    return;
+  }
+
+  *body += ",\"portal_locked\":";
+  *body += access.request_authorized ? "false" : "true";
+  *body += ",\"portal_session_active\":";
+  *body += access.session_active ? "true" : "false";
+  *body += ",\"portal_pin_active\":";
+  *body += access.pin_active ? "true" : "false";
+  *body += ",\"portal_pin_remaining_s\":";
+  *body += std::to_string(access.pin_remaining_s);
+  *body += ",\"portal_session_remaining_s\":";
+  *body += std::to_string(access.session_remaining_s);
+  *body += ",\"portal_detail\":\"" + json_escape(access.detail) + "\"";
 }
 
 void send_json(httpd_req_t* request, const std::string& body) {
@@ -313,6 +438,152 @@ void append_local_status_fields(std::string* body, const PrinterSnapshot& local,
 
 }  // namespace
 
+void SetupPortal::request_unlock_pin() {
+  const uint64_t current_ms = now_ms();
+  std::lock_guard<std::mutex> lock(access_mutex_);
+  prune_access_state_locked(current_ms);
+  unlock_pin_ = generate_unlock_pin();
+  unlock_pin_expiry_ms_ = current_ms + kPortalPinLifetimeMs;
+}
+
+PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
+  const bool lock_required = is_lock_required();
+  const uint64_t current_ms = now_ms();
+  std::lock_guard<std::mutex> lock(access_mutex_);
+  prune_access_state_locked(current_ms);
+
+  PortalAccessSnapshot snapshot;
+  snapshot.request_authorized = lock_required ? request_authorized : true;
+  snapshot.session_active = !session_token_.empty();
+  snapshot.pin_active = !unlock_pin_.empty();
+  snapshot.session_remaining_s = remaining_seconds(session_expiry_ms_, current_ms);
+  snapshot.pin_remaining_s = remaining_seconds(unlock_pin_expiry_ms_, current_ms);
+  snapshot.pin_code = unlock_pin_;
+
+  if (!lock_required) {
+    if (wifi_manager_.is_setup_access_point_active()) {
+      snapshot.detail = "Web Config is open while the setup access point is active.";
+    } else {
+      snapshot.detail = "Web Config is open while PrintSphere is waiting for Wi-Fi credentials.";
+    }
+  } else if (snapshot.pin_active) {
+    snapshot.detail =
+        "Unlock PIN is visible on the device display for " +
+        duration_text(std::max<uint32_t>(snapshot.pin_remaining_s, 1U)) + ".";
+  } else if (snapshot.session_active && request_authorized) {
+    snapshot.detail =
+        "Web Config unlocked for " +
+        duration_text(std::max<uint32_t>(snapshot.session_remaining_s, 1U)) + ".";
+  } else if (snapshot.session_active) {
+    snapshot.detail = "A browser session is active. Hold the display to show a new unlock PIN.";
+  } else {
+    snapshot.detail =
+        "Hold anywhere on the device display for one second to show an unlock PIN.";
+  }
+
+  return snapshot;
+}
+
+void SetupPortal::prune_access_state_locked(uint64_t current_ms) {
+  if (unlock_pin_expiry_ms_ != 0 && current_ms >= unlock_pin_expiry_ms_) {
+    unlock_pin_.clear();
+    unlock_pin_expiry_ms_ = 0;
+  }
+  if (session_expiry_ms_ != 0 && current_ms >= session_expiry_ms_) {
+    session_token_.clear();
+    session_expiry_ms_ = 0;
+  }
+}
+
+std::string SetupPortal::generate_unlock_pin() {
+  char buffer[7] = {};
+  std::snprintf(buffer, sizeof(buffer), "%06u",
+                static_cast<unsigned int>(esp_random() % 1000000U));
+  return buffer;
+}
+
+std::string SetupPortal::generate_session_token() {
+  char buffer[33] = {};
+  std::snprintf(buffer, sizeof(buffer), "%08x%08x%08x%08x",
+                static_cast<unsigned int>(esp_random()),
+                static_cast<unsigned int>(esp_random()),
+                static_cast<unsigned int>(esp_random()),
+                static_cast<unsigned int>(esp_random()));
+  return buffer;
+}
+
+bool SetupPortal::is_lock_required() const {
+  if (wifi_manager_.is_setup_access_point_active()) {
+    return false;
+  }
+
+  const PrinterSnapshot local = printer_client_.snapshot();
+  return local.connection != PrinterConnectionState::kWaitingForCredentials;
+}
+
+bool SetupPortal::is_request_authorized(httpd_req_t* request) {
+  if (!is_lock_required()) {
+    return true;
+  }
+
+  const std::string presented = request_cookie(request, kPortalSessionCookieName);
+  if (presented.empty()) {
+    return false;
+  }
+
+  const uint64_t current_ms = now_ms();
+  std::lock_guard<std::mutex> lock(access_mutex_);
+  prune_access_state_locked(current_ms);
+  return !session_token_.empty() && presented == session_token_;
+}
+
+esp_err_t SetupPortal::send_locked_response(httpd_req_t* request) {
+  PortalAccessSnapshot access = access_snapshot(false);
+  const std::string clear_cookie = session_cookie_header("", 0);
+  httpd_resp_set_status(request, "423 Locked");
+  httpd_resp_set_hdr(request, "Set-Cookie", clear_cookie.c_str());
+
+  std::string body = "{\"error\":\"Portal locked\"";
+  append_portal_access_fields(&body, access);
+  body += "}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::send_unlock_page(httpd_req_t* request) {
+  const PortalAccessSnapshot access = access_snapshot(false);
+  const std::string clear_cookie = session_cookie_header("", 0);
+
+  std::string html;
+  html.reserve(5000);
+  html += "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+  html += "<title>PrintSphere Unlock</title><style>";
+  html += "body{margin:0;font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,#172633,#071018 62%);color:#f8fafc;min-height:100vh;display:grid;place-items:center;padding:20px;}";
+  html += ".card{width:min(420px,100%);background:rgba(6,18,26,.92);border:1px solid rgba(240,166,75,.28);border-radius:26px;padding:28px;box-shadow:0 22px 80px rgba(0,0,0,.45);}";
+  html += "h1{margin:0 0 10px;font-size:32px;}p{margin:0 0 14px;line-height:1.45;color:#cbd5e1;}label{display:block;margin:18px 0 8px;color:#f8fafc;font-weight:600;}";
+  html += "input{width:100%;box-sizing:border-box;border-radius:16px;border:1px solid #365064;background:#0f1e29;color:#f8fafc;padding:16px 18px;font-size:26px;letter-spacing:.22em;text-align:center;}";
+  html += "button{width:100%;margin-top:16px;border:0;border-radius:16px;background:#f0a64b;color:#071018;padding:14px 18px;font-size:18px;font-weight:700;cursor:pointer;}";
+  html += ".status{margin:10px 0 0;color:#f0a64b;font-weight:700;}.micro{margin-top:18px;font-size:14px;color:#94a3b8;}</style></head><body><main class=\"card\">";
+  html += "<h1>Portal Locked</h1>";
+  html += "<p id=\"detail\">";
+  html += json_escape(access.detail);
+  html += "</p>";
+  html += "<form id=\"unlock-form\"><label for=\"pin\">Unlock PIN</label><input id=\"pin\" inputmode=\"numeric\" autocomplete=\"one-time-code\" maxlength=\"6\" placeholder=\"000000\">";
+  html += "<button type=\"submit\" id=\"unlock-button\">Unlock Web Config</button></form>";
+  html += "<div class=\"status\" id=\"status\">Waiting for PIN</div>";
+  html += "<p class=\"micro\">Long-press anywhere on the PrintSphere display for one second. The 6-digit PIN appears on the device, not in the browser.</p>";
+  html += "</main><script>";
+  html += "const form=document.getElementById('unlock-form');const pin=document.getElementById('pin');const statusEl=document.getElementById('status');const detailEl=document.getElementById('detail');const button=document.getElementById('unlock-button');";
+  html += "async function refresh(){try{const response=await fetch('/api/health',{cache:'no-store'});const body=await response.json().catch(()=>({}));if(body.portal_locked===false){window.location.reload();return;}detailEl.textContent=body.portal_detail||'Hold anywhere on the device display for one second to show an unlock PIN.';statusEl.textContent=body.portal_pin_active?'PIN visible on the display':'Portal locked';}catch(error){statusEl.textContent='Portal unreachable';}}";
+  html += "form.addEventListener('submit',async(event)=>{event.preventDefault();const code=pin.value.trim();if(!code){statusEl.textContent='Enter the PIN from the display';return;}button.disabled=true;statusEl.textContent='Unlocking...';try{const response=await fetch('/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:code})});const body=await response.json().catch(()=>({}));if(response.ok){window.location.reload();return;}statusEl.textContent=body.error||'Unlock failed';detailEl.textContent=body.detail||'The PIN was rejected.';pin.select();}catch(error){statusEl.textContent='Unlock request failed';}finally{button.disabled=false;}});";
+  html += "refresh();setInterval(refresh,2000);</script></body></html>";
+
+  httpd_resp_set_type(request, "text/html");
+  httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+  httpd_resp_set_hdr(request, "Set-Cookie", clear_cookie.c_str());
+  return httpd_resp_send(request, html.c_str(), html.size());
+}
+
 esp_err_t SetupPortal::start() {
   if (server_ != nullptr) {
     return ESP_OK;
@@ -347,6 +618,14 @@ esp_err_t SetupPortal::start() {
   health_uri.user_ctx = this;
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &health_uri), kTag,
                       "health handler failed");
+
+  httpd_uri_t unlock_uri = {};
+  unlock_uri.uri = "/api/unlock";
+  unlock_uri.method = HTTP_POST;
+  unlock_uri.handler = &SetupPortal::handle_unlock;
+  unlock_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &unlock_uri), kTag,
+                      "unlock handler failed");
 
   httpd_uri_t wifi_scan_uri = {};
   wifi_scan_uri.uri = "/api/wifi/scan";
@@ -425,7 +704,14 @@ esp_err_t SetupPortal::start() {
 }
 
 esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
-  const auto* portal = static_cast<const SetupPortal*>(request->user_ctx);
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_unlock_page(request);
+  }
+
   const WifiCredentials wifi = portal->config_store_.load_wifi_credentials();
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
   const SourceMode source_mode = portal->config_store_.load_source_mode();
@@ -436,9 +722,18 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const bool wifi_connected = portal->wifi_manager_.is_station_connected();
   const bool setup_ap_active = portal->wifi_manager_.is_setup_access_point_active();
   const bool wifi_configured = wifi.is_configured();
+  const bool wifi_password_saved = !wifi.password.empty();
+  const bool cloud_password_saved = !cloud.password.empty();
+  const bool printer_access_code_saved = !printer.access_code.empty();
   const std::string wifi_ip = portal->wifi_manager_.station_ip();
   const bool local_configured = portal->printer_client_.is_configured();
   const bool show_connection_steps = wifi_connected && !setup_ap_active;
+  const std::string wifi_password_placeholder =
+      wifi_password_saved ? "Leave empty to keep saved Wi-Fi password" : "Enter Wi-Fi password";
+  const std::string cloud_password_placeholder =
+      cloud_password_saved ? "Leave empty to keep saved Bambu password" : "Enter Bambu password";
+  const std::string printer_access_code_placeholder =
+      printer_access_code_saved ? "Leave empty to keep saved access code" : "Enter printer access code";
 
   const std::string wifi_badge_value =
       wifi_connected ? ("Connected - " + wifi_ip) : "Not connected";
@@ -452,7 +747,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   } else if (cloud_snapshot.verification_required) {
     cloud_badge_value = "Code required";
     cloud_badge_class = "warn";
-  } else if (cloud.is_configured()) {
+  } else if (cloud_snapshot.configured) {
     cloud_badge_value = "Configured";
     cloud_badge_class = "info";
   }
@@ -593,8 +888,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "<div class=\"field\"><label for=\"wifi_ssid\">Wi-Fi SSID</label><input id=\"wifi_ssid\" value=\"";
   html += json_escape(wifi.ssid);
   html += "\" autocomplete=\"off\"></div>";
-  html += "<div class=\"field\"><label for=\"wifi_password\">Wi-Fi Password</label><input id=\"wifi_password\" type=\"password\" value=\"";
-  html += json_escape(wifi.password);
+  html += "<div class=\"field\"><label for=\"wifi_password\">Wi-Fi Password</label><input id=\"wifi_password\" type=\"password\" value=\"\" placeholder=\"";
+  html += json_escape(wifi_password_placeholder);
   html += "\" autocomplete=\"off\"></div>";
   html += "</div>";
   html += "<div class=\"grid-2\">";
@@ -615,7 +910,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     if (source_mode == SourceMode::kHybrid) {
       html += " selected";
     }
-    html += ">Hybrid (recommended): local live monitoring first, cloud preview + fallback</option>";
+    html += ">Hybrid (recommended): auto-pick the best status path for your printer, keep local camera when available</option>";
     html += "<option value=\"cloud_only\"";
     if (source_mode == SourceMode::kCloudOnly) {
       html += " selected";
@@ -639,11 +934,27 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email</label><input id=\"cloud_email\" value=\"";
     html += json_escape(cloud.email);
     html += "\" autocomplete=\"username\"></div>";
-    html += "<div class=\"field\"><label for=\"cloud_password\">Bambu Password</label><input id=\"cloud_password\" type=\"password\" value=\"";
-    html += json_escape(cloud.password);
+    html += "<div class=\"field\"><label for=\"cloud_password\">Bambu Password</label><input id=\"cloud_password\" type=\"password\" value=\"\" placeholder=\"";
+    html += json_escape(cloud_password_placeholder);
     html += "\" autocomplete=\"current-password\"></div>";
     html += "</div>";
-    html += "<div class=\"hint-box\"><strong>Cloud Status:</strong> <span id=\"cloud-detail\">";
+    html += "<div class=\"field\"><label for=\"cloud_region\">Cloud Region</label><select id=\"cloud_region\">";
+    html += "<option value=\"us\"";
+    if (cloud.region == CloudRegion::kUS) {
+      html += " selected";
+    }
+    html += ">US</option>";
+    html += "<option value=\"eu\"";
+    if (cloud.region == CloudRegion::kEU) {
+      html += " selected";
+    }
+    html += ">EU</option>";
+    html += "<option value=\"cn\"";
+    if (cloud.region == CloudRegion::kCN) {
+      html += " selected";
+    }
+    html += ">CN</option></select></div>";
+    html += "<div class=\"hint-box\"><strong>Printer Status:</strong> <span id=\"cloud-detail\">";
     html += json_escape(cloud_snapshot.detail);
     html += "</span></div>";
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"cloud-connect-button\">Connect Cloud</button>";
@@ -677,15 +988,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += json_escape(printer.serial);
     html += "\" autocomplete=\"off\"></div>";
     html += "</div>";
-    html += "<div class=\"field\"><label for=\"printer_access_code\">Access Code</label><input id=\"printer_access_code\" value=\"";
-    html += json_escape(printer.access_code);
+    html += "<div class=\"field\"><label for=\"printer_access_code\">Access Code</label><input id=\"printer_access_code\" type=\"password\" value=\"\" placeholder=\"";
+    html += json_escape(printer_access_code_placeholder);
     html += "\" autocomplete=\"off\"></div>";
     html += "<div class=\"hint-box\"><strong>Local Status:</strong> <span id=\"local-detail\">";
     html += json_escape(local_snapshot.detail);
     html += "</span></div>";
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"local-connect-button\">Connect Local</button>";
     html += "<div class=\"micro\">This saves the local printer credentials immediately. In Hybrid and Local only it also reconnects MQTT and camera without rebooting.</div></div>";
-    html += "<p class=\"micro\">In Hybrid mode the local path is preferred for fast monitoring and acts as the fallback when the cloud lags behind.</p>";
+    html += "<p class=\"micro\">In Hybrid mode PrintSphere auto-picks the better status path for your printer and still uses the local camera when available.</p>";
     html += "</section>";
   }
 
@@ -745,19 +1056,26 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const arcInputIds=['arc_printing','arc_done','arc_error','arc_idle','arc_preheat','arc_clean','arc_level','arc_cool','arc_idle_active','arc_filament','arc_setup','arc_offline','arc_unknown'];";
   html += "let statusLockUntil=0;";
   html += "let arcPreviewTimer=null;";
+  html += "let healthTimer=null;";
+  html += "let healthInFlight=false;";
+  html += "let wifiScanInFlight=false;";
   html += "const savedConfig={cloud_email:\"";
   html += json_escape(cloud.email);
-  html += "\",cloud_password:\"";
-  html += json_escape(cloud.password);
+  html += "\",cloud_region:\"";
+  html += json_escape(to_string(cloud.region));
   html += "\",source_mode:\"";
   html += to_string(source_mode);
   html += "\",printer_host:\"";
   html += json_escape(printer.host);
   html += "\",printer_serial:\"";
   html += json_escape(printer.serial);
-  html += "\",printer_access_code:\"";
-  html += json_escape(printer.access_code);
-  html += "\"};";
+  html += "\",wifi_password_saved:";
+  html += wifi_password_saved ? "true" : "false";
+  html += ",cloud_password_saved:";
+  html += cloud_password_saved ? "true" : "false";
+  html += ",printer_access_code_saved:";
+  html += printer_access_code_saved ? "true" : "false";
+  html += "};";
   html += "function setStatus(line,detail,lockMs){statusEl.textContent=line||'';statusDetailEl.textContent=detail||'';"
           "statusLockUntil=lockMs?Date.now()+lockMs:0;}";
   html += "function valueOf(id){const el=document.getElementById(id);return el?el.value:'';}";
@@ -772,14 +1090,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "networks.forEach((ssid)=>{const option=document.createElement('option');option.value=ssid;option.textContent=ssid;wifiSsidSelect.appendChild(option);});"
           "if(currentSsid&&networks.includes(currentSsid)){wifiSsidSelect.value=currentSsid;}"
           "else if(previousValue&&networks.includes(previousValue)){wifiSsidSelect.value=previousValue;}}";
-  html += "async function refreshWifiScan(){if(!wifiSsidSelect)return;"
+  html += "async function refreshWifiScan(){if(!wifiSsidSelect||wifiScanInFlight)return;"
+          "wifiScanInFlight=true;"
           "if(wifiScanButton){wifiScanButton.disabled=true;}if(wifiScanDetail){wifiScanDetail.textContent='Scanning nearby Wi-Fi networks...';}"
           "try{const response=await fetch('/api/wifi/scan',{cache:'no-store'});const body=await response.json().catch(()=>({}));"
           "if(response.ok){populateWifiNetworks(body);if(wifiScanDetail){const count=Array.isArray(body.networks)?body.networks.length:0;"
           "wifiScanDetail.textContent=count?('Found '+count+' visible network'+(count===1?'':'s')+'. Hidden SSIDs can still be typed manually.'):'No visible networks found right now. Hidden SSIDs can still be typed manually.';}}"
           "else if(wifiScanDetail){wifiScanDetail.textContent=body.error||'Wi-Fi scan failed right now.';}}"
           "catch(error){if(wifiScanDetail){wifiScanDetail.textContent='Wi-Fi scan request failed.';}}"
-          "finally{if(wifiScanButton){wifiScanButton.disabled=false;}}}";
+          "finally{wifiScanInFlight=false;if(wifiScanButton){wifiScanButton.disabled=false;}}}";
   html += "function setBadge(id,label,value,stateClass){const badge=document.getElementById(id);if(!badge)return;"
           "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}";
   html += "function updateSourceModeControls(){"
@@ -799,8 +1118,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "input.placeholder=tfa?'Only needed if Bambu requests a 2FA code':'Only needed if Bambu requests an email code';"
           "note.textContent=tfa?'Bambu is currently waiting for a 2FA code.':'Bambu is currently waiting for an email code. The cloud login completes after that step.';"
           "note.classList.toggle('hidden',!required);}";
-  html += "async function updateHealth(){try{const response=await fetch('/api/health',{cache:'no-store'});"
-          "if(!response.ok)return;const body=await response.json();"
+  html += "async function updateHealth(){if(healthInFlight)return;healthInFlight=true;try{const response=await fetch('/api/health',{cache:'no-store'});"
+          "if(!response.ok)return;const body=await response.json();if(body.portal_locked){window.location.reload();return;}"
           "const wifiValue=body.wifi_connected?('Connected - '+(body.wifi_ip||'')):'Not connected';"
           "setBadge('wifi-badge','Wi-Fi',wifiValue,body.wifi_connected?'ok':'warn');"
           "document.getElementById('wifi-detail').textContent=wifiValue;"
@@ -824,16 +1143,18 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(Date.now()>statusLockUntil){"
           "if(body.wifi_connected){setStatus(trimmedValue('cloud_email')||body.cloud_connected||body.cloud_verification_required?'Step 2: Connect Bambu Cloud':'Setup ready',body.cloud_detail||('ESP on home network: '+(body.wifi_ip||'')),0);}"
           "else{setStatus('Step 1: Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}}"
-          "catch(error){if(Date.now()>statusLockUntil){setStatus('Portal reachable','Live status could not be refreshed right now.',0);}}}";
+          "catch(error){if(Date.now()>statusLockUntil){setStatus('Portal reachable','Live status could not be refreshed right now.',0);}}"
+          "finally{healthInFlight=false;}}";
   html += "function buildArcPayload(){const payload={};arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(input){payload[id]=input.value;}});return payload;}";
   html += "function buildPayload(){return Object.assign({wifi_ssid:trimmedValue('wifi_ssid'),"
           "wifi_password:valueOf('wifi_password'),"
           "cloud_email:(document.getElementById('cloud_email')?trimmedValue('cloud_email'):savedConfig.cloud_email),"
-          "cloud_password:(document.getElementById('cloud_password')?valueOf('cloud_password'):savedConfig.cloud_password),"
+          "cloud_region:(document.getElementById('cloud_region')?valueOf('cloud_region'):savedConfig.cloud_region||'eu'),"
+          "cloud_password:(document.getElementById('cloud_password')?valueOf('cloud_password'):''),"
           "source_mode:(document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode)||'hybrid',"
           "printer_host:(document.getElementById('printer_host')?trimmedValue('printer_host'):savedConfig.printer_host),"
           "printer_serial:(document.getElementById('printer_serial')?trimmedValue('printer_serial'):savedConfig.printer_serial),"
-          "printer_access_code:(document.getElementById('printer_access_code')?trimmedValue('printer_access_code'):savedConfig.printer_access_code)},buildArcPayload());}";
+          "printer_access_code:(document.getElementById('printer_access_code')?trimmedValue('printer_access_code'):'' )},buildArcPayload());}";
   html += "async function postArcColors(url){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(buildArcPayload())});"
           "const body=await response.json().catch(()=>({}));if(!response.ok){throw new Error(body.error||'Arc color request failed');}return body;}";
   html += "function queueArcPreview(){clearTimeout(arcPreviewTimer);arcPreviewTimer=setTimeout(async()=>{try{await postArcColors('/api/arc/preview');}"
@@ -858,13 +1179,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "else{setStatus(body.error||'Mode change failed',body.detail||'The new connection mode could not be saved.',8000);sourceModeApplyButton.disabled=false;updateSourceModeControls();}}"
           "catch(error){setStatus('Mode change failed','The request to the ESP could not be completed.',8000);sourceModeApplyButton.disabled=false;updateSourceModeControls();}});}";
   html += "if(cloudConnectButton){cloudConnectButton.addEventListener('click',async()=>{const cloud_email=trimmedValue('cloud_email');"
+          "const cloud_region=(document.getElementById('cloud_region')?valueOf('cloud_region'):'eu')||'eu';"
           "const cloud_password=valueOf('cloud_password');"
           "const source_mode=savedConfig.source_mode||'hybrid';"
-          "if(!cloud_email||!cloud_password){setStatus('Cloud credentials missing','Enter both Bambu email and password first.',5000);return;}"
+          "if(!cloud_email){setStatus('Cloud credentials missing','Enter the Bambu email first.',5000);return;}"
           "cloudConnectButton.disabled=true;setStatus('Connecting cloud...','Saving credentials and starting the login now.',8000);"
-          "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,source_mode})});"
+          "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,cloud_region,source_mode})});"
           "const body=await response.json().catch(()=>({}));updateCloudVerification(body);applyResolvedSerial(body);"
-          "if(response.ok){if(body.cloud_connected){setStatus('Cloud connected',body.detail||'Connected to Bambu Cloud.',7000);}"
+          "if(response.ok){savedConfig.cloud_email=cloud_email;savedConfig.cloud_region=cloud_region;"
+          "if(body.cloud_connected){setStatus('Cloud connected',body.detail||'Connected to Bambu Cloud.',7000);}"
           "else if(body.cloud_verification_required){setStatus(body.cloud_tfa_required?'2FA required':'Email code required',body.detail||'Enter the requested code to finish the login.',10000);}"
           "else{setStatus('Cloud login started',body.detail||'Waiting for cloud response...',7000);}}"
           "else{setStatus(body.error||'Cloud connect failed',body.detail||'Please review the credentials and try again.',8000);}}"
@@ -873,7 +1196,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const printer_serial=trimmedValue('printer_serial');"
           "const printer_access_code=trimmedValue('printer_access_code');"
           "const source_mode=savedConfig.source_mode||'hybrid';"
-          "if(!printer_host||!printer_serial||!printer_access_code){setStatus('Local credentials missing','Enter printer host, serial and access code first.',5000);return;}"
+          "if(!printer_host||!printer_serial){setStatus('Local credentials missing','Enter printer host and serial first.',5000);return;}"
           "localConnectButton.disabled=true;setStatus('Connecting local path...','Saving printer credentials and reconnecting MQTT now.',8000);"
           "try{const response=await fetch('/api/local/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer_host,printer_serial,printer_access_code,source_mode})});"
           "const body=await response.json().catch(()=>({}));"
@@ -894,7 +1217,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "if(wifiScanButton){wifiScanButton.addEventListener('click',refreshWifiScan);}";
   html += "arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(!input)return;"
           "input.addEventListener('input',queueArcPreview);input.addEventListener('change',commitArcColors);});";
-  html += "updateSourceModeControls();refreshWifiScan();updateHealth();setInterval(updateHealth,4000);";
+  html += "updateSourceModeControls();updateHealth();healthTimer=setInterval(updateHealth,4000);window.addEventListener('beforeunload',()=>{if(healthTimer){clearInterval(healthTimer);healthTimer=null;}});";
   html += "</script>";
   html += "</main></body></html>";
 
@@ -910,32 +1233,105 @@ esp_err_t SetupPortal::handle_favicon(httpd_req_t* request) {
 }
 
 esp_err_t SetupPortal::handle_health(httpd_req_t* request) {
-  const auto* portal = static_cast<const SetupPortal*>(request->user_ctx);
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  const bool request_authorized = portal->is_request_authorized(request);
+  const PortalAccessSnapshot access = portal->access_snapshot(request_authorized);
 
   std::string body = "{";
   body += "\"status\":\"ok\",";
   body += "\"portal\":\"setup\",";
-  body += "\"source_mode\":\"";
-  body += to_string(portal->config_store_.load_source_mode());
-  body += "\",";
-  body += "\"wifi_connected\":";
-  body += (portal->wifi_manager_.is_station_connected() ? "true" : "false");
-  body += ",";
-  body += "\"wifi_ip\":\"" + json_escape(portal->wifi_manager_.station_ip()) + "\"";
-  const BambuCloudSnapshot cloud = portal->cloud_client_.snapshot();
-  const PrinterSnapshot local = portal->printer_client_.snapshot();
-  append_cloud_status_fields(&body, cloud);
-  append_local_status_fields(&body, local, portal->printer_client_.is_configured());
+  append_portal_access_fields(&body, access);
+  if (request_authorized) {
+    body += ",\"source_mode\":\"";
+    body += to_string(portal->config_store_.load_source_mode());
+    body += "\",";
+    body += "\"wifi_connected\":";
+    body += (portal->wifi_manager_.is_station_connected() ? "true" : "false");
+    body += ",";
+    body += "\"wifi_ip\":\"" + json_escape(portal->wifi_manager_.station_ip()) + "\"";
+    const BambuCloudSnapshot cloud = portal->cloud_client_.snapshot();
+    const PrinterSnapshot local = portal->printer_client_.snapshot();
+    append_cloud_status_fields(&body, cloud);
+    append_local_status_fields(&body, local, portal->printer_client_.is_configured());
+  }
   body += "}";
 
   send_json(request, body);
   return ESP_OK;
 }
 
-esp_err_t SetupPortal::handle_wifi_scan(httpd_req_t* request) {
-  const auto* portal = static_cast<const SetupPortal*>(request->user_ctx);
+esp_err_t SetupPortal::handle_unlock(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
   if (portal == nullptr) {
     return ESP_FAIL;
+  }
+
+  if (!portal->is_lock_required()) {
+    const PortalAccessSnapshot access = portal->access_snapshot(true);
+    std::string body = "{\"status\":\"open\",\"detail\":\"";
+    body += json_escape(access.detail);
+    body += "\"";
+    append_portal_access_fields(&body, access);
+    body += "}";
+    send_json(request, body);
+    return ESP_OK;
+  }
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) {
+    return parse_err;
+  }
+
+  const std::string pin = trim_copy(read_string_field(root, "pin"));
+  cJSON_Delete(root);
+  if (pin.empty()) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "unlock pin missing");
+  }
+
+  const uint64_t current_ms = now_ms();
+  bool unlocked = false;
+  {
+    std::lock_guard<std::mutex> lock(portal->access_mutex_);
+    portal->prune_access_state_locked(current_ms);
+    if (!portal->unlock_pin_.empty() && pin == portal->unlock_pin_) {
+      portal->session_token_ = generate_session_token();
+      portal->session_expiry_ms_ = current_ms + kPortalSessionLifetimeMs;
+      portal->unlock_pin_.clear();
+      portal->unlock_pin_expiry_ms_ = 0;
+      unlocked = true;
+    }
+  }
+
+  if (!unlocked) {
+    return portal->send_locked_response(request);
+  }
+
+  const PortalAccessSnapshot access = portal->access_snapshot(true);
+  const std::string session_cookie =
+      session_cookie_header(portal->session_token_,
+                            static_cast<uint32_t>(kPortalSessionLifetimeMs / 1000ULL));
+  httpd_resp_set_hdr(request, "Set-Cookie", session_cookie.c_str());
+
+  std::string body = "{\"status\":\"unlocked\",\"detail\":\"";
+  body += json_escape(access.detail);
+  body += "\"";
+  append_portal_access_fields(&body, access);
+  body += "}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_wifi_scan(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
   }
 
   const std::vector<std::string> networks = portal->wifi_manager_.scan_visible_networks();
@@ -955,7 +1351,14 @@ esp_err_t SetupPortal::handle_wifi_scan(httpd_req_t* request) {
 }
 
 esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
-  const auto* portal = static_cast<const SetupPortal*>(request->user_ctx);
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
   const WifiCredentials wifi = portal->config_store_.load_wifi_credentials();
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
   const SourceMode source_mode = portal->config_store_.load_source_mode();
@@ -965,6 +1368,7 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   std::string body = "{";
   body += "\"wifi_ssid\":\"" + json_escape(wifi.ssid) + "\",";
   body += "\"cloud_email\":\"" + json_escape(cloud.email) + "\",";
+  body += "\"cloud_region\":\"" + json_escape(to_string(cloud.region)) + "\",";
   body += "\"printer_host\":\"" + json_escape(printer.host) + "\",";
   body += "\"printer_serial\":\"" + json_escape(printer.serial) + "\",";
   body += "\"source_mode\":\"";
@@ -1005,6 +1409,9 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
   if (portal == nullptr) {
     return ESP_FAIL;
   }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
 
   cJSON* root = nullptr;
   esp_err_t parse_err = receive_json_body(request, &root);
@@ -1012,22 +1419,28 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
     return parse_err;
   }
 
-  const WifiCredentials wifi = {
+  const WifiCredentials stored_wifi = portal->config_store_.load_wifi_credentials();
+  const BambuCloudCredentials stored_cloud = portal->config_store_.load_cloud_credentials();
+  const PrinterConnection stored_printer = portal->config_store_.load_printer_config();
+  const std::string stored_cloud_access_token = portal->config_store_.load_cloud_access_token();
+
+  const WifiCredentials wifi = merge_wifi_credentials({
       .ssid = trim_copy(read_string_field(root, "wifi_ssid")),
       .password = read_string_field(root, "wifi_password"),
-  };
+  }, stored_wifi);
 
-  const BambuCloudCredentials cloud = {
+  const BambuCloudCredentials cloud = merge_cloud_credentials({
       .email = trim_copy(read_string_field(root, "cloud_email")),
       .password = read_string_field(root, "cloud_password"),
-  };
+      .region = parse_cloud_region(trim_copy(read_string_field(root, "cloud_region"))),
+  }, stored_cloud);
   const SourceMode source_mode = parse_source_mode_field(root);
 
-  const PrinterConnection printer = {
+  const PrinterConnection printer = merge_printer_connection({
       .host = trim_copy(read_string_field(root, "printer_host")),
       .serial = trim_copy(read_string_field(root, "printer_serial")),
       .access_code = trim_copy(read_string_field(root, "printer_access_code")),
-  };
+  }, stored_printer);
 
   ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
   const bool colors_valid = parse_arc_colors_from_json(root, &arc_colors);
@@ -1042,7 +1455,8 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
       !printer.host.empty() || !printer.access_code.empty();
   const bool cloud_any = !cloud.email.empty() || !cloud.password.empty();
   const bool local_ready = printer.is_ready();
-  const bool cloud_ready = cloud.is_configured();
+  const bool cloud_ready =
+      cloud.is_configured() || can_reuse_cloud_session(cloud, stored_cloud, stored_cloud_access_token);
 
   if (!local_ready && local_requires_complete_fields) {
     return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "local printer fields incomplete");
@@ -1097,6 +1511,9 @@ esp_err_t SetupPortal::handle_arc_update(httpd_req_t* request, bool persist) {
   if (portal == nullptr) {
     return ESP_FAIL;
   }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
 
   cJSON* root = nullptr;
   esp_err_t parse_err = receive_json_body(request, &root);
@@ -1136,6 +1553,9 @@ esp_err_t SetupPortal::handle_source_mode_post(httpd_req_t* request) {
   if (portal == nullptr) {
     return ESP_FAIL;
   }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
 
   cJSON* root = nullptr;
   esp_err_t parse_err = receive_json_body(request, &root);
@@ -1164,6 +1584,9 @@ esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
   if (portal == nullptr) {
     return ESP_FAIL;
   }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
 
   cJSON* root = nullptr;
   esp_err_t parse_err = receive_json_body(request, &root);
@@ -1171,14 +1594,18 @@ esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
     return parse_err;
   }
 
-  const BambuCloudCredentials cloud = {
+  const BambuCloudCredentials stored_cloud = portal->config_store_.load_cloud_credentials();
+  const std::string stored_cloud_access_token = portal->config_store_.load_cloud_access_token();
+  const BambuCloudCredentials cloud = merge_cloud_credentials({
       .email = trim_copy(read_string_field(root, "cloud_email")),
       .password = read_string_field(root, "cloud_password"),
-  };
+      .region = parse_cloud_region(trim_copy(read_string_field(root, "cloud_region"))),
+  }, stored_cloud);
   const SourceMode source_mode = parse_source_mode_field(root);
   cJSON_Delete(root);
 
-  if (!cloud.is_configured()) {
+  if (!cloud.is_configured() &&
+      !can_reuse_cloud_session(cloud, stored_cloud, stored_cloud_access_token)) {
     httpd_resp_set_status(request, "400 Bad Request");
     send_json(request,
               "{\"error\":\"Cloud credentials incomplete\",\"detail\":\"Enter both Bambu email and password first.\"}");
@@ -1231,6 +1658,9 @@ esp_err_t SetupPortal::handle_cloud_verify(httpd_req_t* request) {
   if (portal == nullptr) {
     return ESP_FAIL;
   }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
 
   cJSON* root = nullptr;
   esp_err_t parse_err = receive_json_body(request, &root);
@@ -1271,6 +1701,9 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
   if (portal == nullptr) {
     return ESP_FAIL;
   }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
 
   cJSON* root = nullptr;
   esp_err_t parse_err = receive_json_body(request, &root);
@@ -1278,11 +1711,12 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
     return parse_err;
   }
 
-  const PrinterConnection printer = {
+  const PrinterConnection stored_printer = portal->config_store_.load_printer_config();
+  const PrinterConnection printer = merge_printer_connection({
       .host = trim_copy(read_string_field(root, "printer_host")),
       .serial = trim_copy(read_string_field(root, "printer_serial")),
       .access_code = trim_copy(read_string_field(root, "printer_access_code")),
-  };
+  }, stored_printer);
   const SourceMode source_mode = parse_source_mode_field(root);
   cJSON_Delete(root);
 

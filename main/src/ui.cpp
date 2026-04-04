@@ -12,6 +12,7 @@
 #include "bsp/esp32_s3_touch_amoled_1_75.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "png.h"
 #include "printsphere/board_config.hpp"
 
@@ -20,6 +21,7 @@ extern const lv_image_dsc_t bambuicon_small;
 extern const lv_font_t dosis_20;
 extern const lv_font_t dosis_32;
 extern const lv_font_t dosis_40;
+extern const lv_font_t lv_font_montserrat_20;
 extern const lv_font_t mdi_30;
 extern const lv_font_t mdi_40;
 }
@@ -50,6 +52,7 @@ constexpr uint32_t kBatteryDimTimeoutIdleMs = 20000U;
 constexpr uint32_t kBatteryOffTimeoutIdleMs = 60000U;
 constexpr uint32_t kBatteryDimTimeoutActiveMs = 30000U;
 constexpr uint32_t kBatteryOffTimeoutActiveMs = 120000U;
+constexpr uint64_t kPortalHintIntroMs = 5ULL * 60ULL * 1000ULL;
 constexpr uint32_t kRingBaseDark = 0x101010;
 constexpr uint32_t kRingIdleSolid = 0x404040;
 constexpr char kDegreeC[] = "\xC2\xB0""C";
@@ -160,8 +163,8 @@ void set_label_text_if_changed(lv_obj_t* label, const std::string& text) {
   set_label_text_if_changed(label, text.c_str());
 }
 
-std::string optional_temperature_text(const char* label, float temperature_c) {
-  if (label == nullptr || temperature_c <= 0.0f) {
+std::string optional_temperature_text(const char* label, float temperature_c, bool known = false) {
+  if (label == nullptr || (!known && temperature_c <= 0.0f)) {
     return {};
   }
 
@@ -832,6 +835,19 @@ std::string battery_pct_text(const PrinterSnapshot& snapshot) {
   return buffer;
 }
 
+std::string short_duration_text(uint32_t total_seconds) {
+  const uint32_t minutes = total_seconds / 60U;
+  const uint32_t seconds = total_seconds % 60U;
+  char buffer[24] = {};
+  if (minutes > 0U) {
+    std::snprintf(buffer, sizeof(buffer), "%um %us", static_cast<unsigned int>(minutes),
+                  static_cast<unsigned int>(seconds));
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%us", static_cast<unsigned int>(seconds));
+  }
+  return buffer;
+}
+
 bool should_show_logo(const PrinterSnapshot& snapshot) {
   if (!snapshot.wifi_connected) {
     return false;
@@ -856,6 +872,8 @@ esp_err_t Ui::initialize() {
   if (initialized_) {
     return ESP_OK;
   }
+
+  portal_hint_boot_ms_ = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
 
   display_ = bsp_display_start();
   if (display_ == nullptr) {
@@ -904,6 +922,66 @@ bool Ui::consume_camera_refresh_request() {
 
 bool Ui::consume_chamber_light_toggle_request() {
   return chamber_light_toggle_requested_.exchange(false);
+}
+
+bool Ui::consume_portal_unlock_request() {
+  return portal_unlock_requested_.exchange(false);
+}
+
+void Ui::set_portal_access_state(bool request_authorized, bool session_active, bool pin_active,
+                                 const std::string& pin_code, uint32_t pin_remaining_s,
+                                 uint32_t session_remaining_s) {
+  if (!initialized_) {
+    return;
+  }
+
+  LvglLockGuard lock(200);
+  if (!lock.locked()) {
+    return;
+  }
+
+  portal_request_authorized_ = request_authorized;
+  portal_session_active_ = session_active;
+  portal_pin_active_ = pin_active;
+  portal_pin_code_ = pin_code;
+  portal_pin_remaining_s_ = pin_remaining_s;
+  portal_session_remaining_s_ = session_remaining_s;
+  const bool provisioning_context =
+      last_snapshot_.setup_ap_active ||
+      last_snapshot_.connection == PrinterConnectionState::kWaitingForCredentials;
+  const bool station_portal_available =
+      !last_snapshot_.setup_ap_active && last_snapshot_.wifi_connected && !last_snapshot_.wifi_ip.empty();
+
+  if (portal_pin_active_) {
+    portal_hint_text_ = request_authorized ? "Web Config PIN active on the display"
+                                           : "Enter the PIN shown on the display";
+    portal_overlay_title_text_ = "WEB CONFIG PIN";
+    portal_overlay_value_text_ = portal_pin_code_;
+    portal_overlay_detail_text_ =
+        "Valid for " + short_duration_text(std::max<uint32_t>(portal_pin_remaining_s_, 1U)) +
+        ". Enter it in the browser.";
+  } else {
+    portal_overlay_title_text_.clear();
+    portal_overlay_value_text_.clear();
+    portal_overlay_detail_text_.clear();
+    if (portal_session_active_ && request_authorized) {
+      portal_hint_text_ =
+          "Web Config unlocked for " +
+          short_duration_text(std::max<uint32_t>(portal_session_remaining_s_, 1U));
+    } else if (provisioning_context) {
+      portal_hint_text_.clear();
+    } else if (portal_hint_boot_ms_ != 0 &&
+               static_cast<uint64_t>(esp_timer_get_time() / 1000ULL) <
+                   portal_hint_boot_ms_ + kPortalHintIntroMs) {
+      portal_hint_text_ = station_portal_available
+                              ? ("Open " + last_snapshot_.wifi_ip + " | Hold for PIN")
+                              : "Hold for PIN";
+    } else {
+      portal_hint_text_.clear();
+    }
+  }
+
+  update_portal_access_visuals_locked();
 }
 
 void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
@@ -1033,14 +1111,14 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   set_label_text_if_changed(remaining_label_, remaining);
 
   char temp_buffer[24] = {};
-  if (snapshot.nozzle_temp_c > 0.0f) {
+  if (snapshot.nozzle_temp_known || snapshot.nozzle_temp_c > 0.0f) {
     std::snprintf(temp_buffer, sizeof(temp_buffer), "%.0f%s", snapshot.nozzle_temp_c, kDegreeC);
   } else {
     std::snprintf(temp_buffer, sizeof(temp_buffer), "--%s", kDegreeC);
   }
   set_label_text_if_changed(nozzle_value_label_, temp_buffer);
 
-  if (snapshot.bed_temp_c > 0.0f) {
+  if (snapshot.bed_temp_known || snapshot.bed_temp_c > 0.0f) {
     std::snprintf(temp_buffer, sizeof(temp_buffer), "%.0f%s", snapshot.bed_temp_c, kDegreeC);
   } else {
     std::snprintf(temp_buffer, sizeof(temp_buffer), "--%s", kDegreeC);
@@ -1048,13 +1126,15 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   set_label_text_if_changed(bed_value_label_, temp_buffer);
 
   const std::string nozzle_aux =
-      optional_temperature_text("Other nozzle", snapshot.secondary_nozzle_temp_c);
+      optional_temperature_text("Other nozzle", snapshot.secondary_nozzle_temp_c,
+                                snapshot.secondary_nozzle_temp_known);
   nozzle_aux_visible_ = !nozzle_aux.empty();
   if (nozzle_aux_visible_) {
     set_label_text_if_changed(nozzle_aux_label_, nozzle_aux);
   }
 
-  const std::string bed_aux = optional_temperature_text("Chamber", snapshot.chamber_temp_c);
+  const std::string bed_aux =
+      optional_temperature_text("Chamber", snapshot.chamber_temp_c, snapshot.chamber_temp_known);
   bed_aux_visible_ = !bed_aux.empty();
   if (bed_aux_visible_) {
     set_label_text_if_changed(bed_aux_label_, bed_aux);
@@ -1232,6 +1312,7 @@ esp_err_t Ui::build_dashboard() {
   const lv_font_t* dosis20 = &dosis_20;
   const lv_font_t* dosis32 = &dosis_32;
   const lv_font_t* dosis40 = &dosis_40;
+  const lv_font_t* info20 = &lv_font_montserrat_20;
   const lv_font_t* mdi30 = &mdi_30;
   const lv_font_t* mdi40 = &mdi_40;
 
@@ -1367,7 +1448,7 @@ esp_err_t Ui::build_dashboard() {
   lv_label_set_long_mode(detail_label_, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(detail_label_, 320);
   lv_obj_set_style_text_align(detail_label_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(detail_label_, dosis20, 0);
+  lv_obj_set_style_text_font(detail_label_, info20, 0);
   lv_obj_set_style_text_color(detail_label_, lv_color_hex(0x94A3B8), 0);
   lv_obj_align(detail_label_, LV_ALIGN_CENTER, 0, 114);
 
@@ -1445,6 +1526,16 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_font(remaining_label_, dosis40, 0);
   lv_obj_set_style_text_color(remaining_label_, lv_color_hex(0x87CEEB), 0);
 
+  portal_hint_label_ = lv_label_create(page1_);
+  set_label_text_if_changed(portal_hint_label_, "");
+  lv_obj_set_width(portal_hint_label_, 320);
+  lv_label_set_long_mode(portal_hint_label_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(portal_hint_label_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(portal_hint_label_, info20, 0);
+  lv_obj_set_style_text_color(portal_hint_label_, lv_color_hex(0x64748B), 0);
+  lv_obj_align(portal_hint_label_, LV_ALIGN_CENTER, 0, 114);
+  lv_obj_add_flag(portal_hint_label_, LV_OBJ_FLAG_HIDDEN);
+
   brightness_overlay_ = lv_label_create(lv_layer_top());
   set_label_text_if_changed(brightness_overlay_, "80%");
   lv_obj_set_style_text_font(brightness_overlay_, dosis40, 0);
@@ -1457,6 +1548,44 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_align(brightness_overlay_, LV_ALIGN_CENTER, 0, 0);
   lv_obj_add_flag(brightness_overlay_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(brightness_overlay_);
+
+  portal_overlay_card_ = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(portal_overlay_card_, 280, LV_SIZE_CONTENT);
+  lv_obj_set_style_radius(portal_overlay_card_, 22, 0);
+  lv_obj_set_style_bg_color(portal_overlay_card_, lv_color_hex(0x071018), 0);
+  lv_obj_set_style_bg_opa(portal_overlay_card_, LV_OPA_90, 0);
+  lv_obj_set_style_border_color(portal_overlay_card_, lv_color_hex(0xF0A64B), 0);
+  lv_obj_set_style_border_width(portal_overlay_card_, 2, 0);
+  lv_obj_set_style_pad_hor(portal_overlay_card_, 22, 0);
+  lv_obj_set_style_pad_ver(portal_overlay_card_, 18, 0);
+  lv_obj_set_style_pad_row(portal_overlay_card_, 8, 0);
+  lv_obj_set_layout(portal_overlay_card_, LV_LAYOUT_FLEX);
+  lv_obj_set_flex_flow(portal_overlay_card_, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(portal_overlay_card_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_center(portal_overlay_card_);
+  lv_obj_clear_flag(portal_overlay_card_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(portal_overlay_card_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(portal_overlay_card_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(portal_overlay_card_);
+
+  portal_overlay_title_ = lv_label_create(portal_overlay_card_);
+  set_label_text_if_changed(portal_overlay_title_, "WEB CONFIG PIN");
+  lv_obj_set_style_text_font(portal_overlay_title_, dosis20, 0);
+  lv_obj_set_style_text_color(portal_overlay_title_, lv_color_hex(0xF8FAFC), 0);
+
+  portal_overlay_value_ = lv_label_create(portal_overlay_card_);
+  set_label_text_if_changed(portal_overlay_value_, "000000");
+  lv_obj_set_style_text_font(portal_overlay_value_, dosis40, 0);
+  lv_obj_set_style_text_color(portal_overlay_value_, lv_color_hex(0xF0A64B), 0);
+
+  portal_overlay_detail_ = lv_label_create(portal_overlay_card_);
+  set_label_text_if_changed(portal_overlay_detail_, "");
+  lv_obj_set_width(portal_overlay_detail_, 236);
+  lv_label_set_long_mode(portal_overlay_detail_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(portal_overlay_detail_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(portal_overlay_detail_, dosis20, 0);
+  lv_obj_set_style_text_color(portal_overlay_detail_, lv_color_hex(0xCBD5E1), 0);
 
   page2_shell_ = nullptr;
 
@@ -1484,7 +1613,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_width(page2_subnote_, 320);
   lv_label_set_long_mode(page2_subnote_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page2_subnote_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(page2_subnote_, dosis20, 0);
+  lv_obj_set_style_text_font(page2_subnote_, info20, 0);
   lv_obj_set_style_text_color(page2_subnote_, lv_color_hex(0x888888), 0);
   lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 28);
   lv_obj_add_flag(page2_subnote_, LV_OBJ_FLAG_HIDDEN);
@@ -1504,7 +1633,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_width(page3_note_, 320);
   lv_label_set_long_mode(page3_note_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page3_note_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(page3_note_, dosis20, 0);
+  lv_obj_set_style_text_font(page3_note_, info20, 0);
   lv_obj_set_style_text_color(page3_note_, lv_color_hex(0x888888), 0);
   lv_obj_align(page3_note_, LV_ALIGN_CENTER, 0, 0);
   enable_touch_bubble(page3_note_);
@@ -1514,7 +1643,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_width(page3_subnote_, 320);
   lv_label_set_long_mode(page3_subnote_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page3_subnote_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(page3_subnote_, dosis20, 0);
+  lv_obj_set_style_text_font(page3_subnote_, info20, 0);
   lv_obj_set_style_text_color(page3_subnote_, lv_color_hex(0x888888), 0);
   lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, 28);
   lv_obj_add_flag(page3_subnote_, LV_OBJ_FLAG_HIDDEN);
@@ -1531,6 +1660,7 @@ esp_err_t Ui::build_dashboard() {
   preview_text_image_mode_ = false;
   camera_text_image_mode_ = false;
   apply_page_visibility();
+  update_portal_access_visuals_locked();
 
   return ESP_OK;
 }
@@ -1539,6 +1669,10 @@ void Ui::apply_page_visibility() {
   const bool show_page1 = !scrolling_ && active_page_ == 0;
   const bool show_page2 = !scrolling_ && active_page_ == 1;
   const bool show_page3 = !scrolling_ && active_page_ == 2;
+  const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
+  const bool show_portal_hint =
+      show_page1 && !portal_hint_text_.empty() &&
+      (portal_hint_has_priority || !detail_visible_);
 
   set_hidden(page2_, !preview_page_available_);
   set_hidden(page3_, !camera_page_available_);
@@ -1553,10 +1687,12 @@ void Ui::apply_page_visibility() {
   set_hidden(bed_aux_label_, !show_page1 || !bed_aux_visible_);
   set_hidden(remaining_row_, !show_page1);
   set_hidden(badge_slot_, !show_page1);
+  set_hidden(portal_hint_label_, !show_portal_hint);
   set_hidden(page2_image_, !show_page2 || !preview_image_visible_);
   set_hidden(page3_image_, !show_page3 || !camera_image_visible_);
 
   apply_logo_visibility();
+  update_portal_access_visuals_locked();
 }
 
 void Ui::apply_logo_visibility() {
@@ -1750,7 +1886,7 @@ void Ui::handle_pager_event(lv_event_t* event) {
 void Ui::handle_screen_event(lv_event_t* event) {
   const lv_event_code_t code = lv_event_get_code(event);
   if (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING && code != LV_EVENT_RELEASED &&
-      code != LV_EVENT_PRESS_LOST) {
+      code != LV_EVENT_PRESS_LOST && code != LV_EVENT_LONG_PRESSED) {
     return;
   }
 
@@ -1798,6 +1934,14 @@ void Ui::handle_screen_event(lv_event_t* event) {
     return;
   }
 
+  if (code == LV_EVENT_LONG_PRESSED && gesture_active_) {
+    note_activity(false);
+    if (!overlay_visible_ && !scrolling_) {
+      portal_unlock_requested_.store(true);
+    }
+    return;
+  }
+
   if ((code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) && gesture_active_) {
     note_activity(false);
     const int dx = static_cast<int>(point.x - gesture_start_x_);
@@ -1830,6 +1974,27 @@ void Ui::handle_screen_event(lv_event_t* event) {
       camera_refresh_requested_ = true;
     }
   }
+}
+
+void Ui::update_portal_access_visuals_locked() {
+  const bool show_page1 = !scrolling_ && active_page_ == 0;
+  const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
+  const bool show_hint = portal_hint_label_ != nullptr && show_page1 && !portal_hint_text_.empty() &&
+                         (portal_hint_has_priority || !detail_visible_);
+  set_hidden(portal_hint_label_, !show_hint);
+  if (show_hint) {
+    set_label_text_if_changed(portal_hint_label_, portal_hint_text_);
+  }
+
+  const bool show_overlay = portal_overlay_card_ != nullptr && portal_pin_active_;
+  set_hidden(portal_overlay_card_, !show_overlay);
+  if (!show_overlay) {
+    return;
+  }
+
+  set_label_text_if_changed(portal_overlay_title_, portal_overlay_title_text_);
+  set_label_text_if_changed(portal_overlay_value_, portal_overlay_value_text_);
+  set_label_text_if_changed(portal_overlay_detail_, portal_overlay_detail_text_);
 }
 
 void Ui::handle_logo_event(lv_event_t* event) {

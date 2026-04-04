@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <mutex>
+#include <string>
+
 #include "esp_err.h"
 #include "esp_http_server.h"
 #include "printsphere/bambu_cloud_client.hpp"
@@ -11,6 +15,16 @@
 namespace printsphere {
 
 class Ui;
+
+struct PortalAccessSnapshot {
+  bool request_authorized = false;
+  bool session_active = false;
+  bool pin_active = false;
+  uint32_t session_remaining_s = 0;
+  uint32_t pin_remaining_s = 0;
+  std::string pin_code;
+  std::string detail;
+};
 
 class SetupPortal {
  public:
@@ -25,11 +39,14 @@ class SetupPortal {
         ui_(ui) {}
 
   esp_err_t start();
+  void request_unlock_pin();
+  PortalAccessSnapshot access_snapshot(bool request_authorized = false);
 
  private:
   static esp_err_t handle_root(httpd_req_t* request);
   static esp_err_t handle_favicon(httpd_req_t* request);
   static esp_err_t handle_health(httpd_req_t* request);
+  static esp_err_t handle_unlock(httpd_req_t* request);
   static esp_err_t handle_wifi_scan(httpd_req_t* request);
   static esp_err_t handle_config_get(httpd_req_t* request);
   static esp_err_t handle_config_post(httpd_req_t* request);
@@ -41,6 +58,13 @@ class SetupPortal {
   static esp_err_t handle_cloud_verify(httpd_req_t* request);
   static esp_err_t handle_local_connect(httpd_req_t* request);
   static void reboot_task(void* context);
+  bool is_lock_required() const;
+  bool is_request_authorized(httpd_req_t* request);
+  esp_err_t send_locked_response(httpd_req_t* request);
+  esp_err_t send_unlock_page(httpd_req_t* request);
+  void prune_access_state_locked(uint64_t now_ms);
+  static std::string generate_unlock_pin();
+  static std::string generate_session_token();
 
   ConfigStore& config_store_;
   const WifiManager& wifi_manager_;
@@ -50,6 +74,11 @@ class SetupPortal {
   Ui& ui_;
   httpd_handle_t server_ = nullptr;
   bool reboot_requested_ = false;
+  std::mutex access_mutex_{};
+  std::string unlock_pin_{};
+  uint64_t unlock_pin_expiry_ms_ = 0;
+  std::string session_token_{};
+  uint64_t session_expiry_ms_ = 0;
 };
 
 }  // namespace printsphere

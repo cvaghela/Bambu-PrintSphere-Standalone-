@@ -14,7 +14,8 @@ namespace printsphere {
 namespace {
 constexpr char kTag[] = "printsphere.app";
 constexpr TickType_t kStopBannerDuration = pdMS_TO_TICKS(12000);
-constexpr TickType_t kHybridCloudFallbackDelay = pdMS_TO_TICKS(12000);
+constexpr TickType_t kHybridCloudFallbackDelayLocalFirst = pdMS_TO_TICKS(35000);
+constexpr TickType_t kHybridCloudFallbackDelayCloudFirst = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCameraCloudCooldown = pdMS_TO_TICKS(8000);
 constexpr uint64_t kChamberLightOverrideMs = 6000;
 
@@ -41,6 +42,33 @@ bool hybrid_local_status_ready(const PrinterSnapshot& snapshot) {
          snapshot.bed_temp_c > 0.0f || snapshot.chamber_temp_c > 0.0f ||
          snapshot.secondary_nozzle_temp_c > 0.0f || snapshot.print_error_code != 0 ||
          snapshot.hms_alert_count > 0U;
+}
+
+PrinterModel preferred_model_for_routing(const PrinterSnapshot& local_snapshot,
+                                         const BambuCloudSnapshot& cloud_snapshot) {
+  if (cloud_snapshot.model != PrinterModel::kUnknown) {
+    return cloud_snapshot.model;
+  }
+  return local_snapshot.local_model;
+}
+
+bool hybrid_prefers_cloud_status(const PrinterSnapshot& local_snapshot,
+                                 const BambuCloudSnapshot& cloud_snapshot) {
+  return printer_model_prefers_cloud_status(
+      preferred_model_for_routing(local_snapshot, cloud_snapshot));
+}
+
+bool hybrid_local_status_supported(const PrinterSnapshot& local_snapshot,
+                                   const BambuCloudSnapshot& cloud_snapshot) {
+  return printer_model_supports_local_status(
+      preferred_model_for_routing(local_snapshot, cloud_snapshot));
+}
+
+TickType_t hybrid_cloud_fallback_delay(const PrinterSnapshot& local_snapshot,
+                                       const BambuCloudSnapshot& cloud_snapshot) {
+  return hybrid_prefers_cloud_status(local_snapshot, cloud_snapshot)
+             ? kHybridCloudFallbackDelayCloudFirst
+             : kHybridCloudFallbackDelayLocalFirst;
 }
 }
 
@@ -93,8 +121,13 @@ void Application::run() {
   while (true) {
     const TickType_t now_tick = xTaskGetTickCount();
     const uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+    if (ui_.consume_portal_unlock_request()) {
+      setup_portal_.request_unlock_pin();
+    }
+    const PortalAccessSnapshot portal_access = setup_portal_.access_snapshot();
     const bool wifi_connected = wifi_manager_.is_station_connected();
     const std::string wifi_ip = wifi_manager_.station_ip();
+    const bool page_transition_active = ui_.is_page_transition_active();
     const bool preview_page_active = ui_.is_page2_active();
     const bool camera_page_active = ui_.is_camera_page_active();
     source_mode_ = config_store_.load_source_mode();
@@ -102,6 +135,13 @@ void Application::run() {
     printer_client_.set_network_ready(local_network_ready);
     camera_client_.set_network_ready(local_network_ready);
     local_printer_enabled_ = printer_client_.is_configured();
+    const bool camera_enabled =
+        source_mode_ != SourceMode::kCloudOnly && local_printer_enabled_ && wifi_connected &&
+        camera_page_active && ui_.screen_power_mode() != ScreenPowerMode::kOff;
+    camera_client_.set_enabled(camera_enabled);
+    if (ui_.consume_camera_refresh_request()) {
+      camera_client_.request_refresh();
+    }
 
     PrinterSnapshot local_snapshot = printer_client_.snapshot();
     local_snapshot.wifi_connected = wifi_connected;
@@ -134,6 +174,14 @@ void Application::run() {
       hybrid_camera_cooldown_deadline_ = 0;
     }
 
+    BambuCloudSnapshot cloud_snapshot = cloud_client_.snapshot();
+    const bool hybrid_prefers_cloud =
+        source_mode_ == SourceMode::kHybrid &&
+        hybrid_prefers_cloud_status(local_snapshot, cloud_snapshot);
+    const bool hybrid_local_status_supported_now =
+        source_mode_ != SourceMode::kCloudOnly &&
+        hybrid_local_status_supported(local_snapshot, cloud_snapshot);
+
     bool cloud_network_ready = wifi_connected;
     const bool hybrid_camera_cooldown_active =
         source_mode_ == SourceMode::kHybrid &&
@@ -146,10 +194,14 @@ void Application::run() {
         hybrid_cloud_gate_deadline_ = 0;
       } else if (!wifi_connected) {
         hybrid_cloud_gate_open_ = false;
+      } else if (hybrid_prefers_cloud || !hybrid_local_status_supported_now) {
+        hybrid_cloud_gate_open_ = true;
+        hybrid_cloud_gate_deadline_ = 0;
       } else {
         if (source_mode_changed || wifi_reconnected || hybrid_cloud_gate_deadline_ == 0) {
           hybrid_cloud_gate_open_ = false;
-          hybrid_cloud_gate_deadline_ = now_tick + kHybridCloudFallbackDelay;
+          hybrid_cloud_gate_deadline_ =
+              now_tick + hybrid_cloud_fallback_delay(local_snapshot, cloud_snapshot);
           ESP_LOGI(kTag, "Hybrid mode: delaying cloud path until local status or fallback timeout");
         }
 
@@ -167,22 +219,24 @@ void Application::run() {
     }
     const bool hybrid_local_path_healthy =
         source_mode_ == SourceMode::kHybrid && local_network_ready && local_printer_enabled_ &&
-        local_snapshot.local_connected;
+        local_snapshot.local_connected && hybrid_local_status_supported_now && !hybrid_prefers_cloud;
     if (source_mode_ == SourceMode::kHybrid && hybrid_local_path_healthy && !preview_page_active) {
       cloud_network_ready = false;
     }
     const bool cloud_live_mqtt_enabled =
         cloud_network_ready &&
         (source_mode_ == SourceMode::kCloudOnly ||
-         (source_mode_ == SourceMode::kHybrid && !hybrid_local_path_healthy));
+         (source_mode_ == SourceMode::kHybrid &&
+          (hybrid_prefers_cloud || !hybrid_local_path_healthy)));
     const bool pause_cloud_fetches =
         source_mode_ == SourceMode::kHybrid &&
-        (camera_page_active || hybrid_camera_cooldown_active || !cloud_network_ready);
+        (camera_page_active || page_transition_active || hybrid_camera_cooldown_active ||
+         !cloud_network_ready);
     cloud_client_.set_network_ready(cloud_network_ready);
     cloud_client_.set_live_mqtt_enabled(cloud_live_mqtt_enabled);
     cloud_client_.set_fetch_paused(pause_cloud_fetches);
 
-    BambuCloudSnapshot cloud_snapshot = cloud_client_.snapshot();
+    cloud_snapshot = cloud_client_.snapshot();
     if (source_mode_ == SourceMode::kCloudOnly) {
       if (last_cloud_print_live_ && cloud_snapshot.non_error_stop) {
         stop_banner_until_tick_ = now_tick + kStopBannerDuration;
@@ -249,7 +303,8 @@ void Application::run() {
         }
       } else {
         const bool local_light_available =
-            local_network_ready && local_printer_enabled_ &&
+            !hybrid_prefers_cloud && hybrid_local_status_supported_now && local_network_ready &&
+            local_printer_enabled_ &&
             (local_snapshot.local_connected ||
              printer_model_has_chamber_light(local_snapshot.local_model));
         if (local_light_available) {
@@ -290,14 +345,6 @@ void Application::run() {
       snapshot.pmu_temp_c = power.temperature_c;
     }
 
-    const bool camera_enabled =
-        source_mode_ != SourceMode::kCloudOnly && local_printer_enabled_ && wifi_connected &&
-        camera_page_active && ui_.screen_power_mode() != ScreenPowerMode::kOff;
-    camera_client_.set_enabled(camera_enabled);
-    if (ui_.consume_camera_refresh_request()) {
-      camera_client_.request_refresh();
-    }
-
     const P1sCameraSnapshot camera_snapshot = camera_client_.snapshot();
     if (source_mode_ == SourceMode::kCloudOnly || !local_printer_enabled_) {
       snapshot.camera_connected = false;
@@ -323,6 +370,9 @@ void Application::run() {
 
     resolve_ui_state(snapshot);
     ui_.apply_snapshot(snapshot);
+    ui_.set_portal_access_state(portal_access.request_authorized, portal_access.session_active,
+                                portal_access.pin_active, portal_access.pin_code,
+                                portal_access.pin_remaining_s, portal_access.session_remaining_s);
     last_local_print_live_ = local_print_is_live(local_snapshot);
     last_cloud_print_live_ = cloud_print_is_live(cloud_snapshot);
 
@@ -331,16 +381,17 @@ void Application::run() {
         source_mode_ == SourceMode::kCloudOnly || preview_page_active;
     cloud_client_.set_preview_fetch_enabled(source_mode_ != SourceMode::kLocalOnly &&
                                             preview_pipeline_enabled);
-    const bool keep_screen_awake = snapshot.print_active || camera_page_active;
+    const bool keep_screen_awake = snapshot.print_active || camera_page_active || page_transition_active;
     ui_.update_power_save(on_battery, keep_screen_awake);
 
-    cloud_client_.set_low_power_mode(camera_page_active ||
+    cloud_client_.set_low_power_mode(camera_page_active || page_transition_active ||
                                      (on_battery && ui_.is_low_power_mode_active() &&
                                       !snapshot.print_active));
 
     const TickType_t loop_delay =
-        (snapshot.print_active || camera_page_active || !ui_.is_low_power_mode_active())
-            ? pdMS_TO_TICKS(500)
+        (snapshot.print_active || camera_page_active || page_transition_active ||
+         !ui_.is_low_power_mode_active())
+            ? pdMS_TO_TICKS(page_transition_active ? 100 : 500)
             : pdMS_TO_TICKS(1500);
     last_source_mode_ = source_mode_;
     last_wifi_connected_ = wifi_connected;

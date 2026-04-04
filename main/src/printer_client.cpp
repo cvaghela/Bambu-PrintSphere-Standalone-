@@ -41,6 +41,32 @@ uint64_t now_ms() {
   return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
 }
 
+template <size_t N>
+void copy_text(std::array<char, N>* target, const std::string& value) {
+  if (target == nullptr) {
+    return;
+  }
+  strlcpy(target->data(), value.c_str(), target->size());
+}
+
+template <size_t N>
+void copy_text(std::array<char, N>* target, const char* value) {
+  if (target == nullptr) {
+    return;
+  }
+  strlcpy(target->data(), value != nullptr ? value : "", target->size());
+}
+
+template <size_t N>
+std::string text_string(const std::array<char, N>& value) {
+  return value.data();
+}
+
+template <size_t N>
+bool has_text(const std::array<char, N>& value) {
+  return value[0] != '\0';
+}
+
 bool tick_elapsed(uint32_t start_tick, uint32_t now_tick, TickType_t duration) {
   if (start_tick == 0) {
     return false;
@@ -200,8 +226,9 @@ std::string build_ledctrl_payload(const char* node, bool on) {
   return payload;
 }
 
-void apply_chamber_light_report(const cJSON* object, PrinterSnapshot* snapshot) {
-  if (object == nullptr || snapshot == nullptr) {
+void apply_chamber_light_report(const cJSON* object,
+                                PrinterClient::LocalPrinterRuntimeState* runtime) {
+  if (object == nullptr || runtime == nullptr) {
     return;
   }
 
@@ -226,62 +253,10 @@ void apply_chamber_light_report(const cJSON* object, PrinterSnapshot* snapshot) 
   }
 
   if (seen) {
-    snapshot->chamber_light_supported = true;
-    snapshot->chamber_light_state_known = true;
-    snapshot->chamber_light_on = any_on;
+    runtime->chamber_light_supported = true;
+    runtime->chamber_light_state_known = true;
+    runtime->chamber_light_on = any_on;
   }
-}
-
-std::string normalized_copy(std::string value) {
-  std::string normalized;
-  normalized.reserve(value.size());
-  for (const char ch : value) {
-    if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
-      normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
-    }
-  }
-  return normalized;
-}
-
-PrinterModel model_from_product_name(const std::string& product_name) {
-  const std::string normalized = normalized_copy(product_name);
-  if (normalized.find("A1MINI") != std::string::npos) {
-    return PrinterModel::kA1Mini;
-  }
-  if (normalized.find("BAMBULABA1") != std::string::npos || normalized == "A1") {
-    return PrinterModel::kA1;
-  }
-  if (normalized.find("P1S") != std::string::npos) {
-    return PrinterModel::kP1S;
-  }
-  if (normalized.find("P1P") != std::string::npos) {
-    return PrinterModel::kP1P;
-  }
-  if (normalized.find("P2S") != std::string::npos) {
-    return PrinterModel::kP2S;
-  }
-  if (normalized.find("H2DPRO") != std::string::npos) {
-    return PrinterModel::kH2DPro;
-  }
-  if (normalized.find("H2D") != std::string::npos) {
-    return PrinterModel::kH2D;
-  }
-  if (normalized.find("H2S") != std::string::npos) {
-    return PrinterModel::kH2S;
-  }
-  if (normalized.find("H2C") != std::string::npos) {
-    return PrinterModel::kH2C;
-  }
-  if (normalized.find("X1E") != std::string::npos) {
-    return PrinterModel::kX1E;
-  }
-  if (normalized.find("X1CARBON") != std::string::npos || normalized.find("X1C") != std::string::npos) {
-    return PrinterModel::kX1C;
-  }
-  if (normalized.find("X1") != std::string::npos) {
-    return PrinterModel::kX1;
-  }
-  return PrinterModel::kUnknown;
 }
 
 PrinterModel detect_printer_model(const cJSON* modules, PrinterModel fallback) {
@@ -297,8 +272,8 @@ PrinterModel detect_printer_model(const cJSON* modules, PrinterModel fallback) {
     }
 
     const PrinterModel model =
-        model_from_product_name(json_string_local(module, "product_name",
-                                                  json_string_local(module, "productName", {})));
+        bambu_model_from_product_name(json_string_local(module, "product_name",
+                                                        json_string_local(module, "productName", {})));
     if (model != PrinterModel::kUnknown) {
       return model;
     }
@@ -347,7 +322,7 @@ PrinterModel detect_printer_model_from_payload(const cJSON* object, PrinterModel
   const char* keys[] = {"product_name", "productName", "printer_model",
                         "printerModel", "model",        "series"};
   for (const char* key : keys) {
-    if (const PrinterModel model = model_from_product_name(json_string_local(object, key, {}));
+    if (const PrinterModel model = bambu_model_from_product_name(json_string_local(object, key, {}));
         model != PrinterModel::kUnknown) {
       return model;
     }
@@ -548,21 +523,22 @@ bool parse_signature_required(const cJSON* print, bool fallback) {
   return (parsed & 0x20000000ULL) != 0ULL;
 }
 
-void update_local_source_metadata(PrinterSnapshot* snapshot, bool configured, bool connected) {
-  if (snapshot == nullptr) {
+void update_local_runtime_metadata(PrinterClient::LocalPrinterRuntimeState* runtime, bool configured,
+                                   bool connected) {
+  if (runtime == nullptr) {
     return;
   }
 
-  snapshot->local_configured = configured;
-  snapshot->local_connected = connected;
-  snapshot->local_capabilities = default_local_capabilities_for_model(snapshot->local_model);
-  if (!snapshot->camera_rtsp_url.empty()) {
-    snapshot->local_capabilities.camera_rtsp = true;
+  runtime->local_configured = configured;
+  runtime->local_connected = connected;
+  runtime->local_capabilities = default_local_capabilities_for_model(runtime->local_model);
+  if (has_text(runtime->camera_rtsp_url)) {
+    runtime->local_capabilities.camera_rtsp = true;
   }
-  if (snapshot->local_mqtt_signature_required) {
-    snapshot->local_capabilities.developer_mode_required = true;
+  if (runtime->local_mqtt_signature_required) {
+    runtime->local_capabilities.developer_mode_required = true;
   }
-  snapshot->local_last_update_ms = now_ms();
+  runtime->local_last_update_ms = now_ms();
 }
 
 uint32_t extract_remaining_seconds(const cJSON* print) {
@@ -710,9 +686,9 @@ bool PrinterClient::is_configured() const {
 }
 
 bool PrinterClient::set_chamber_light(bool on) {
-  PrinterSnapshot snapshot = state_.snapshot();
+  LocalPrinterRuntimeState runtime = runtime_state_copy();
   const bool supports_secondary =
-      printer_model_has_secondary_chamber_light(snapshot.local_model);
+      printer_model_has_secondary_chamber_light(runtime.local_model);
 
   auto publish_ledctrl = [&](const char* node) {
     const std::string payload = build_ledctrl_payload(node, on);
@@ -737,11 +713,12 @@ bool PrinterClient::set_chamber_light(bool on) {
 
   publish_request(kPushAll);
 
-  snapshot.chamber_light_supported = true;
-  snapshot.chamber_light_state_known = true;
-  snapshot.chamber_light_on = on;
-  update_local_source_metadata(&snapshot, true, mqtt_connected_.load());
-  state_.set_snapshot(std::move(snapshot));
+  runtime.chamber_light_supported = true;
+  runtime.chamber_light_state_known = true;
+  runtime.chamber_light_on = on;
+  update_local_runtime_metadata(&runtime, true, mqtt_connected_.load());
+  store_runtime_state(std::move(runtime), false);
+  publish_runtime_snapshot();
   ESP_LOGI(kTag, "Local chamber light set to %s", on ? "on" : "off");
   return true;
 }
@@ -775,6 +752,78 @@ void PrinterClient::task_entry(void* context) {
   static_cast<PrinterClient*>(context)->task_loop();
 }
 
+PrinterClient::LocalPrinterRuntimeState PrinterClient::runtime_state_copy() const {
+  std::lock_guard<std::mutex> lock(runtime_mutex_);
+  return runtime_state_;
+}
+
+void PrinterClient::store_runtime_state(LocalPrinterRuntimeState runtime, bool notify_task) {
+  {
+    std::lock_guard<std::mutex> lock(runtime_mutex_);
+    runtime_state_ = std::move(runtime);
+  }
+  runtime_dirty_ = true;
+  if (notify_task) {
+    wake_task();
+  }
+}
+
+void PrinterClient::publish_runtime_snapshot() {
+  const LocalPrinterRuntimeState runtime = runtime_state_copy();
+  state_.set_snapshot(build_snapshot_from_runtime(runtime));
+}
+
+PrinterSnapshot PrinterClient::build_snapshot_from_runtime(
+    const LocalPrinterRuntimeState& runtime) const {
+  PrinterSnapshot snapshot;
+  snapshot.connection = runtime.connection;
+  snapshot.lifecycle = runtime.lifecycle;
+  snapshot.stage = text_string(runtime.stage);
+  snapshot.detail = text_string(runtime.detail);
+  snapshot.raw_status = text_string(runtime.raw_status);
+  snapshot.raw_stage = text_string(runtime.raw_stage);
+  snapshot.resolved_serial = text_string(runtime.resolved_serial);
+  snapshot.job_name = text_string(runtime.job_name);
+  snapshot.gcode_file = text_string(runtime.gcode_file);
+  snapshot.preview_hint = preview_hint_for(snapshot.gcode_file);
+  snapshot.camera_rtsp_url = text_string(runtime.camera_rtsp_url);
+  snapshot.progress_percent = runtime.progress_percent;
+  snapshot.nozzle_temp_c = runtime.nozzle_temp_c;
+  snapshot.nozzle_temp_known = runtime.nozzle_temp_c > 0.0f;
+  snapshot.bed_temp_c = runtime.bed_temp_c;
+  snapshot.bed_temp_known = runtime.bed_temp_c > 0.0f;
+  snapshot.chamber_temp_c = runtime.chamber_temp_c;
+  snapshot.chamber_temp_known = runtime.chamber_temp_c > 0.0f;
+  snapshot.secondary_nozzle_temp_c = runtime.secondary_nozzle_temp_c;
+  snapshot.secondary_nozzle_temp_known = runtime.secondary_nozzle_temp_c > 0.0f;
+  snapshot.chamber_light_supported = runtime.chamber_light_supported;
+  snapshot.chamber_light_state_known = runtime.chamber_light_state_known;
+  snapshot.chamber_light_on = runtime.chamber_light_on;
+  snapshot.remaining_seconds = runtime.remaining_seconds;
+  snapshot.current_layer = runtime.current_layer;
+  snapshot.total_layers = runtime.total_layers;
+  snapshot.print_error_code = runtime.print_error_code;
+  snapshot.hms_alert_count = runtime.hms_alert_count;
+  snapshot.local_configured = runtime.local_configured;
+  snapshot.local_connected = runtime.local_connected;
+  snapshot.local_last_update_ms = runtime.local_last_update_ms;
+  snapshot.local_model = runtime.local_model;
+  snapshot.local_capabilities = runtime.local_capabilities;
+  snapshot.local_mqtt_signature_required = runtime.local_mqtt_signature_required;
+  snapshot.has_error = runtime.has_error;
+  snapshot.print_active = runtime.print_active;
+  snapshot.warn_hms = runtime.warn_hms;
+  snapshot.non_error_stop = runtime.non_error_stop;
+  snapshot.show_stop_banner = runtime.show_stop_banner;
+  return snapshot;
+}
+
+void PrinterClient::wake_task() {
+  if (task_handle_ != nullptr) {
+    xTaskNotifyGive(task_handle_);
+  }
+}
+
 void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
   if (event == nullptr || client_ == nullptr || event->client != client_) {
     return;
@@ -802,7 +851,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
                  msg_id);
       }
 
-      PrinterSnapshot snapshot = state_.snapshot();
+      LocalPrinterRuntimeState runtime = runtime_state_copy();
       std::string active_host;
       std::string active_serial;
       {
@@ -810,18 +859,17 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         active_host = active_connection_.host;
         active_serial = active_connection_.serial;
       }
-      snapshot.connection = PrinterConnectionState::kOnline;
-      snapshot.lifecycle = PrintLifecycleState::kUnknown;
-      snapshot.raw_status.clear();
-      snapshot.raw_stage.clear();
-      snapshot.ui_status.clear();
-      snapshot.stage = "connected";
-      snapshot.detail = "Connected to local Bambu MQTT, waiting for subscribe ack";
-      snapshot.resolved_serial = active_serial;
-      snapshot.non_error_stop = false;
-      snapshot.show_stop_banner = false;
-      update_local_source_metadata(&snapshot, true, true);
-      state_.set_snapshot(std::move(snapshot));
+      runtime.connection = PrinterConnectionState::kOnline;
+      runtime.lifecycle = PrintLifecycleState::kUnknown;
+      copy_text(&runtime.raw_status, "");
+      copy_text(&runtime.raw_stage, "");
+      copy_text(&runtime.stage, "connected");
+      copy_text(&runtime.detail, "Connected to local Bambu MQTT, waiting for subscribe ack");
+      copy_text(&runtime.resolved_serial, active_serial);
+      runtime.non_error_stop = false;
+      runtime.show_stop_banner = false;
+      update_local_runtime_metadata(&runtime, true, true);
+      store_runtime_state(std::move(runtime), true);
       ESP_LOGI(kTag, "Connected to %s", active_host.c_str());
       break;
     }
@@ -834,18 +882,17 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       initial_sync_tick_ = xTaskGetTickCount();
       watchdog_probe_tick_ = 0;
 
-      PrinterSnapshot snapshot = state_.snapshot();
-      snapshot.connection = PrinterConnectionState::kOnline;
-      snapshot.lifecycle = PrintLifecycleState::kUnknown;
-      snapshot.raw_status.clear();
-      snapshot.raw_stage.clear();
-      snapshot.ui_status.clear();
-      snapshot.stage = "subscribed";
-      snapshot.detail = "MQTT subscribed, requesting printer sync";
-      snapshot.non_error_stop = false;
-      snapshot.show_stop_banner = false;
-      update_local_source_metadata(&snapshot, true, true);
-      state_.set_snapshot(std::move(snapshot));
+      LocalPrinterRuntimeState runtime = runtime_state_copy();
+      runtime.connection = PrinterConnectionState::kOnline;
+      runtime.lifecycle = PrintLifecycleState::kUnknown;
+      copy_text(&runtime.raw_status, "");
+      copy_text(&runtime.raw_stage, "");
+      copy_text(&runtime.stage, "subscribed");
+      copy_text(&runtime.detail, "MQTT subscribed, requesting printer sync");
+      runtime.non_error_stop = false;
+      runtime.show_stop_banner = false;
+      update_local_runtime_metadata(&runtime, true, true);
+      store_runtime_state(std::move(runtime), true);
 
       ESP_LOGI(kTag, "MQTT subscribe acknowledged (msg_id=%d), sending get_version + start",
                event->msg_id);
@@ -861,16 +908,15 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       initial_sync_tick_ = 0;
       connection_state_tick_ = xTaskGetTickCount();
       watchdog_probe_tick_ = 0;
-      PrinterSnapshot snapshot = state_.snapshot();
-      snapshot.connection = PrinterConnectionState::kConnecting;
-      snapshot.raw_status.clear();
-      snapshot.raw_stage.clear();
-      snapshot.ui_status.clear();
-      snapshot.detail = "MQTT disconnected, waiting for reconnect";
-      snapshot.non_error_stop = false;
-      snapshot.show_stop_banner = false;
-      update_local_source_metadata(&snapshot, true, false);
-      state_.set_snapshot(std::move(snapshot));
+      LocalPrinterRuntimeState runtime = runtime_state_copy();
+      runtime.connection = PrinterConnectionState::kConnecting;
+      copy_text(&runtime.raw_status, "");
+      copy_text(&runtime.raw_stage, "");
+      copy_text(&runtime.detail, "MQTT disconnected, waiting for reconnect");
+      runtime.non_error_stop = false;
+      runtime.show_stop_banner = false;
+      update_local_runtime_metadata(&runtime, true, false);
+      store_runtime_state(std::move(runtime), true);
       ESP_LOGW(kTag, "MQTT disconnected");
       break;
     }
@@ -921,48 +967,48 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       connection_state_tick_ = xTaskGetTickCount();
       watchdog_probe_tick_ = 0;
       log_heap_status("MQTT error");
-      PrinterSnapshot snapshot = state_.snapshot();
-      snapshot.connection = PrinterConnectionState::kError;
-      snapshot.lifecycle = PrintLifecycleState::kError;
-      snapshot.raw_status.clear();
-      snapshot.raw_stage.clear();
-      snapshot.ui_status.clear();
-      snapshot.stage = "mqtt-error";
-      snapshot.has_error = true;
-      snapshot.non_error_stop = false;
-      snapshot.show_stop_banner = false;
+      LocalPrinterRuntimeState runtime = runtime_state_copy();
+      runtime.connection = PrinterConnectionState::kError;
+      runtime.lifecycle = PrintLifecycleState::kError;
+      copy_text(&runtime.raw_status, "");
+      copy_text(&runtime.raw_stage, "");
+      copy_text(&runtime.stage, "mqtt-error");
+      runtime.has_error = true;
+      runtime.non_error_stop = false;
+      runtime.show_stop_banner = false;
 
       const auto* error = event->error_handle;
       if (error != nullptr) {
         if (error->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
           if (error->connect_return_code == MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED) {
-            snapshot.stage = "mqtt-auth";
-            snapshot.detail = "MQTT auth rejected; verify access code";
+            copy_text(&runtime.stage, "mqtt-auth");
+            copy_text(&runtime.detail, "MQTT auth rejected; verify access code");
           } else if (error->connect_return_code == MQTT_CONNECTION_REFUSE_BAD_USERNAME) {
-            snapshot.stage = "mqtt-auth";
-            snapshot.detail = "MQTT username rejected";
+            copy_text(&runtime.stage, "mqtt-auth");
+            copy_text(&runtime.detail, "MQTT username rejected");
           } else {
-            snapshot.detail =
-                std::string("MQTT refused: ") + connect_return_code_name(error->connect_return_code);
+            copy_text(&runtime.detail,
+                      std::string("MQTT refused: ") +
+                          connect_return_code_name(error->connect_return_code));
           }
           ESP_LOGE(kTag, "MQTT refused by broker: %s",
                    connect_return_code_name(error->connect_return_code));
         } else if (error->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-          snapshot.detail = "MQTT transport timeout or printer unreachable";
+          copy_text(&runtime.detail, "MQTT transport timeout or printer unreachable");
           ESP_LOGE(kTag, "MQTT transport error: esp_err=%s tls=0x%x sock_errno=%d",
                    esp_err_to_name(error->esp_tls_last_esp_err), error->esp_tls_stack_err,
                    error->esp_transport_sock_errno);
         } else {
-          snapshot.detail = "TLS or MQTT handshake failed";
+          copy_text(&runtime.detail, "TLS or MQTT handshake failed");
           ESP_LOGE(kTag, "MQTT event error type=%d", static_cast<int>(error->error_type));
         }
       } else {
-        snapshot.detail = "TLS or MQTT handshake failed";
+        copy_text(&runtime.detail, "TLS or MQTT handshake failed");
         ESP_LOGE(kTag, "MQTT event error without details");
       }
 
-      update_local_source_metadata(&snapshot, true, false);
-      state_.set_snapshot(std::move(snapshot));
+      update_local_runtime_metadata(&runtime, true, false);
+      store_runtime_state(std::move(runtime), true);
       schedule_client_rebuild("mqtt error");
       break;
     }
@@ -981,20 +1027,19 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 
   const cJSON* print = cJSON_GetObjectItemCaseSensitive(root, "print");
   if (cJSON_IsObject(print)) {
-    PrinterSnapshot snapshot = state_.snapshot();
+    LocalPrinterRuntimeState runtime = runtime_state_copy();
     std::string active_serial;
     {
       std::lock_guard<std::mutex> lock(config_mutex_);
       active_serial = active_connection_.serial;
     }
-    const std::string previous_raw_status = snapshot.raw_status;
-    const std::string previous_raw_stage = snapshot.raw_stage;
-    const std::string previous_stage = snapshot.stage;
-    const std::string previous_detail = snapshot.detail;
-    const int previous_print_error_code = snapshot.print_error_code;
-    const uint16_t previous_hms_alert_count = snapshot.hms_alert_count;
-    const bool previous_pause_fault =
-        snapshot.has_error && is_paused_gcode_state(previous_raw_status);
+    const std::string previous_raw_status = text_string(runtime.raw_status);
+    const std::string previous_raw_stage = text_string(runtime.raw_stage);
+    const std::string previous_stage = text_string(runtime.stage);
+    const std::string previous_detail = text_string(runtime.detail);
+    const int previous_print_error_code = runtime.print_error_code;
+    const uint16_t previous_hms_alert_count = runtime.hms_alert_count;
+    const bool previous_pause_fault = runtime.has_error && is_paused_gcode_state(previous_raw_status);
     const std::string gcode_state = json_string(print, "gcode_state", {});
     const std::string effective_gcode_state = !gcode_state.empty() ? gcode_state : previous_raw_status;
     const cJSON* stage = cJSON_GetObjectItemCaseSensitive(print, "stage");
@@ -1018,169 +1063,158 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     const bool has_status_update = !gcode_state.empty();
     const bool has_stage_update = !resolved_stage.empty();
 
-    snapshot.connection = PrinterConnectionState::kOnline;
-    snapshot.progress_percent = extract_progress_percent(print, snapshot.progress_percent);
+    runtime.connection = PrinterConnectionState::kOnline;
+    runtime.progress_percent = extract_progress_percent(print, runtime.progress_percent);
     const NozzleTemperatureBundle nozzle_temps =
-        extract_nozzle_temperature_bundle(print, snapshot.nozzle_temp_c,
-                                          snapshot.secondary_nozzle_temp_c);
-    snapshot.nozzle_temp_c = nozzle_temps.active;
-    snapshot.secondary_nozzle_temp_c = nozzle_temps.secondary;
-    snapshot.bed_temp_c = extract_bed_temperature_c(print, snapshot.bed_temp_c);
-    snapshot.chamber_temp_c = extract_chamber_temperature_c(print, snapshot.chamber_temp_c);
-    snapshot.current_layer = extract_current_layer_local(print, snapshot.current_layer);
-    snapshot.total_layers = extract_total_layers_local(print, snapshot.total_layers);
-    snapshot.local_model = detect_printer_model_from_payload(print, snapshot.local_model);
-    snapshot.chamber_light_supported =
-        snapshot.chamber_light_supported || printer_model_has_chamber_light(snapshot.local_model);
-    snapshot.camera_rtsp_url = extract_rtsp_url(print, snapshot.camera_rtsp_url);
-    snapshot.local_mqtt_signature_required =
-        parse_signature_required(print, snapshot.local_mqtt_signature_required);
-    apply_chamber_light_report(print, &snapshot);
-    if (snapshot.resolved_serial.empty()) {
-      snapshot.resolved_serial = active_serial;
+        extract_nozzle_temperature_bundle(print, runtime.nozzle_temp_c,
+                                          runtime.secondary_nozzle_temp_c);
+    runtime.nozzle_temp_c = nozzle_temps.active;
+    runtime.secondary_nozzle_temp_c = nozzle_temps.secondary;
+    runtime.bed_temp_c = extract_bed_temperature_c(print, runtime.bed_temp_c);
+    runtime.chamber_temp_c = extract_chamber_temperature_c(print, runtime.chamber_temp_c);
+    runtime.current_layer = extract_current_layer_local(print, runtime.current_layer);
+    runtime.total_layers = extract_total_layers_local(print, runtime.total_layers);
+    runtime.local_model = detect_printer_model_from_payload(print, runtime.local_model);
+    runtime.chamber_light_supported =
+        runtime.chamber_light_supported || printer_model_has_chamber_light(runtime.local_model);
+    copy_text(&runtime.camera_rtsp_url,
+              extract_rtsp_url(print, text_string(runtime.camera_rtsp_url)));
+    runtime.local_mqtt_signature_required =
+        parse_signature_required(print, runtime.local_mqtt_signature_required);
+    apply_chamber_light_report(print, &runtime);
+    if (!has_text(runtime.resolved_serial)) {
+      copy_text(&runtime.resolved_serial, active_serial);
     }
 
     const uint32_t remaining_seconds = extract_remaining_seconds(print);
     if (remaining_seconds > 0U) {
-      snapshot.remaining_seconds = remaining_seconds;
+      runtime.remaining_seconds = remaining_seconds;
     }
 
-    const std::string previous_preview_hint = snapshot.preview_hint;
-    const std::string gcode_file = json_string(print, "gcode_file", snapshot.gcode_file);
+    const std::string previous_preview_hint = preview_hint_for(text_string(runtime.gcode_file));
+    const std::string gcode_file = json_string(print, "gcode_file", text_string(runtime.gcode_file));
     if (!gcode_file.empty()) {
-      snapshot.gcode_file = gcode_file;
+      copy_text(&runtime.gcode_file, gcode_file);
     }
-    snapshot.preview_hint = preview_hint_for(snapshot.gcode_file);
-    if (!snapshot.preview_hint.empty() && snapshot.preview_hint != previous_preview_hint) {
-      ESP_LOGI(kTag, "Preview candidate: %s", snapshot.preview_hint.c_str());
+    const std::string preview_hint = preview_hint_for(text_string(runtime.gcode_file));
+    if (!preview_hint.empty() && preview_hint != previous_preview_hint) {
+      ESP_LOGI(kTag, "Preview candidate: %s", preview_hint.c_str());
     }
 
     const std::string subtask_name = trim_job_name(
-        json_string(print, "subtask_name", json_string(print, "gcode_file", snapshot.job_name)));
+        json_string(print, "subtask_name", json_string(print, "gcode_file",
+                                                       text_string(runtime.job_name))));
     if (!subtask_name.empty()) {
-      snapshot.job_name = subtask_name;
+      copy_text(&runtime.job_name, subtask_name);
     }
 
-    snapshot.raw_status = has_status_update ? gcode_state : previous_raw_status;
+    copy_text(&runtime.raw_status, has_status_update ? gcode_state : previous_raw_status);
     if (has_stage_update) {
-      snapshot.raw_stage = resolved_stage;
+      copy_text(&runtime.raw_stage, resolved_stage);
     } else if (is_active_gcode_state(effective_gcode_state) && stage_idle_placeholder) {
       // Active Bambu jobs often emit transient "-1/255 => idle" stage packets between
       // real sub-states. Keep only the last meaningful runtime stage latched. Do not
       // carry terminal leftovers like "Finished" into a fresh PREPARE/RUNNING cycle.
-      snapshot.raw_stage = is_meaningful_active_stage(previous_raw_stage) ? previous_raw_stage : "";
+      copy_text(&runtime.raw_stage,
+                is_meaningful_active_stage(previous_raw_stage) ? previous_raw_stage : "");
     } else {
-      snapshot.raw_stage = previous_raw_stage;
+      copy_text(&runtime.raw_stage, previous_raw_stage);
     }
-    snapshot.print_error_code = print_error_code;
-    snapshot.hms_alert_count = static_cast<uint16_t>(std::max(hms_count, 0));
-    snapshot.has_error = has_concrete_error || paused_fault_latched;
-    snapshot.warn_hms = false;
-    snapshot.non_error_stop = snapshot.raw_status == "FAILED" && !has_concrete_error;
-    snapshot.show_stop_banner = false;
-    snapshot.print_active = false;
-    snapshot.lifecycle = lifecycle_from_state(snapshot.raw_status, has_concrete_error);
+    runtime.print_error_code = print_error_code;
+    runtime.hms_alert_count = static_cast<uint16_t>(std::max(hms_count, 0));
+    runtime.has_error = has_concrete_error || paused_fault_latched;
+    runtime.warn_hms = false;
+    runtime.non_error_stop = text_string(runtime.raw_status) == "FAILED" && !has_concrete_error;
+    runtime.show_stop_banner = false;
+    runtime.print_active = false;
+    runtime.lifecycle = lifecycle_from_state(text_string(runtime.raw_status), has_concrete_error);
     if (paused_fault_latched) {
-      snapshot.lifecycle = PrintLifecycleState::kError;
+      runtime.lifecycle = PrintLifecycleState::kError;
     }
     if (remaining_seconds == 0U &&
-        (snapshot.lifecycle == PrintLifecycleState::kFinished ||
-         snapshot.lifecycle == PrintLifecycleState::kIdle ||
-         snapshot.lifecycle == PrintLifecycleState::kError)) {
-      snapshot.remaining_seconds = 0U;
+        (runtime.lifecycle == PrintLifecycleState::kFinished ||
+         runtime.lifecycle == PrintLifecycleState::kIdle ||
+         runtime.lifecycle == PrintLifecycleState::kError)) {
+      runtime.remaining_seconds = 0U;
     }
-    if (!snapshot.raw_stage.empty()) {
-      snapshot.stage = snapshot.raw_stage;
-    } else if (!snapshot.raw_status.empty()) {
-      snapshot.stage = stage_label_for(snapshot.raw_status, stage_id, has_concrete_error);
+    const std::string raw_stage = text_string(runtime.raw_stage);
+    const std::string raw_status = text_string(runtime.raw_status);
+    if (!raw_stage.empty()) {
+      copy_text(&runtime.stage, raw_stage);
+    } else if (!raw_status.empty()) {
+      copy_text(&runtime.stage, stage_label_for(raw_status, stage_id, has_concrete_error));
     } else {
-      snapshot.stage = previous_stage;
+      copy_text(&runtime.stage, previous_stage);
     }
 
     const std::string error_detail = error_detail_for(print_error_code, hms_count);
     if (!error_detail.empty()) {
-      snapshot.detail = error_detail;
+      copy_text(&runtime.detail, error_detail);
     } else if (paused_fault_latched && previous_pause_fault && !previous_detail.empty() &&
                previous_detail != "Paused") {
-      snapshot.detail = previous_detail;
-    } else if (!snapshot.job_name.empty() && snapshot.lifecycle == PrintLifecycleState::kPrinting) {
-      snapshot.detail = snapshot.job_name;
+      copy_text(&runtime.detail, previous_detail);
+    } else if (has_text(runtime.job_name) && runtime.lifecycle == PrintLifecycleState::kPrinting) {
+      copy_text(&runtime.detail, text_string(runtime.job_name));
     } else if (has_status_update || has_stage_update) {
-      snapshot.detail = snapshot.stage;
+      copy_text(&runtime.detail, text_string(runtime.stage));
     } else if (previous_detail.empty()) {
-      snapshot.detail = "Status payload received";
+      copy_text(&runtime.detail, "Status payload received");
     } else {
-      snapshot.detail = previous_detail;
+      copy_text(&runtime.detail, previous_detail);
     }
-    update_local_source_metadata(&snapshot, true, true);
-    if (snapshot.local_mqtt_signature_required) {
-      snapshot.local_capabilities.developer_mode_required = true;
-    }
+    update_local_runtime_metadata(&runtime, true, true);
 
     received_payload_ = true;
-    if (snapshot.raw_status != previous_raw_status || snapshot.raw_stage != previous_raw_stage) {
+    if (text_string(runtime.raw_status) != previous_raw_status ||
+        text_string(runtime.raw_stage) != previous_raw_stage) {
       const bool active_idle_placeholder =
           is_active_gcode_state(effective_gcode_state) && stage_idle_placeholder &&
-          snapshot.raw_stage.empty();
-      const char* logged_stage = active_idle_placeholder ? "<placeholder>" : snapshot.raw_stage.c_str();
+          !has_text(runtime.raw_stage);
+      const std::string logged_stage_string =
+          active_idle_placeholder ? std::string("<placeholder>") : text_string(runtime.raw_stage);
       ESP_LOGI(kTag, "Local printer state: status=%s stage=%s stg_cur=%d",
-               snapshot.raw_status.c_str(), logged_stage, stage_id);
+               text_string(runtime.raw_status).c_str(), logged_stage_string.c_str(), stage_id);
     }
     if ((print_error_code != previous_print_error_code ||
-         snapshot.hms_alert_count != previous_hms_alert_count ||
+         runtime.hms_alert_count != previous_hms_alert_count ||
          (fault_pause_signal && !previous_pause_fault)) &&
         (has_concrete_error || paused_fault_latched)) {
       ESP_LOGW(kTag, "Local printer alert: status=%s stage=%s stg_cur=%d print_error=%d hms=%u",
-               snapshot.raw_status.c_str(), snapshot.stage.c_str(), stage_id, print_error_code,
-               static_cast<unsigned int>(snapshot.hms_alert_count));
+               text_string(runtime.raw_status).c_str(), text_string(runtime.stage).c_str(),
+               stage_id, print_error_code, static_cast<unsigned int>(runtime.hms_alert_count));
     }
-    state_.set_snapshot(std::move(snapshot));
+    store_runtime_state(std::move(runtime), true);
     cJSON_Delete(root);
     return;
   }
 
   const cJSON* info = cJSON_GetObjectItemCaseSensitive(root, "info");
   if (cJSON_IsObject(info)) {
-    handle_info_payload(payload, length);
+    LocalPrinterRuntimeState runtime = runtime_state_copy();
+    runtime.connection = PrinterConnectionState::kOnline;
+    std::string active_serial;
+    {
+      std::lock_guard<std::mutex> lock(config_mutex_);
+      active_serial = active_connection_.serial;
+    }
+    const cJSON* modules = child_array_local(info, "module");
+    if (modules == nullptr) {
+      modules = child_array_local(info, "modules");
+    }
+    runtime.local_model = detect_printer_model(
+        modules, detect_printer_model_from_payload(info, runtime.local_model));
+    runtime.chamber_light_supported =
+        runtime.chamber_light_supported || printer_model_has_chamber_light(runtime.local_model);
+    copy_text(&runtime.resolved_serial,
+              extract_module_serial(modules, json_string(info, "sn", active_serial)));
+    if (text_string(runtime.detail) == "Connecting to local Bambu MQTT" ||
+        !has_text(runtime.detail)) {
+      copy_text(&runtime.detail,
+                std::string("Printer info received (") + to_string(runtime.local_model) + ")");
+    }
+    update_local_runtime_metadata(&runtime, true, true);
+    store_runtime_state(std::move(runtime), true);
   }
-
-  cJSON_Delete(root);
-}
-
-void PrinterClient::handle_info_payload(const char* payload, size_t length) {
-  cJSON* root = cJSON_ParseWithLength(payload, length);
-  if (root == nullptr) {
-    return;
-  }
-
-  const cJSON* info = cJSON_GetObjectItemCaseSensitive(root, "info");
-  if (!cJSON_IsObject(info)) {
-    cJSON_Delete(root);
-    return;
-  }
-
-  PrinterSnapshot snapshot = state_.snapshot();
-  snapshot.connection = PrinterConnectionState::kOnline;
-  std::string active_serial;
-  {
-    std::lock_guard<std::mutex> lock(config_mutex_);
-    active_serial = active_connection_.serial;
-  }
-  const cJSON* modules = child_array_local(info, "module");
-  if (modules == nullptr) {
-    modules = child_array_local(info, "modules");
-  }
-  snapshot.local_model = detect_printer_model(
-      modules, detect_printer_model_from_payload(info, snapshot.local_model));
-  snapshot.chamber_light_supported =
-      snapshot.chamber_light_supported || printer_model_has_chamber_light(snapshot.local_model);
-  snapshot.resolved_serial =
-      extract_module_serial(modules, json_string(info, "sn", active_serial));
-  if (snapshot.detail == "Connecting to local Bambu MQTT" || snapshot.detail.empty()) {
-    snapshot.detail = std::string("Printer info received (") + to_string(snapshot.local_model) + ")";
-  }
-  update_local_source_metadata(&snapshot, true, true);
-  state_.set_snapshot(std::move(snapshot));
   cJSON_Delete(root);
 }
 
@@ -1233,6 +1267,10 @@ void PrinterClient::cancel_client_rebuild() {
 
 void PrinterClient::task_loop() {
   while (true) {
+    if (runtime_dirty_.exchange(false)) {
+      publish_runtime_snapshot();
+    }
+
     if (reconfigure_requested_.exchange(false)) {
       stop_client();
     }
@@ -1274,20 +1312,20 @@ void PrinterClient::task_loop() {
         active_connection_ = connection;
       }
 
-      PrinterSnapshot waiting = state_.snapshot();
+      LocalPrinterRuntimeState waiting = runtime_state_copy();
       waiting.connection = PrinterConnectionState::kConnecting;
       waiting.lifecycle = PrintLifecycleState::kUnknown;
-      waiting.raw_status.clear();
-      waiting.raw_stage.clear();
-      waiting.ui_status.clear();
-      waiting.stage = "wifi";
-      waiting.detail = "Waiting for Wi-Fi IP";
+      copy_text(&waiting.raw_status, "");
+      copy_text(&waiting.raw_stage, "");
+      copy_text(&waiting.stage, "wifi");
+      copy_text(&waiting.detail, "Waiting for Wi-Fi IP");
       waiting.has_error = false;
       waiting.non_error_stop = false;
       waiting.show_stop_banner = false;
-      waiting.resolved_serial = connection.serial;
-      update_local_source_metadata(&waiting, true, false);
-      state_.set_snapshot(std::move(waiting));
+      copy_text(&waiting.resolved_serial, connection.serial);
+      update_local_runtime_metadata(&waiting, true, false);
+      store_runtime_state(std::move(waiting), false);
+      publish_runtime_snapshot();
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
@@ -1301,23 +1339,22 @@ void PrinterClient::task_loop() {
       request_topic_ = "device/" + connection.serial + "/request";
       client_id_ = make_client_id();
 
-      PrinterSnapshot snapshot = state_.snapshot();
-      snapshot.connection = PrinterConnectionState::kConnecting;
-      snapshot.lifecycle = PrintLifecycleState::kUnknown;
-      snapshot.raw_status.clear();
-      snapshot.raw_stage.clear();
-      snapshot.ui_status.clear();
-      snapshot.stage = "mqtt";
-      snapshot.detail = "Connecting to local Bambu MQTT";
-      snapshot.job_name.clear();
-      snapshot.gcode_file.clear();
-      snapshot.preview_hint.clear();
-      snapshot.resolved_serial = connection.serial;
-      snapshot.has_error = false;
-      snapshot.non_error_stop = false;
-      snapshot.show_stop_banner = false;
-      update_local_source_metadata(&snapshot, true, false);
-      state_.set_snapshot(std::move(snapshot));
+      LocalPrinterRuntimeState runtime = runtime_state_copy();
+      runtime.connection = PrinterConnectionState::kConnecting;
+      runtime.lifecycle = PrintLifecycleState::kUnknown;
+      copy_text(&runtime.raw_status, "");
+      copy_text(&runtime.raw_stage, "");
+      copy_text(&runtime.stage, "mqtt");
+      copy_text(&runtime.detail, "Connecting to local Bambu MQTT");
+      copy_text(&runtime.job_name, "");
+      copy_text(&runtime.gcode_file, "");
+      copy_text(&runtime.resolved_serial, connection.serial);
+      runtime.has_error = false;
+      runtime.non_error_stop = false;
+      runtime.show_stop_banner = false;
+      update_local_runtime_metadata(&runtime, true, false);
+      store_runtime_state(std::move(runtime), false);
+      publish_runtime_snapshot();
 
       ESP_LOGI(kTag, "Connecting to printer MQTT %s:%u (serial=%s, user=%s)",
                connection.host.c_str(), static_cast<unsigned int>(connection.mqtt_port),
@@ -1342,6 +1379,7 @@ void PrinterClient::task_loop() {
       mqtt_cfg.session.keepalive = 30;
       mqtt_cfg.session.disable_clean_session = false;
       mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_3_1_1;
+      mqtt_cfg.task.stack_size = 10240;
       mqtt_cfg.network.timeout_ms = 10000;
       mqtt_cfg.network.reconnect_timeout_ms = 5000;
       {
@@ -1354,40 +1392,40 @@ void PrinterClient::task_loop() {
 
       client_ = esp_mqtt_client_init(&mqtt_cfg);
       if (client_ == nullptr) {
-        PrinterSnapshot failed = state_.snapshot();
+        LocalPrinterRuntimeState failed = runtime_state_copy();
         failed.connection = PrinterConnectionState::kError;
         failed.lifecycle = PrintLifecycleState::kError;
-        failed.raw_status.clear();
-        failed.raw_stage.clear();
-        failed.ui_status.clear();
-        failed.stage = "mqtt-init";
-        failed.detail = "Failed to create MQTT client";
+        copy_text(&failed.raw_status, "");
+        copy_text(&failed.raw_stage, "");
+        copy_text(&failed.stage, "mqtt-init");
+        copy_text(&failed.detail, "Failed to create MQTT client");
         failed.has_error = true;
         failed.non_error_stop = false;
         failed.show_stop_banner = false;
-        failed.resolved_serial = connection.serial;
-        update_local_source_metadata(&failed, true, false);
-        state_.set_snapshot(std::move(failed));
+        copy_text(&failed.resolved_serial, connection.serial);
+        update_local_runtime_metadata(&failed, true, false);
+        store_runtime_state(std::move(failed), false);
+        publish_runtime_snapshot();
         vTaskDelay(pdMS_TO_TICKS(1500));
         continue;
       }
 
       esp_mqtt_client_register_event(client_, MQTT_EVENT_ANY, &PrinterClient::mqtt_event_handler, this);
       if (esp_mqtt_client_start(client_) != ESP_OK) {
-        PrinterSnapshot failed = state_.snapshot();
+        LocalPrinterRuntimeState failed = runtime_state_copy();
         failed.connection = PrinterConnectionState::kError;
         failed.lifecycle = PrintLifecycleState::kError;
-        failed.raw_status.clear();
-        failed.raw_stage.clear();
-        failed.ui_status.clear();
-        failed.stage = "mqtt-start";
-        failed.detail = "Failed to start MQTT client";
+        copy_text(&failed.raw_status, "");
+        copy_text(&failed.raw_stage, "");
+        copy_text(&failed.stage, "mqtt-start");
+        copy_text(&failed.detail, "Failed to start MQTT client");
         failed.has_error = true;
         failed.non_error_stop = false;
         failed.show_stop_banner = false;
-        failed.resolved_serial = connection.serial;
-        update_local_source_metadata(&failed, true, false);
-        state_.set_snapshot(std::move(failed));
+        copy_text(&failed.resolved_serial, connection.serial);
+        update_local_runtime_metadata(&failed, true, false);
+        store_runtime_state(std::move(failed), false);
+        publish_runtime_snapshot();
         esp_mqtt_client_destroy(client_);
         client_ = nullptr;
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -1444,26 +1482,27 @@ void PrinterClient::task_loop() {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
   }
 }
 
 void PrinterClient::set_waiting_snapshot(const PrinterConnection& connection) {
-  PrinterSnapshot snapshot;
+  LocalPrinterRuntimeState runtime;
   if (!connection.is_ready()) {
-    snapshot.connection = PrinterConnectionState::kWaitingForCredentials;
-    snapshot.lifecycle = PrintLifecycleState::kUnknown;
-    snapshot.stage = "setup";
-    snapshot.detail = "Need printer host, serial and access code";
+    runtime.connection = PrinterConnectionState::kWaitingForCredentials;
+    runtime.lifecycle = PrintLifecycleState::kUnknown;
+    copy_text(&runtime.stage, "setup");
+    copy_text(&runtime.detail, "Need printer host, serial and access code");
   } else {
-    snapshot.connection = PrinterConnectionState::kReadyForLanConnect;
-    snapshot.lifecycle = PrintLifecycleState::kIdle;
-    snapshot.stage = "ready";
-    snapshot.detail = "Printer credentials loaded";
+    runtime.connection = PrinterConnectionState::kReadyForLanConnect;
+    runtime.lifecycle = PrintLifecycleState::kIdle;
+    copy_text(&runtime.stage, "ready");
+    copy_text(&runtime.detail, "Printer credentials loaded");
   }
-  snapshot.resolved_serial = connection.serial;
-  update_local_source_metadata(&snapshot, connection.is_ready(), false);
-  state_.set_snapshot(std::move(snapshot));
+  copy_text(&runtime.resolved_serial, connection.serial);
+  update_local_runtime_metadata(&runtime, connection.is_ready(), false);
+  store_runtime_state(std::move(runtime), false);
+  publish_runtime_snapshot();
 }
 
 bool PrinterClient::publish_request(const char* payload) {

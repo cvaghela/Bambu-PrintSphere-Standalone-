@@ -73,6 +73,28 @@ SourceMode parse_source_mode(const std::string& value) {
   return SourceMode::kHybrid;
 }
 
+const char* to_string(CloudRegion region) {
+  switch (region) {
+    case CloudRegion::kUS:
+      return "us";
+    case CloudRegion::kCN:
+      return "cn";
+    case CloudRegion::kEU:
+    default:
+      return "eu";
+  }
+}
+
+CloudRegion parse_cloud_region(const std::string& value) {
+  if (value == "us") {
+    return CloudRegion::kUS;
+  }
+  if (value == "cn") {
+    return CloudRegion::kCN;
+  }
+  return CloudRegion::kEU;
+}
+
 esp_err_t ConfigStore::initialize() {
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -100,6 +122,7 @@ BambuCloudCredentials ConfigStore::load_cloud_credentials() const {
   BambuCloudCredentials credentials;
   credentials.email = load_string("cloud_email");
   credentials.password = load_string("cloud_pass");
+  credentials.region = parse_cloud_region(load_string("cloud_region"));
   return credentials;
 }
 
@@ -165,7 +188,13 @@ esp_err_t ConfigStore::save_cloud_credentials(const BambuCloudCredentials& crede
   const BambuCloudCredentials previous = load_cloud_credentials();
   ESP_RETURN_ON_ERROR(save_string("cloud_email", credentials.email), kTag, "save cloud email failed");
   ESP_RETURN_ON_ERROR(save_string("cloud_pass", credentials.password), kTag, "save cloud password failed");
-  if (previous.email == credentials.email && previous.password == credentials.password) {
+  ESP_RETURN_ON_ERROR(save_string("cloud_region", to_string(credentials.region)), kTag,
+                      "save cloud region failed");
+  const bool email_changed = previous.email != credentials.email;
+  const bool password_changed =
+      !credentials.password.empty() && previous.password != credentials.password;
+  const bool region_changed = previous.region != credentials.region;
+  if (!email_changed && !password_changed && !region_changed) {
     return ESP_OK;
   }
   return clear_cloud_access_token();

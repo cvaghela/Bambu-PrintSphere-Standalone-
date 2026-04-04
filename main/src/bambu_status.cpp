@@ -15,6 +15,48 @@ std::string normalize_bambu_status_token(const std::string& status_text) {
   return normalized;
 }
 
+PrinterModel bambu_model_from_product_name(const std::string& product_name) {
+  const std::string normalized = normalize_bambu_status_token(product_name);
+  if (normalized.find("A1MINI") != std::string::npos) {
+    return PrinterModel::kA1Mini;
+  }
+  if (normalized.find("BAMBULABA1") != std::string::npos || normalized == "A1") {
+    return PrinterModel::kA1;
+  }
+  if (normalized.find("P1S") != std::string::npos) {
+    return PrinterModel::kP1S;
+  }
+  if (normalized.find("P1P") != std::string::npos) {
+    return PrinterModel::kP1P;
+  }
+  if (normalized.find("P2S") != std::string::npos) {
+    return PrinterModel::kP2S;
+  }
+  if (normalized.find("H2DPRO") != std::string::npos) {
+    return PrinterModel::kH2DPro;
+  }
+  if (normalized.find("H2D") != std::string::npos) {
+    return PrinterModel::kH2D;
+  }
+  if (normalized.find("H2S") != std::string::npos) {
+    return PrinterModel::kH2S;
+  }
+  if (normalized.find("H2C") != std::string::npos) {
+    return PrinterModel::kH2C;
+  }
+  if (normalized.find("X1E") != std::string::npos) {
+    return PrinterModel::kX1E;
+  }
+  if (normalized.find("X1CARBON") != std::string::npos ||
+      normalized.find("X1C") != std::string::npos) {
+    return PrinterModel::kX1C;
+  }
+  if (normalized.find("X1") != std::string::npos) {
+    return PrinterModel::kX1;
+  }
+  return PrinterModel::kUnknown;
+}
+
 bool bambu_status_is_failed(const std::string& status_text) {
   const std::string normalized = normalize_bambu_status_token(status_text);
   return normalized.find("FAIL") != std::string::npos ||

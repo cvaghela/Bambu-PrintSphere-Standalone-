@@ -28,10 +28,15 @@ class Ui {
   void update_power_save(bool on_battery, bool print_active);
   bool is_low_power_mode_active() const;
   ScreenPowerMode screen_power_mode() const { return screen_power_mode_; }
-  bool is_page2_active() const { return active_page_ == 1; }
-  bool is_camera_page_active() const { return active_page_ == 2; }
+  bool is_page2_active() const { return !scrolling_ && active_page_ == 1; }
+  bool is_camera_page_active() const { return !scrolling_ && active_page_ == 2; }
+  bool is_page_transition_active() const { return scrolling_; }
+  void set_portal_access_state(bool request_authorized, bool session_active, bool pin_active,
+                               const std::string& pin_code, uint32_t pin_remaining_s,
+                               uint32_t session_remaining_s);
   bool consume_camera_refresh_request();
   bool consume_chamber_light_toggle_request();
+  bool consume_portal_unlock_request();
 
  private:
   esp_err_t build_dashboard();
@@ -55,6 +60,7 @@ class Ui {
   void handle_pager_event(lv_event_t* event);
   void handle_screen_event(lv_event_t* event);
   void handle_logo_event(lv_event_t* event);
+  void update_portal_access_visuals_locked();
   void set_brightness_percent(int brightness_percent);
   static void ring_timer_cb(lv_timer_t* timer);
   static void pager_event_cb(lv_event_t* event);
@@ -98,6 +104,11 @@ class Ui {
   lv_obj_t* page3_image_ = nullptr;
   lv_obj_t* page3_note_ = nullptr;
   lv_obj_t* page3_subnote_ = nullptr;
+  lv_obj_t* portal_hint_label_ = nullptr;
+  lv_obj_t* portal_overlay_card_ = nullptr;
+  lv_obj_t* portal_overlay_title_ = nullptr;
+  lv_obj_t* portal_overlay_value_ = nullptr;
+  lv_obj_t* portal_overlay_detail_ = nullptr;
   lv_timer_t* ring_anim_timer_ = nullptr;
   int user_brightness_percent_ = 80;
   int applied_brightness_percent_ = -1;
@@ -143,9 +154,21 @@ class Ui {
   bool logo_clickable_ = false;
   bool logo_recolor_enabled_ = false;
   uint32_t logo_recolor_hex_ = 0;
+  bool portal_request_authorized_ = false;
+  bool portal_session_active_ = false;
+  bool portal_pin_active_ = false;
+  uint64_t portal_hint_boot_ms_ = 0;
+  uint32_t portal_pin_remaining_s_ = 0;
+  uint32_t portal_session_remaining_s_ = 0;
+  std::string portal_pin_code_;
+  std::string portal_hint_text_;
+  std::string portal_overlay_title_text_;
+  std::string portal_overlay_value_text_;
+  std::string portal_overlay_detail_text_;
   mutable std::mutex camera_refresh_mutex_{};
   bool camera_refresh_requested_ = false;
   std::atomic<bool> chamber_light_toggle_requested_{false};
+  std::atomic<bool> portal_unlock_requested_{false};
   PrinterSnapshot deferred_snapshot_{};
   PrinterSnapshot last_snapshot_{};
 };

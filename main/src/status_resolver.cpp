@@ -241,7 +241,6 @@ bool local_runtime_substate_should_override(const PrinterSnapshot& target,
 
 constexpr uint64_t kLocalSourceFreshMs = 90ULL * 1000ULL;
 constexpr uint64_t kCloudSourceFreshMs = 5ULL * 60ULL * 1000ULL;
-constexpr uint64_t kCloudTemperatureRetainMs = 60ULL * 1000ULL;
 constexpr uint64_t kCloudPreviewFreshMs = 30ULL * 60ULL * 1000ULL;
 
 bool is_recent_enough(uint64_t last_update_ms, uint64_t now_ms, uint64_t max_age_ms) {
@@ -271,13 +270,21 @@ bool cloud_preview_available(const BambuCloudSnapshot& snapshot, uint64_t now_ms
          !snapshot.preview_title.empty();
 }
 
-bool cloud_temperature_recent(float value, uint64_t last_update_ms, uint64_t now_ms) {
-  return value > 0.0f && is_recent_enough(last_update_ms, now_ms, kCloudTemperatureRetainMs);
+bool cloud_temperature_known(uint64_t last_update_ms, bool cloud_connected) {
+  return cloud_connected && last_update_ms != 0;
 }
 
 bool local_camera_available(const PrinterSnapshot& snapshot) {
   return snapshot.local_capabilities.camera_jpeg_socket || snapshot.local_capabilities.camera_rtsp ||
          snapshot.local_model == PrinterModel::kUnknown || !snapshot.camera_rtsp_url.empty();
+}
+
+PrinterModel preferred_model_for_routing(const PrinterSnapshot& local_snapshot,
+                                         const BambuCloudSnapshot& cloud_snapshot) {
+  if (cloud_snapshot.model != PrinterModel::kUnknown) {
+    return cloud_snapshot.model;
+  }
+  return local_snapshot.local_model;
 }
 
 void copy_source_metadata(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot,
@@ -314,6 +321,10 @@ void copy_source_metadata(PrinterSnapshot& target, const PrinterSnapshot& local_
 void apply_base_state_for_mode(PrinterSnapshot& target, SourceMode source_mode,
                                const PrinterSnapshot& local_snapshot, bool local_enabled,
                                const BambuCloudSnapshot& cloud_snapshot, bool cloud_enabled) {
+  const bool hybrid_prefers_cloud =
+      source_mode == SourceMode::kHybrid && cloud_enabled &&
+      printer_model_prefers_cloud_status(
+          preferred_model_for_routing(local_snapshot, cloud_snapshot));
   switch (source_mode) {
     case SourceMode::kCloudOnly:
       if (cloud_enabled) {
@@ -344,7 +355,13 @@ void apply_base_state_for_mode(PrinterSnapshot& target, SourceMode source_mode,
       break;
     case SourceMode::kHybrid:
     default:
-      if (local_enabled) {
+      if (hybrid_prefers_cloud) {
+        target.connection = cloud_snapshot.connected ? PrinterConnectionState::kOnline
+                                                     : PrinterConnectionState::kConnecting;
+        target.lifecycle = cloud_snapshot.lifecycle;
+        target.stage = cloud_snapshot.connected ? "cloud-online" : "cloud";
+        target.detail = cloud_snapshot.detail.empty() ? "Cloud path ready" : cloud_snapshot.detail;
+      } else if (local_enabled) {
         target.connection = local_snapshot.connection;
         target.lifecycle = local_snapshot.lifecycle;
         target.stage = local_snapshot.stage;
@@ -448,31 +465,33 @@ void apply_local_metrics_bundle(PrinterSnapshot& target, const PrinterSnapshot& 
 
 void apply_local_temperature_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
   target.nozzle_temp_c = local_snapshot.nozzle_temp_c;
+  target.nozzle_temp_known = local_snapshot.nozzle_temp_known || local_snapshot.nozzle_temp_c > 0.0f;
   target.bed_temp_c = local_snapshot.bed_temp_c;
+  target.bed_temp_known = local_snapshot.bed_temp_known || local_snapshot.bed_temp_c > 0.0f;
   target.chamber_temp_c = local_snapshot.chamber_temp_c;
+  target.chamber_temp_known =
+      local_snapshot.chamber_temp_known || local_snapshot.chamber_temp_c > 0.0f;
   target.secondary_nozzle_temp_c = local_snapshot.secondary_nozzle_temp_c;
+  target.secondary_nozzle_temp_known =
+      local_snapshot.secondary_nozzle_temp_known || local_snapshot.secondary_nozzle_temp_c > 0.0f;
 }
 
 void apply_cloud_temperature_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot,
                                     uint64_t now_ms) {
-  target.nozzle_temp_c = cloud_temperature_recent(cloud_snapshot.nozzle_temp_c,
-                                                  cloud_snapshot.nozzle_temp_last_update_ms, now_ms)
-                             ? cloud_snapshot.nozzle_temp_c
-                             : 0.0f;
-  target.bed_temp_c = cloud_temperature_recent(cloud_snapshot.bed_temp_c,
-                                               cloud_snapshot.bed_temp_last_update_ms, now_ms)
-                          ? cloud_snapshot.bed_temp_c
-                          : 0.0f;
-  target.chamber_temp_c =
-      cloud_temperature_recent(cloud_snapshot.chamber_temp_c,
-                               cloud_snapshot.chamber_temp_last_update_ms, now_ms)
-          ? cloud_snapshot.chamber_temp_c
-          : 0.0f;
+  (void)now_ms;
+  target.nozzle_temp_known =
+      cloud_temperature_known(cloud_snapshot.nozzle_temp_last_update_ms, cloud_snapshot.connected);
+  target.nozzle_temp_c = target.nozzle_temp_known ? cloud_snapshot.nozzle_temp_c : 0.0f;
+  target.bed_temp_known =
+      cloud_temperature_known(cloud_snapshot.bed_temp_last_update_ms, cloud_snapshot.connected);
+  target.bed_temp_c = target.bed_temp_known ? cloud_snapshot.bed_temp_c : 0.0f;
+  target.chamber_temp_known =
+      cloud_temperature_known(cloud_snapshot.chamber_temp_last_update_ms, cloud_snapshot.connected);
+  target.chamber_temp_c = target.chamber_temp_known ? cloud_snapshot.chamber_temp_c : 0.0f;
+  target.secondary_nozzle_temp_known = cloud_temperature_known(
+      cloud_snapshot.secondary_nozzle_temp_last_update_ms, cloud_snapshot.connected);
   target.secondary_nozzle_temp_c =
-      cloud_temperature_recent(cloud_snapshot.secondary_nozzle_temp_c,
-                               cloud_snapshot.secondary_nozzle_temp_last_update_ms, now_ms)
-          ? cloud_snapshot.secondary_nozzle_temp_c
-          : 0.0f;
+      target.secondary_nozzle_temp_known ? cloud_snapshot.secondary_nozzle_temp_c : 0.0f;
 }
 
 void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
@@ -738,38 +757,56 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
   apply_base_state_for_mode(snapshot, source_mode, local_snapshot, local_enabled, cloud_snapshot,
                             cloud_enabled);
 
+  const PrinterModel routing_model =
+      preferred_model_for_routing(local_snapshot, cloud_snapshot);
+  const bool local_status_supported =
+      local_enabled && printer_model_supports_local_status(routing_model);
+  const bool local_metrics_supported = local_status_supported;
+  const bool local_temperatures_supported = local_status_supported;
+  const bool local_error_supported = local_status_supported;
+  const bool prefer_cloud_status =
+      source_mode == SourceMode::kHybrid &&
+      printer_model_prefers_cloud_status(routing_model);
+
   const bool local_fresh =
       local_enabled && local_snapshot.local_connected &&
       is_recent_enough(local_snapshot.local_last_update_ms, now_ms, kLocalSourceFreshMs);
   const bool cloud_fresh =
       cloud_enabled && cloud_snapshot.connected &&
       is_recent_enough(cloud_snapshot.last_update_ms, now_ms, kCloudSourceFreshMs);
-  const bool local_status_usable = local_fresh && local_state_has_priority_signal(local_snapshot);
   const bool cloud_status_usable = cloud_fresh && cloud_state_has_signal(cloud_snapshot);
-  const bool local_metrics_usable = local_fresh && local_metrics_have_signal(local_snapshot);
   const bool cloud_metrics_usable = cloud_fresh && cloud_metrics_have_signal(cloud_snapshot);
-  const bool local_temperatures_usable = local_fresh && local_snapshot.local_capabilities.temperatures;
   const bool cloud_temperatures_usable =
       cloud_fresh && cloud_snapshot.capabilities.temperatures &&
-      (cloud_temperature_recent(cloud_snapshot.nozzle_temp_c,
-                                cloud_snapshot.nozzle_temp_last_update_ms, now_ms) ||
-       cloud_temperature_recent(cloud_snapshot.bed_temp_c,
-                                cloud_snapshot.bed_temp_last_update_ms, now_ms) ||
-       cloud_temperature_recent(cloud_snapshot.chamber_temp_c,
-                                cloud_snapshot.chamber_temp_last_update_ms, now_ms) ||
-       cloud_temperature_recent(cloud_snapshot.secondary_nozzle_temp_c,
-                                cloud_snapshot.secondary_nozzle_temp_last_update_ms, now_ms));
-  const bool local_light_usable =
-      local_fresh && local_snapshot.chamber_light_supported && local_snapshot.chamber_light_state_known;
+      (cloud_temperature_known(cloud_snapshot.nozzle_temp_last_update_ms, cloud_snapshot.connected) ||
+       cloud_temperature_known(cloud_snapshot.bed_temp_last_update_ms, cloud_snapshot.connected) ||
+       cloud_temperature_known(cloud_snapshot.chamber_temp_last_update_ms, cloud_snapshot.connected) ||
+       cloud_temperature_known(cloud_snapshot.secondary_nozzle_temp_last_update_ms,
+                               cloud_snapshot.connected));
   const bool cloud_light_usable =
       cloud_fresh && cloud_snapshot.chamber_light_supported &&
       cloud_snapshot.chamber_light_state_known;
-  const bool local_error_usable =
-      local_fresh && (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
-                      local_snapshot.non_error_stop || local_snapshot.has_error);
   const bool cloud_error_usable =
       cloud_fresh && (cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
                       cloud_snapshot.has_error || cloud_snapshot.non_error_stop);
+  const bool local_status_usable =
+      local_status_supported && local_fresh && local_state_has_priority_signal(local_snapshot) &&
+      (!prefer_cloud_status || !cloud_status_usable);
+  const bool local_metrics_usable =
+      local_metrics_supported && local_fresh && local_metrics_have_signal(local_snapshot) &&
+      (!prefer_cloud_status || !cloud_metrics_usable);
+  const bool local_temperatures_usable =
+      local_temperatures_supported && local_fresh && local_snapshot.local_capabilities.temperatures &&
+      (!prefer_cloud_status || !cloud_temperatures_usable);
+  const bool local_light_usable =
+      local_status_supported && local_fresh && local_snapshot.chamber_light_supported &&
+      local_snapshot.chamber_light_state_known &&
+      (!prefer_cloud_status || !cloud_light_usable);
+  const bool local_error_usable =
+      local_error_supported && local_fresh &&
+      (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
+       local_snapshot.non_error_stop || local_snapshot.has_error) &&
+      (!prefer_cloud_status || !cloud_error_usable);
 
   if (local_status_usable) {
     snapshot.status_source = FieldSource::kLocal;
@@ -851,9 +888,11 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
   if (effective_model != PrinterModel::kUnknown) {
     if (!printer_model_has_chamber_temperature(effective_model)) {
       snapshot.chamber_temp_c = 0.0f;
+      snapshot.chamber_temp_known = false;
     }
     if (!printer_model_has_secondary_nozzle_temperature(effective_model)) {
       snapshot.secondary_nozzle_temp_c = 0.0f;
+      snapshot.secondary_nozzle_temp_known = false;
     }
     if (!printer_model_has_chamber_light(effective_model)) {
       snapshot.chamber_light_supported = false;
@@ -864,6 +903,7 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
     }
   } else if (printer_serial_family_has_no_chamber_temperature(snapshot.resolved_serial)) {
     snapshot.chamber_temp_c = 0.0f;
+    snapshot.chamber_temp_known = false;
   }
 
   return snapshot;

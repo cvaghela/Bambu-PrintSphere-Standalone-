@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -25,6 +26,42 @@ class PrinterClient {
   bool set_chamber_light(bool on);
   esp_err_t start();
   PrinterSnapshot snapshot() const { return state_.snapshot(); }
+  struct LocalPrinterRuntimeState {
+    PrinterConnectionState connection = PrinterConnectionState::kBooting;
+    PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
+    PrinterModel local_model = PrinterModel::kUnknown;
+    SourceCapabilities local_capabilities{};
+    float progress_percent = 0.0f;
+    float nozzle_temp_c = 0.0f;
+    float bed_temp_c = 0.0f;
+    float chamber_temp_c = 0.0f;
+    float secondary_nozzle_temp_c = 0.0f;
+    bool chamber_light_supported = false;
+    bool chamber_light_state_known = false;
+    bool chamber_light_on = false;
+    uint32_t remaining_seconds = 0;
+    uint16_t current_layer = 0;
+    uint16_t total_layers = 0;
+    int print_error_code = 0;
+    uint16_t hms_alert_count = 0;
+    bool local_configured = false;
+    bool local_connected = false;
+    uint64_t local_last_update_ms = 0;
+    bool local_mqtt_signature_required = false;
+    bool has_error = false;
+    bool print_active = false;
+    bool warn_hms = false;
+    bool non_error_stop = false;
+    bool show_stop_banner = false;
+    std::array<char, 16> raw_status{};
+    std::array<char, 32> raw_stage{};
+    std::array<char, 32> stage{};
+    std::array<char, 96> detail{};
+    std::array<char, 24> resolved_serial{};
+    std::array<char, 96> job_name{};
+    std::array<char, 128> gcode_file{};
+    std::array<char, 96> camera_rtsp_url{};
+  };
 
  private:
   static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_t event_id,
@@ -32,7 +69,6 @@ class PrinterClient {
   static void task_entry(void* context);
   void handle_mqtt_event(esp_mqtt_event_handle_t event);
   void handle_report_payload(const char* payload, size_t length);
-  void handle_info_payload(const char* payload, size_t length);
   void task_loop();
   void stop_client();
   void schedule_client_rebuild(const char* reason, uint32_t delay_ms = 1500);
@@ -52,11 +88,18 @@ class PrinterClient {
   static int json_int(const cJSON* object, const char* key, int fallback);
   static std::string json_string(const cJSON* object, const char* key,
                                  const std::string& fallback = {});
+  LocalPrinterRuntimeState runtime_state_copy() const;
+  void store_runtime_state(LocalPrinterRuntimeState runtime, bool notify_task);
+  void publish_runtime_snapshot();
+  PrinterSnapshot build_snapshot_from_runtime(const LocalPrinterRuntimeState& runtime) const;
+  void wake_task();
 
   mutable std::mutex config_mutex_{};
   PrinterConnection desired_connection_{};
   PrinterConnection active_connection_{};
   PrinterStateStore state_{};
+  mutable std::mutex runtime_mutex_{};
+  LocalPrinterRuntimeState runtime_state_{};
   TaskHandle_t task_handle_ = nullptr;
   esp_mqtt_client_handle_t client_ = nullptr;
   std::string client_id_{};
@@ -81,6 +124,7 @@ class PrinterClient {
   std::atomic<uint32_t> watchdog_probe_tick_{0};
   std::atomic<uint32_t> rebuild_request_tick_{0};
   std::atomic<uint32_t> rebuild_delay_ticks_{0};
+  std::atomic<bool> runtime_dirty_{false};
 };
 
 }  // namespace printsphere
