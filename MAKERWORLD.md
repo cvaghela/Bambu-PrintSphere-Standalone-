@@ -54,18 +54,18 @@ Additional hardware:
   - size: `10 mm x 34 mm x 54 mm`
 - `Qi standard wireless charging coil x 1`
   - example source: `aliexpress.com/item/1005006741966938.html`
-  - <img width="576" height="345" alt="image" src="https://github.com/user-attachments/assets/714d08a9-650f-41c4-81d0-946902a2202d" />
+  - <img width="288" height="173" alt="image" src="https://github.com/user-attachments/assets/714d08a9-650f-41c4-81d0-946902a2202d" />
 - `JST MX1.25 mm soft silicone cable x 2`
   - one for the battery
   - one to replace the cable on the wireless charger
 - `Mini slide switch SS12D00G x 1`
   - knob length: `3 mm`
-  - <img width="134" height="129" alt="image" src="https://github.com/user-attachments/assets/1338e4f8-1655-48e3-984a-a06f1e34e060" />
+  - <img width="95" height="92" alt="image" src="https://github.com/user-attachments/assets/1338e4f8-1655-48e3-984a-a06f1e34e060" />
 - `M2.5x25 mm screw x 1`
 - `M2.5 nut x 1`
 - `Magnetic circle ring plate sheet x 1`
   - example source: `aliexpress.com/item/1005006966440001.html`
-  - <img width="450" height="423" alt="image" src="https://github.com/user-attachments/assets/4fc0314c-2227-49d2-9140-b058a4a3bf0d" />
+  - <img width="225" height="212" alt="image" src="https://github.com/user-attachments/assets/4fc0314c-2227-49d2-9140-b058a4a3bf0d" />
 
 
 ## Before Assembly
