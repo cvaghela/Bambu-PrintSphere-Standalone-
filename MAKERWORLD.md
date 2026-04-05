@@ -18,6 +18,9 @@ Depending on printer model, source mode, and current code support, it can show:
 - local camera snapshots
 - printer error details and HMS information
 
+![20260313_143723](https://github.com/user-attachments/assets/d034439a-e9b4-43c0-ba95-79031c930dcb)
+
+
 It also supports:
 
 - Bambu Cloud login from the built-in Web Config
@@ -52,15 +55,19 @@ Additional hardware:
   - size: `10 mm x 34 mm x 54 mm`
 - `Qi standard wireless charging coil x 1`
   - example source: `aliexpress.com/item/1005006741966938.html`
+  - <img width="576" height="345" alt="image" src="https://github.com/user-attachments/assets/714d08a9-650f-41c4-81d0-946902a2202d" />
 - `JST MX1.25 mm soft silicone cable x 2`
   - one for the battery
   - one to replace the cable on the wireless charger
 - `Mini slide switch SS12D00G x 1`
   - knob length: `3 mm`
+  - <img width="134" height="129" alt="image" src="https://github.com/user-attachments/assets/1338e4f8-1655-48e3-984a-a06f1e34e060" />
 - `M2.5x25 mm screw x 1`
 - `M2.5 nut x 1`
 - `Magnetic circle ring plate sheet x 1`
   - example source: `aliexpress.com/item/1005006966440001.html`
+  - <img width="450" height="423" alt="image" src="https://github.com/user-attachments/assets/4fc0314c-2227-49d2-9140-b058a4a3bf0d" />
+
 
 ## Before Assembly
 
@@ -90,7 +97,8 @@ Additional hardware:
 - Never guess LiPo polarity.
 - cut one wire of (+ or -) 
 - solder the cut wire to the slide switch and add heat-shrink tubing to the switch contacts. 
-  
+  ![20260405_223952](https://github.com/user-attachments/assets/9eb3d04a-818d-43c4-bdc2-1852d4b4e9c8)
+
 ### 4. Prepare The Slide Switch
 
 - Install the `SS12D00G` slide switch into the matching slot in the printed housing.
@@ -120,6 +128,7 @@ Additional hardware:
 - Place the `103454 2000 mAh` battery into the battery compartment.
 - Make sure the battery is not bent, pinched, or compressed by the shell.
 - Route the cable so it does not cross the screw channel or get trapped at the shell edge.
+![20260405_224151](https://github.com/user-attachments/assets/251a2e2c-1684-4d05-9bea-ddafe645daab)
 
 ### 9. Mount the Display
 
@@ -130,12 +139,15 @@ Additional hardware:
 
 - Thread the battery cable and the wireless charging coil cable together through a piece (1.5 cm) of heat-shrink tubing and shrink it in the area of the hinge.
 - Feed the bundle through the opening in the lid into the interior of the upper section 
+![20260405_224438](https://github.com/user-attachments/assets/efe68972-e904-4b0f-9413-e00f833c5df4)
+<img width="1119" height="893" alt="image" src="https://github.com/user-attachments/assets/0b96cf91-3a6e-4a7b-ad6a-4509580cb9de" />
 
 ### 9. Connect the Board
 
 - remove the pin header gently with some small side-cutter pliers
 - Solder the cables to the circuit board, make sure to connect positive (+5V) to VBUS and negative to GND.
 - switch the `SS12D00G` slide switch to off position then connect the battery to the board.
+![20260405_224446](https://github.com/user-attachments/assets/c3dc9121-f1b9-48ed-a6a7-6a921a6a6859)
 
 ### 10. Final Cable Check
 
