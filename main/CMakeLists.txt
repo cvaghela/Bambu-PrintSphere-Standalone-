@@ -45,4 +45,7 @@ idf_component_register(
         nvs_flash
 )
 
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    PRINTSPHERE_RELEASE_VERSION="${PRINTSPHERE_RELEASE_VERSION}"
+)
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra)

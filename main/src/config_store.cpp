@@ -1,5 +1,6 @@
 #include "printsphere/config_store.hpp"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -46,6 +47,27 @@ uint32_t parse_color_or_default(const std::string& value, uint32_t fallback) {
   }
 
   return static_cast<uint32_t>(parsed);
+}
+
+bool parse_bool_or_default(const std::string& value, bool fallback) {
+  if (value.empty()) {
+    return fallback;
+  }
+
+  std::string normalized = value;
+  for (char& ch : normalized) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+
+  if (normalized == "1" || normalized == "true" || normalized == "on" ||
+      normalized == "enabled") {
+    return true;
+  }
+  if (normalized == "0" || normalized == "false" || normalized == "off" ||
+      normalized == "disabled") {
+    return false;
+  }
+  return fallback;
 }
 }
 
@@ -169,6 +191,10 @@ DisplayRotation ConfigStore::load_display_rotation() const {
   return parse_display_rotation(load_string("display_rot"));
 }
 
+bool ConfigStore::load_portal_lock_enabled() const {
+  return parse_bool_or_default(load_string("portal_lock"), true);
+}
+
 PrinterConnection ConfigStore::load_printer_config() const {
   PrinterConnection connection;
   connection.host = load_string("prn_host");
@@ -246,6 +272,10 @@ esp_err_t ConfigStore::save_source_mode(SourceMode mode) const {
 
 esp_err_t ConfigStore::save_display_rotation(DisplayRotation rotation) const {
   return save_string("display_rot", to_string(rotation));
+}
+
+esp_err_t ConfigStore::save_portal_lock_enabled(bool enabled) const {
+  return save_string("portal_lock", enabled ? "1" : "0");
 }
 
 esp_err_t ConfigStore::save_printer_config(const PrinterConnection& connection) const {

@@ -59,11 +59,7 @@ std::string format_lookup_code(ErrorLookupDomain domain, uint64_t code) {
   return buffer;
 }
 
-std::string format_generic_print_error_detail(int print_error_code, int hms_count) {
-  if (print_error_code == 0 && hms_count == 0) {
-    return {};
-  }
-
+std::string format_generic_print_error_detail(int print_error_code) {
   if (print_error_code != 0) {
     char error_buffer[32] = {};
     std::snprintf(error_buffer, sizeof(error_buffer), "%08X",
@@ -72,14 +68,52 @@ std::string format_generic_print_error_detail(int print_error_code, int hms_coun
     detail += std::string(error_buffer, 4);
     detail += "_";
     detail += std::string(error_buffer + 4, 4);
-    if (hms_count > 0) {
-      detail += " + HMS ";
-      detail += std::to_string(hms_count);
-    }
     return detail;
   }
 
+  return {};
+}
+
+std::string format_generic_hms_detail(uint64_t hms_code) {
+  if (hms_code == 0) {
+    return {};
+  }
+
+  char error_buffer[32] = {};
+  std::snprintf(error_buffer, sizeof(error_buffer), "%016llX",
+                static_cast<unsigned long long>(hms_code));
+  std::string detail = "HMS ";
+  detail += std::string(error_buffer, 8);
+  detail += "_";
+  detail += std::string(error_buffer + 8, 8);
+  return detail;
+}
+
+std::string format_generic_hms_count_detail(int hms_count) {
+  if (hms_count <= 0) {
+    return {};
+  }
   return "HMS alerts: " + std::to_string(hms_count);
+}
+
+std::string resolve_primary_hms_detail(const std::vector<uint64_t>& hms_codes, int hms_count,
+                                       PrinterModel model) {
+  for (const uint64_t hms_code : hms_codes) {
+    if (hms_code == 0) {
+      continue;
+    }
+
+    std::string detail = lookup_error_text(ErrorLookupDomain::kDeviceHms, hms_code, model);
+    if (!detail.empty()) {
+      return detail;
+    }
+  }
+
+  if (!hms_codes.empty()) {
+    return format_generic_hms_detail(hms_codes.front());
+  }
+
+  return format_generic_hms_count_detail(hms_count);
 }
 
 bool ensure_storage_ready_locked() {
@@ -233,21 +267,19 @@ std::string lookup_error_text(ErrorLookupDomain domain, uint64_t code, PrinterMo
   return result;
 }
 
-std::string format_resolved_error_detail(int print_error_code, int hms_count, PrinterModel model) {
-  if (print_error_code == 0) {
-    return hms_count > 0 ? "HMS alerts: " + std::to_string(hms_count) : std::string{};
+std::string format_resolved_error_detail(int print_error_code,
+                                         const std::vector<uint64_t>& hms_codes, int hms_count,
+                                         PrinterModel model) {
+  if (print_error_code != 0) {
+    std::string detail = lookup_error_text(ErrorLookupDomain::kPrintError,
+                                           static_cast<uint32_t>(print_error_code), model);
+    if (!detail.empty()) {
+      return detail;
+    }
+    return format_generic_print_error_detail(print_error_code);
   }
 
-  std::string detail = lookup_error_text(ErrorLookupDomain::kPrintError,
-                                         static_cast<uint32_t>(print_error_code), model);
-  if (detail.empty()) {
-    return format_generic_print_error_detail(print_error_code, hms_count);
-  }
-  if (hms_count > 0) {
-    detail += " + HMS ";
-    detail += std::to_string(hms_count);
-  }
-  return detail;
+  return resolve_primary_hms_detail(hms_codes, hms_count, model);
 }
 
 }  // namespace printsphere

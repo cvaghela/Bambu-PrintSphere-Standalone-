@@ -68,6 +68,7 @@ struct BambuCloudSnapshot {
   uint16_t current_layer = 0;
   uint16_t total_layers = 0;
   int print_error_code = 0;
+  std::vector<uint64_t> hms_codes;
   uint16_t hms_alert_count = 0;
   uint64_t live_data_last_update_ms = 0;
   PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
@@ -108,6 +109,7 @@ class BambuCloudClient {
     uint16_t current_layer = 0;
     uint16_t total_layers = 0;
     int print_error_code = 0;
+    std::vector<uint64_t> hms_codes;
     uint16_t hms_alert_count = 0;
     bool has_error = false;
     std::array<char, 96> detail{};

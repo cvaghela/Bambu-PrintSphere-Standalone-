@@ -80,7 +80,8 @@ bool is_paused_status(const std::string& status, const std::string& stage) {
 }
 
 bool is_non_error_stop(const PrinterSnapshot& snapshot) {
-  return snapshot.non_error_stop && snapshot.print_error_code == 0 && snapshot.hms_alert_count == 0;
+  return snapshot.non_error_stop && snapshot.print_error_code == 0 &&
+         snapshot.hms_alert_count == 0 && snapshot.hms_codes.empty();
 }
 
 std::string effective_status(const PrinterSnapshot& snapshot) {
@@ -121,7 +122,7 @@ bool is_generic_local_stage(const PrinterSnapshot& snapshot) {
 }
 
 bool local_state_has_priority_signal(const PrinterSnapshot& snapshot) {
-  if (snapshot.print_error_code != 0 || snapshot.hms_alert_count > 0 ||
+  if (snapshot.print_error_code != 0 || !snapshot.hms_codes.empty() || snapshot.hms_alert_count > 0 ||
       snapshot.has_error || snapshot.lifecycle == PrintLifecycleState::kError) {
     return true;
   }
@@ -145,7 +146,8 @@ bool cloud_state_has_signal(const BambuCloudSnapshot& snapshot) {
   return snapshot.connected &&
          (snapshot.lifecycle != PrintLifecycleState::kUnknown || snapshot.progress_percent > 0.0f ||
           !snapshot.stage.empty() || !snapshot.raw_status.empty() || !snapshot.raw_stage.empty() ||
-          snapshot.has_error);
+          snapshot.has_error || snapshot.print_error_code != 0 || !snapshot.hms_codes.empty() ||
+          snapshot.hms_alert_count > 0 || snapshot.non_error_stop);
 }
 
 bool is_filament_stage(const std::string& stage) {
@@ -496,16 +498,19 @@ void apply_cloud_temperature_bundle(PrinterSnapshot& target, const BambuCloudSna
 
 void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
   target.print_error_code = local_snapshot.print_error_code;
+  target.hms_codes = local_snapshot.hms_codes;
   target.hms_alert_count = local_snapshot.hms_alert_count;
   target.non_error_stop = local_snapshot.non_error_stop;
   target.show_stop_banner = local_snapshot.show_stop_banner;
-  if ((local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
+  if ((local_snapshot.print_error_code != 0 || !local_snapshot.hms_codes.empty() ||
+       local_snapshot.hms_alert_count > 0 ||
        local_snapshot.non_error_stop || local_snapshot.has_error) &&
       !local_snapshot.detail.empty()) {
     target.detail = local_snapshot.detail;
   }
   if (target.status_source == FieldSource::kNone &&
-      (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
+      (local_snapshot.print_error_code != 0 || !local_snapshot.hms_codes.empty() ||
+       local_snapshot.hms_alert_count > 0 ||
        local_snapshot.non_error_stop || local_snapshot.has_error)) {
     apply_local_status_bundle(target, local_snapshot);
   }
@@ -513,16 +518,19 @@ void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& lo
 
 void apply_cloud_error_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
   target.print_error_code = cloud_snapshot.print_error_code;
+  target.hms_codes = cloud_snapshot.hms_codes;
   target.hms_alert_count = cloud_snapshot.hms_alert_count;
   target.non_error_stop = cloud_snapshot.non_error_stop;
   target.show_stop_banner = false;
-  if ((cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
+  if ((cloud_snapshot.print_error_code != 0 || !cloud_snapshot.hms_codes.empty() ||
+       cloud_snapshot.hms_alert_count > 0 ||
        cloud_snapshot.has_error || cloud_snapshot.non_error_stop) &&
       !cloud_snapshot.detail.empty()) {
     target.detail = cloud_snapshot.detail;
   }
   if (target.status_source == FieldSource::kNone &&
-      (cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
+      (cloud_snapshot.print_error_code != 0 || !cloud_snapshot.hms_codes.empty() ||
+       cloud_snapshot.hms_alert_count > 0 ||
        cloud_snapshot.has_error || cloud_snapshot.non_error_stop)) {
     apply_cloud_status_bundle(target, cloud_snapshot);
   }
@@ -569,8 +577,8 @@ bool is_generic_finished_detail(const std::string& detail, const std::string& st
 
 void apply_resolved_detail(PrinterSnapshot& snapshot) {
   const PrinterModel model = effective_model_for_snapshot(snapshot);
-  const std::string resolved_error =
-      format_resolved_error_detail(snapshot.print_error_code, snapshot.hms_alert_count, model);
+  const std::string resolved_error = format_resolved_error_detail(
+      snapshot.print_error_code, snapshot.hms_codes, snapshot.hms_alert_count, model);
   if (!resolved_error.empty()) {
     snapshot.detail = resolved_error;
     return;
@@ -637,7 +645,7 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
 
   const bool ps_failed = is_failed_status(status);
   const bool err_print = snapshot.print_error_code != 0;
-  const bool err_hms = snapshot.hms_alert_count > 0;
+  const bool err_hms = !snapshot.hms_codes.empty() || snapshot.hms_alert_count > 0;
   const bool input_error = snapshot.has_error;
   const bool paused = is_paused_status(status, stage);
   const bool preparing = is_prepare_status(status, stage);
@@ -666,7 +674,7 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
     snapshot.print_active = false;
   }
 
-  snapshot.has_error = input_error || ps_failed || err_print || (err_hms && !snapshot.print_active);
+  snapshot.has_error = input_error || ps_failed || err_print;
   snapshot.warn_hms = err_hms && snapshot.print_active && !snapshot.has_error;
 
   if (snapshot.has_error) {
@@ -787,7 +795,8 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
       cloud_fresh && cloud_snapshot.chamber_light_supported &&
       cloud_snapshot.chamber_light_state_known;
   const bool cloud_error_usable =
-      cloud_fresh && (cloud_snapshot.print_error_code != 0 || cloud_snapshot.hms_alert_count > 0 ||
+      cloud_fresh && (cloud_snapshot.print_error_code != 0 || !cloud_snapshot.hms_codes.empty() ||
+                      cloud_snapshot.hms_alert_count > 0 ||
                       cloud_snapshot.has_error || cloud_snapshot.non_error_stop);
   const bool local_status_usable =
       local_status_supported && local_fresh && local_state_has_priority_signal(local_snapshot) &&
@@ -804,7 +813,8 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
       (!prefer_cloud_status || !cloud_light_usable);
   const bool local_error_usable =
       local_error_supported && local_fresh &&
-      (local_snapshot.print_error_code != 0 || local_snapshot.hms_alert_count > 0 ||
+      (local_snapshot.print_error_code != 0 || !local_snapshot.hms_codes.empty() ||
+       local_snapshot.hms_alert_count > 0 ||
        local_snapshot.non_error_stop || local_snapshot.has_error) &&
       (!prefer_cloud_status || !cloud_error_usable);
 

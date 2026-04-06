@@ -22,11 +22,16 @@ namespace printsphere {
 
 namespace {
 
+#ifndef PRINTSPHERE_RELEASE_VERSION
+#define PRINTSPHERE_RELEASE_VERSION "dev"
+#endif
+
 constexpr char kTag[] = "printsphere.portal";
 constexpr size_t kMaxRequestBody = 4096;
 constexpr char kPortalSessionCookieName[] = "printsphere_portal_session";
 constexpr uint64_t kPortalPinLifetimeMs = 2ULL * 60ULL * 1000ULL;
 constexpr uint64_t kPortalSessionLifetimeMs = 10ULL * 60ULL * 1000ULL;
+constexpr char kPortalReleaseVersion[] = PRINTSPHERE_RELEASE_VERSION;
 constexpr char kFaviconSvg[] =
     "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">"
     "<rect width=\"64\" height=\"64\" rx=\"16\" fill=\"#121a23\"/>"
@@ -69,6 +74,42 @@ std::string read_string_field(const cJSON* object, const char* key) {
     return {};
   }
   return item->valuestring;
+}
+
+bool read_bool_field(const cJSON* object, const char* key, bool fallback) {
+  if (object == nullptr || key == nullptr || key[0] == '\0') {
+    return fallback;
+  }
+
+  const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+  if (cJSON_IsBool(item)) {
+    return cJSON_IsTrue(item);
+  }
+  if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+    return fallback;
+  }
+
+  std::string value = item->valuestring;
+  size_t start = 0;
+  while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+    ++start;
+  }
+  size_t end = value.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+    --end;
+  }
+  value = value.substr(start, end - start);
+  for (char& ch : value) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+
+  if (value == "1" || value == "true" || value == "on" || value == "enabled") {
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "off" || value == "disabled") {
+    return false;
+  }
+  return fallback;
 }
 
 std::string trim_copy(const std::string& input) {
@@ -293,6 +334,8 @@ void append_portal_access_fields(std::string* body, const PortalAccessSnapshot& 
 
   *body += ",\"portal_locked\":";
   *body += access.request_authorized ? "false" : "true";
+  *body += ",\"portal_lock_enabled\":";
+  *body += access.lock_enabled ? "true" : "false";
   *body += ",\"portal_session_active\":";
   *body += access.session_active ? "true" : "false";
   *body += ",\"portal_pin_active\":";
@@ -450,7 +493,7 @@ struct CloudPortalPresentation {
   bool ready = false;
   std::string badge_value = "Not configured";
   const char* badge_class = "idle";
-  std::string status_line = "Step 2: Connect Bambu Cloud";
+  std::string status_line = "Connect Bambu Cloud";
   std::string status_detail = "No cloud response yet";
 };
 
@@ -671,17 +714,26 @@ void SetupPortal::request_unlock_pin() {
   const uint64_t current_ms = now_ms();
   std::lock_guard<std::mutex> lock(access_mutex_);
   prune_access_state_locked(current_ms);
+  if (!is_lock_required()) {
+    unlock_pin_.clear();
+    unlock_pin_expiry_ms_ = 0;
+    session_token_.clear();
+    session_expiry_ms_ = 0;
+    return;
+  }
   unlock_pin_ = generate_unlock_pin();
   unlock_pin_expiry_ms_ = current_ms + kPortalPinLifetimeMs;
 }
 
 PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
+  const bool lock_enabled = is_lock_enabled();
   const bool lock_required = is_lock_required();
   const uint64_t current_ms = now_ms();
   std::lock_guard<std::mutex> lock(access_mutex_);
   prune_access_state_locked(current_ms);
 
   PortalAccessSnapshot snapshot;
+  snapshot.lock_enabled = lock_enabled;
   snapshot.request_authorized = lock_required ? request_authorized : true;
   snapshot.session_active = !session_token_.empty();
   snapshot.pin_active = !unlock_pin_.empty();
@@ -690,7 +742,20 @@ PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
   snapshot.pin_code = unlock_pin_;
 
   if (!lock_required) {
-    if (wifi_manager_.is_setup_access_point_active()) {
+    unlock_pin_.clear();
+    unlock_pin_expiry_ms_ = 0;
+    session_token_.clear();
+    session_expiry_ms_ = 0;
+    snapshot.session_active = false;
+    snapshot.pin_active = false;
+    snapshot.session_remaining_s = 0;
+    snapshot.pin_remaining_s = 0;
+    snapshot.pin_code.clear();
+
+    if (!lock_enabled) {
+      snapshot.detail =
+          "Portal PIN lock is disabled. Web Config stays open on your home network.";
+    } else if (wifi_manager_.is_setup_access_point_active()) {
       snapshot.detail = "Web Config is open while the setup access point is active.";
     } else if (!wifi_manager_.is_station_connected()) {
       snapshot.detail = "Web Config is open while PrintSphere is waiting for Wi-Fi credentials.";
@@ -782,8 +847,14 @@ bool SetupPortal::is_lock_required() const {
     return false;
   }
 
+  if (!is_lock_enabled()) {
+    return false;
+  }
+
   return is_provisioning_complete();
 }
+
+bool SetupPortal::is_lock_enabled() const { return config_store_.load_portal_lock_enabled(); }
 
 bool SetupPortal::is_request_authorized(httpd_req_t* request) {
   if (!is_lock_required()) {
@@ -948,6 +1019,14 @@ esp_err_t SetupPortal::start() {
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &display_rotation_uri), kTag,
                       "display rotation handler failed");
 
+  httpd_uri_t portal_access_uri = {};
+  portal_access_uri.uri = "/api/portal-access";
+  portal_access_uri.method = HTTP_POST;
+  portal_access_uri.handler = &SetupPortal::handle_portal_access_post;
+  portal_access_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &portal_access_uri), kTag,
+                      "portal access handler failed");
+
   httpd_uri_t cloud_connect_uri = {};
   cloud_connect_uri.uri = "/api/cloud/connect";
   cloud_connect_uri.method = HTTP_POST;
@@ -989,6 +1068,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
   const SourceMode source_mode = portal->config_store_.load_source_mode();
   const DisplayRotation display_rotation = portal->config_store_.load_display_rotation();
+  const bool portal_lock_enabled = portal->config_store_.load_portal_lock_enabled();
   const PrinterConnection printer = portal->config_store_.load_printer_config();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
   const CloudPortalPresentation cloud_portal =
@@ -1039,8 +1119,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
                      cloud_snapshot.setup_stage == CloudSetupStage::kLoggingIn ||
                      cloud_snapshot.setup_stage == CloudSetupStage::kCodeSubmitted
                  ? cloud_portal.status_line
-                 : "Step 2: Connect Bambu Cloud")
-          : "Step 1: Save Wi-Fi";
+                 : "Connect Bambu Cloud")
+          : "Save Wi-Fi";
   const std::string initial_status_detail =
       show_connection_steps
           ? (cloud_portal.ready || cloud_snapshot.verification_required ||
@@ -1060,6 +1140,45 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       show_connection_steps
           ? "Use this mainly when Wi-Fi changes. Cloud and local connect buttons apply those paths live without a reboot."
           : "This first save writes Wi-Fi to NVS and restarts the ESP.";
+  const ArcColorScheme default_arc_colors = {};
+  const bool arc_colors_custom =
+      arc_colors.printing != default_arc_colors.printing ||
+      arc_colors.done != default_arc_colors.done || arc_colors.error != default_arc_colors.error ||
+      arc_colors.idle != default_arc_colors.idle ||
+      arc_colors.preheat != default_arc_colors.preheat ||
+      arc_colors.clean != default_arc_colors.clean || arc_colors.level != default_arc_colors.level ||
+      arc_colors.cool != default_arc_colors.cool ||
+      arc_colors.idle_active != default_arc_colors.idle_active ||
+      arc_colors.filament != default_arc_colors.filament ||
+      arc_colors.setup != default_arc_colors.setup ||
+      arc_colors.offline != default_arc_colors.offline ||
+      arc_colors.unknown != default_arc_colors.unknown;
+  const std::string wifi_section_badge_value =
+      wifi_connected ? "Connected" : (wifi_configured ? "Saved" : "Needs setup");
+  const char* wifi_section_badge_class =
+      wifi_connected ? "ok" : (wifi_configured ? "info" : "warn");
+  const std::string rotation_section_badge_value = display_rotation_badge_value(display_rotation);
+  const std::string portal_lock_badge_value =
+      setup_ap_active ? "Open in setup AP"
+                      : (portal_lock_enabled ? "PIN lock on" : "Open on LAN");
+  const char* portal_lock_badge_class =
+      setup_ap_active ? "info" : (portal_lock_enabled ? "info" : "warn");
+  const std::string arc_badge_value = arc_colors_custom ? "Custom" : "Default";
+  const char* arc_badge_class = arc_colors_custom ? "info" : "idle";
+  const bool wifi_section_open = !wifi_configured || !wifi_connected || setup_ap_active;
+  const bool rotation_section_open = false;
+  const bool connection_mode_section_open = false;
+  const bool portal_access_section_open = !portal_lock_enabled && !setup_ap_active;
+  const bool cloud_section_configured =
+      cloud_snapshot.configured || cloud_portal.ready || cloud_snapshot.verification_required ||
+      cloud_snapshot.tfa_required || cloud.has_identity();
+  const bool cloud_section_open =
+      !cloud_section_configured || cloud_snapshot.verification_required ||
+      cloud_snapshot.tfa_required || cloud_snapshot.setup_stage == CloudSetupStage::kFailed;
+  const bool local_section_open =
+      !local_configured || local_snapshot.connection == PrinterConnectionState::kError;
+  const bool arc_section_open = false;
+  std::string html;
 
   const auto add_badge = [](std::string* html, const char* id, const std::string& label,
                             const std::string& value, const char* state_class) {
@@ -1077,8 +1196,31 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     *html += json_escape(value);
     *html += "</span></div>";
   };
-
-  std::string html;
+  const auto add_summary_pill = [](std::string* html, const std::string& value,
+                                   const char* state_class) {
+    *html += "<span class=\"summary-pill ";
+    *html += state_class;
+    *html += "\">";
+    *html += json_escape(value);
+    *html += "</span>";
+  };
+  const auto begin_collapsible_section =
+      [&html, &add_summary_pill](const char* title, const char* detail,
+                                 const std::string& badge_value, const char* badge_class,
+                                 bool open) {
+        html += "<details class=\"section\"";
+        if (open) {
+          html += " open";
+        }
+        html += "><summary class=\"section-summary\"><div class=\"section-summary-main section-head\"><h2>";
+        html += title;
+        html += "</h2><p>";
+        html += detail;
+        html += "</p></div><div class=\"section-summary-side\">";
+        add_summary_pill(&html, badge_value, badge_class);
+        html += "<span class=\"section-toggle-icon\" aria-hidden=\"true\"></span></div></summary><div class=\"section-body\">";
+      };
+  const auto end_collapsible_section = [&html]() { html += "</div></details>"; };
   html += "<!doctype html><html><head><meta charset=\"utf-8\">";
   html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
   html += "<title>PrintSphere Web Config</title>";
@@ -1098,12 +1240,26 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "border:1px solid #34506e;}";
   html += ".hero,.section,.footer-card{background:rgba(18,26,35,0.94);border:1px solid var(--line);"
           "border-radius:24px;box-shadow:0 14px 32px rgba(0,0,0,.2);} .hero{padding:24px;display:grid;gap:18px;}"
-          ".section{padding:22px;display:grid;gap:16px;} .footer-card{padding:18px;display:grid;gap:8px;}"
-          ".stack{display:grid;gap:18px;}";
-  html += ".hero-top{display:grid;gap:8px;} .eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;"
-          "color:#8fb2d3;} .title{font-size:34px;line-height:1.05;} .subtitle{max-width:720px;color:var(--muted);"
+          ".section{padding:0;overflow:hidden;} .section-body{padding:0 22px 22px;display:grid;gap:16px;}"
+          ".footer-card{padding:18px;display:grid;gap:8px;} .stack{display:grid;gap:18px;}";
+  html += ".hero-top{display:grid;gap:10px;} .hero-brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}"
+          " .eyebrow{font-size:18px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;"
+          "color:#b9d4ef;} .hero-version{display:inline-flex;align-items:center;justify-content:center;padding:6px 12px;"
+          "border-radius:999px;border:1px solid #31557d;background:#111b29;color:#dceafa;font-size:12px;font-weight:700;"
+          "letter-spacing:.08em;text-transform:uppercase;text-decoration:none;transition:border-color .18s ease,background .18s ease,color .18s ease;}"
+          " .hero-version:hover{border-color:#4d86c7;background:#142235;color:#f8fbff;} .title{font-size:34px;line-height:1.05;} .subtitle{max-width:720px;color:var(--muted);"
           "line-height:1.55;} .section-head{display:grid;gap:6px;} .section-head p,.hint,.micro{color:var(--muted);"
-          "line-height:1.5;} .micro{font-size:13px;} .hint-box{padding:14px 16px;border-radius:18px;background:#0e1620;"
+          "line-height:1.5;} .micro{font-size:13px;} .section-summary{display:flex;gap:14px;align-items:flex-start;"
+          "justify-content:space-between;padding:22px;cursor:pointer;list-style:none;} .section-summary::-webkit-details-marker{display:none;}"
+          ".section-summary-main{flex:1 1 auto;} .section-summary-side{display:flex;align-items:center;gap:10px;flex:0 0 auto;}"
+          ".summary-pill{display:inline-flex;align-items:center;justify-content:center;padding:8px 12px;border-radius:999px;"
+          "border:1px solid var(--line);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;"
+          "background:#0f1721;color:var(--text);white-space:nowrap;} .summary-pill.ok{border-color:#22614c;background:#10231d;}"
+          ".summary-pill.warn{border-color:#7d6222;background:#241c0e;} .summary-pill.info{border-color:#31557d;background:#111b29;}"
+          ".summary-pill.idle{border-color:#334456;background:#121a23;} .section-toggle-icon{width:32px;height:32px;border-radius:999px;"
+          "border:1px solid #365064;background:#0f1721;display:grid;place-items:center;flex:0 0 auto;} .section-toggle-icon::before{content:'+';"
+          "font-size:20px;line-height:1;color:#cfe0f1;} details[open]>.section-summary .section-toggle-icon::before{content:'-';}"
+          ".hint-box{padding:14px 16px;border-radius:18px;background:#0e1620;"
           "border:1px solid #2b3e54;color:var(--muted);} .hint-box strong{color:var(--text);}";
   html += ".badge-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;}"
           ".badge{padding:14px 16px;border-radius:18px;border:1px solid var(--line);background:#0f1721;display:grid;gap:6px;}"
@@ -1120,7 +1276,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           ".hidden{display:none !important;}";
   html += "@media(max-width:840px){.badge-grid,.color-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}";
   html += "@media(max-width:640px){body{padding:16px;} .title{font-size:28px;} .badge-grid,.grid-2,.grid-3,.color-grid"
-          "{grid-template-columns:1fr;} .hero,.section,.footer-card{padding:18px;}}";
+          "{grid-template-columns:1fr;} .hero,.footer-card{padding:18px;} .hero-brand{gap:10px;} .eyebrow{font-size:16px;}"
+          ".section-summary{padding:18px;flex-direction:column;}"
+          ".section-summary-side{width:100%;justify-content:space-between;} .section-body{padding:0 18px 18px;}}";
   html += "</style></head><body><main>";
 
   const auto add_color_field = [&html](const char* id, const char* label, uint32_t color) {
@@ -1136,11 +1294,13 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   };
 
   html += "<section class=\"hero\">";
-  html += "<div class=\"hero-top\"><div class=\"eyebrow\">PrintSphere</div>";
+  html += "<div class=\"hero-top\"><div class=\"hero-brand\"><div class=\"eyebrow\">PrintSphere</div><a class=\"hero-version\" href=\"https://github.com/cptkirki/PrintSphere\" target=\"_blank\" rel=\"noopener noreferrer\">";
+  html += json_escape(kPortalReleaseVersion);
+  html += "</a></div>";
   html += "<h1 class=\"title\">Web Config</h1>";
   html += "<p class=\"subtitle\">";
   html += show_connection_steps
-              ? "The ESP is on your home network. You can now finish the full setup with cloud, local printer access and UI tuning."
+              ? "The ESP is on your home network. You can manage cloud access, local printer access and UI tuning below."
               : "In setup AP mode this page only asks for your home Wi-Fi. Save it, let the ESP reboot, then reopen the portal on the home-network IP.";
   html += "</p></div>";
   html += "<div class=\"badge-grid\">";
@@ -1153,15 +1313,17 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "</div>";
   html += "<div class=\"hint-box\"><strong>Note:</strong> ";
   html += show_connection_steps
-              ? "Wi-Fi is up. You can connect Bambu Cloud and the local MQTT path now without rebooting."
+              ? "Wi-Fi is up. Review or update cloud, local printer access and UI settings below."
               : "Only the Wi-Fi step is available while the ESP is running its setup access point.";
   html += "</div>";
   html += "</section>";
 
   html += "<form id=\"config-form\" class=\"stack\">";
 
-  html += "<section class=\"section\">";
-  html += "<div class=\"section-head\"><h2>Step 1 - Wi-Fi</h2><p>This network is used for cloud access, local printer access and the setup portal after first boot.</p></div>";
+  begin_collapsible_section(
+      "Wi-Fi",
+      "This network is used for cloud access, local printer access and the setup portal after first boot.",
+      wifi_section_badge_value, wifi_section_badge_class, wifi_section_open);
   html += "<div class=\"grid-2\">";
   html += "<div class=\"field\"><label for=\"wifi_ssid\">Wi-Fi SSID</label><input id=\"wifi_ssid\" value=\"";
   html += json_escape(wifi.ssid);
@@ -1178,10 +1340,16 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "<p class=\"micro\">Current network status: <span id=\"wifi-detail\">";
   html += json_escape(wifi_badge_value);
   html += "</span></p>";
-  html += "</section>";
+  end_collapsible_section();
 
-  html += "<section class=\"section\">";
-  html += "<div class=\"section-head\"><h2>Screen Rotation</h2><p>Uses the board's hardware display rotation and keeps touch aligned with it. Changing it restarts the ESP.</p></div>";
+  if (show_connection_steps) {
+    html += "<div class=\"grid-2\">";
+  }
+
+  begin_collapsible_section(
+      "Screen Rotation",
+      "Uses the board's hardware display rotation and keeps touch aligned with it. Changing it restarts the ESP.",
+      rotation_section_badge_value, "info", rotation_section_open);
   html += "<div class=\"field\"><label for=\"display_rotation\">Screen Rotation</label><select id=\"display_rotation\">";
   html += "<option value=\"0\"";
   if (display_rotation == DisplayRotation::k0) {
@@ -1208,11 +1376,13 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "<p class=\"micro\">Current orientation: ";
   html += json_escape(display_rotation_badge_value(display_rotation));
   html += "</p>";
-  html += "</section>";
+  end_collapsible_section();
 
   if (show_connection_steps) {
-    html += "<section class=\"section\">";
-    html += "<div class=\"section-head\"><h2>Connection Mode</h2><p>This decides which printer path drives the UI. Changing it needs a reboot because the active runtime wiring changes between cloud, local and hybrid.</p></div>";
+    begin_collapsible_section(
+        "Connection Mode",
+        "This decides which printer path drives the UI. Changing it needs a reboot because the active runtime wiring changes between cloud, local and hybrid.",
+        source_badge_value, "info", connection_mode_section_open);
     html += "<div class=\"field\"><label for=\"source_mode\">Connection Mode</label><select id=\"source_mode\">";
     html += "<option value=\"hybrid\"";
     if (source_mode == SourceMode::kHybrid) {
@@ -1231,13 +1401,42 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += ">Local only</option></select></div>";
     html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"source-mode-apply-button\">Apply + Restart</button>";
     html += "<div class=\"micro hidden\" id=\"source-mode-apply-hint\">A mode change rewires the active clients, so the ESP restarts right away after saving it.</div></div>";
-    html += "</section>";
+    end_collapsible_section();
+    html += "</div>";
   }
 
+  begin_collapsible_section(
+      "Portal Access",
+      "Controls whether the setup portal requires a 6-digit PIN on your home network after provisioning is complete.",
+      portal_lock_badge_value, portal_lock_badge_class, portal_access_section_open);
+  html += "<div class=\"field\"><label for=\"portal_lock_enabled\">Portal Lock</label><select id=\"portal_lock_enabled\">";
+  html += "<option value=\"true\"";
+  if (portal_lock_enabled) {
+    html += " selected";
+  }
+  html += ">Enabled: require PIN unlock on the home network</option>";
+  html += "<option value=\"false\"";
+  if (!portal_lock_enabled) {
+    html += " selected";
+  }
+  html += ">Disabled: keep the portal open on the home network</option></select></div>";
+  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"portal-access-apply-button\">Apply + Restart</button>";
+  html += "<div class=\"micro hidden\" id=\"portal-access-apply-hint\">Portal access changes apply after the ESP restarts so the new lock mode is active immediately.</div></div>";
+  html += "<div class=\"hint-box\"><strong>Security:</strong> ";
+  html += setup_ap_active
+              ? "The portal always stays open while the setup access point is active."
+              : (portal_lock_enabled
+                     ? "Long-press on the device display to show a temporary 6-digit unlock PIN whenever you need browser access."
+                     : "With the PIN lock disabled, anyone on the same home network can open Web Config without the device-generated PIN.");
+  html += "</div>";
+  html += "<p class=\"micro\">The lock never applies while PrintSphere is still in setup AP mode.</p>";
+  end_collapsible_section();
+
   if (show_connection_steps) {
-    html += "<section class=\"section\">";
-    html += "<div class=\"section-head\"><h2>Step 2 - Bambu Cloud</h2><p>Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. "
-            "Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.</p></div>";
+    begin_collapsible_section(
+        "Bambu Cloud",
+        "Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.",
+        cloud_badge_value, cloud_badge_class, cloud_section_open);
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email</label><input id=\"cloud_email\" value=\"";
     html += json_escape(cloud.email);
@@ -1282,12 +1481,14 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += "\" id=\"cloud-verify-note\">";
     html += json_escape(cloud_code_note);
     html += "</p>";
-    html += "</section>";
+    end_collapsible_section();
   }
 
   if (show_connection_steps) {
-    html += "<section class=\"section\">";
-    html += "<div class=\"section-head\"><h2>Step 3 - Local Printer Path</h2><p>The local MQTT path provides live status, layers, temperatures and also powers camera snapshots on page 3.</p></div>";
+    begin_collapsible_section(
+        "Local Printer Path",
+        "The local MQTT path provides live status, layers, temperatures and also powers camera snapshots on page 3.",
+        local_badge_value, local_badge_class, local_section_open);
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"printer_host\">Printer IP or Hostname</label><input id=\"printer_host\" value=\"";
     html += json_escape(printer.host);
@@ -1305,13 +1506,14 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"local-connect-button\">Connect Local</button>";
     html += "<div class=\"micro\">This saves the local printer credentials immediately. In Hybrid and Local only it also reconnects MQTT and camera without rebooting.</div></div>";
     html += "<p class=\"micro\">In Hybrid mode PrintSphere auto-picks the better status path for your printer and still uses the local camera when available.</p>";
-    html += "</section>";
+    end_collapsible_section();
   }
 
   if (show_connection_steps) {
-    html += "<section class=\"section\">";
-    html += "<div class=\"section-head\"><h2>Arc Colors</h2><p>These groups control ring colors, pulsing states and status colors in the UI. "
-            "The values map directly to your native PrintSphere interface.</p></div>";
+    begin_collapsible_section(
+        "Arc Colors",
+        "These groups control ring colors, pulsing states and status colors in the UI. The values map directly to your native PrintSphere interface.",
+        arc_badge_value, arc_badge_class, arc_section_open);
     html += "<p class=\"micro\">Color changes preview live immediately and are saved automatically. No restart is needed for color tuning.</p>";
     html += "<div class=\"color-grid\">";
     add_color_field("arc_printing", "Printing", arc_colors.printing);
@@ -1328,7 +1530,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     add_color_field("arc_offline", "Offline", arc_colors.offline);
     add_color_field("arc_unknown", "Fallback", arc_colors.unknown);
     html += "</div>";
-    html += "</section>";
+    end_collapsible_section();
   }
 
   html += "<section class=\"footer-card\">";
@@ -1358,6 +1560,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const displayRotationSelect=document.getElementById('display_rotation');";
   html += "const displayRotationApplyButton=document.getElementById('display-rotation-apply-button');";
   html += "const displayRotationApplyHint=document.getElementById('display-rotation-apply-hint');";
+  html += "const portalLockSelect=document.getElementById('portal_lock_enabled');";
+  html += "const portalAccessApplyButton=document.getElementById('portal-access-apply-button');";
+  html += "const portalAccessApplyHint=document.getElementById('portal-access-apply-hint');";
   html += "const sourceModeSelect=document.getElementById('source_mode');";
   html += "const sourceModeApplyButton=document.getElementById('source-mode-apply-button');";
   html += "const sourceModeApplyHint=document.getElementById('source-mode-apply-hint');";
@@ -1385,7 +1590,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += to_string(source_mode);
   html += "\",display_rotation:\"";
   html += to_string(display_rotation);
-  html += "\",printer_host:\"";
+  html += "\",portal_lock_enabled:";
+  html += portal_lock_enabled ? "true" : "false";
+  html += ",printer_host:\"";
   html += json_escape(printer.host);
   html += "\",printer_serial:\"";
   html += json_escape(effective_printer_serial);
@@ -1471,8 +1678,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "renderLocalStatus(body);"
           "if(Date.now()>statusLockUntil){"
           "if(body.wifi_connected){if(body.cloud_status_line){setStatus(body.cloud_status_line,body.cloud_status_detail||body.cloud_detail||body.detail||'',0);}"
-          "else{const stage=cloudSetupStage(body);setStatus(trimmedValue('cloud_email')||body.cloud_connected||cloudStageIsCodeRequired(stage)||cloudStageIsBusy(stage)?'Step 2: Connect Bambu Cloud':'Setup ready',body.cloud_detail||body.detail||('ESP on home network: '+(body.wifi_ip||'')),0);}}"
-          "else{setStatus('Step 1: Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}"
+          "else{const stage=cloudSetupStage(body);setStatus(trimmedValue('cloud_email')||body.cloud_connected||cloudStageIsCodeRequired(stage)||cloudStageIsBusy(stage)?'Connect Bambu Cloud':'Setup ready',body.cloud_detail||body.detail||('ESP on home network: '+(body.wifi_ip||'')),0);}}"
+          "else{setStatus('Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}"
           "return body;}";
   html += "async function forceHealthRefresh(){try{const response=await fetch('/api/health',{cache:'no-store'});"
           "if(!response.ok)return null;const body=await response.json();if(body.portal_locked){window.location.reload();return null;}"
@@ -1534,6 +1741,13 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "displayRotationApplyButton.classList.toggle('hidden',!changed);"
           "displayRotationApplyHint.classList.toggle('hidden',!changed);"
           "if(!changed){displayRotationApplyButton.disabled=false;}}";
+  html += "function updatePortalAccessControls(){"
+          "if(!portalLockSelect||!portalAccessApplyButton||!portalAccessApplyHint)return;"
+          "const selected=valueOf('portal_lock_enabled')==='true';"
+          "const changed=selected!==(savedConfig.portal_lock_enabled!==false);"
+          "portalAccessApplyButton.classList.toggle('hidden',!changed);"
+          "portalAccessApplyHint.classList.toggle('hidden',!changed);"
+          "if(!changed){portalAccessApplyButton.disabled=false;}}";
   html += "function updateCloudVerification(body){const note=document.getElementById('cloud-verify-note');"
           "const label=document.getElementById('cloud-verification-label');"
           "const input=document.getElementById('cloud_verification_code');"
@@ -1559,6 +1773,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "cloud_region:(document.getElementById('cloud_region')?valueOf('cloud_region'):savedConfig.cloud_region||'eu'),"
           "cloud_password:(document.getElementById('cloud_password')?valueOf('cloud_password'):''),"
           "display_rotation:(document.getElementById('display_rotation')?valueOf('display_rotation'):savedConfig.display_rotation)||'0',"
+          "portal_lock_enabled:(document.getElementById('portal_lock_enabled')?valueOf('portal_lock_enabled')==='true':savedConfig.portal_lock_enabled!==false),"
           "source_mode:(document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode)||'hybrid',"
           "printer_host:(document.getElementById('printer_host')?trimmedValue('printer_host'):savedConfig.printer_host),"
           "printer_serial:(document.getElementById('printer_serial')?trimmedValue('printer_serial'):savedConfig.printer_serial),"
@@ -1586,6 +1801,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(response.ok){savedConfig.display_rotation=display_rotation;updateDisplayRotationControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
           "else{setStatus(body.error||'Rotation change failed',body.detail||'The new display rotation could not be saved.',8000);displayRotationApplyButton.disabled=false;updateDisplayRotationControls();}}"
           "catch(error){setStatus('Rotation change failed','The request to the ESP could not be completed.',8000);displayRotationApplyButton.disabled=false;updateDisplayRotationControls();}});}";
+  html += "if(portalLockSelect){portalLockSelect.addEventListener('change',updatePortalAccessControls);}";
+  html += "if(portalAccessApplyButton){portalAccessApplyButton.addEventListener('click',async()=>{const portal_lock_enabled=valueOf('portal_lock_enabled')==='true';"
+          "if(portal_lock_enabled===(savedConfig.portal_lock_enabled!==false)){updatePortalAccessControls();return;}"
+          "portalAccessApplyButton.disabled=true;setStatus('Applying portal access...','Saving the new portal lock mode and restarting the ESP now.',15000);"
+          "try{const response=await fetch('/api/portal-access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({portal_lock_enabled})});"
+          "const body=await response.json().catch(()=>({}));"
+          "if(response.ok){savedConfig.portal_lock_enabled=portal_lock_enabled;updatePortalAccessControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
+          "else{setStatus(body.error||'Portal access change failed',body.detail||'The new portal access mode could not be saved.',8000);portalAccessApplyButton.disabled=false;updatePortalAccessControls();}}"
+          "catch(error){setStatus('Portal access change failed','The request to the ESP could not be completed.',8000);portalAccessApplyButton.disabled=false;updatePortalAccessControls();}});}";
   html += "if(sourceModeSelect){sourceModeSelect.addEventListener('change',updateSourceModeControls);}";
   html += "if(sourceModeApplyButton){sourceModeApplyButton.addEventListener('click',async()=>{const source_mode=valueOf('source_mode')||'hybrid';"
           "if(source_mode===(savedConfig.source_mode||'hybrid')){updateSourceModeControls();return;}"
@@ -1645,7 +1869,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "if(wifiScanButton){wifiScanButton.addEventListener('click',refreshWifiScan);}";
   html += "arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(!input)return;"
           "input.addEventListener('input',queueArcPreview);input.addEventListener('change',commitArcColors);});";
-  html += "updateDisplayRotationControls();updateSourceModeControls();updateHealth();healthTimer=setInterval(updateHealth,4000);window.addEventListener('beforeunload',()=>{if(healthTimer){clearInterval(healthTimer);healthTimer=null;}stopCloudFollowup();stopLocalFollowup();});";
+  html += "updateDisplayRotationControls();updatePortalAccessControls();updateSourceModeControls();updateHealth();healthTimer=setInterval(updateHealth,4000);window.addEventListener('beforeunload',()=>{if(healthTimer){clearInterval(healthTimer);healthTimer=null;}stopCloudFollowup();stopLocalFollowup();});";
   html += "</script>";
   html += "</main></body></html>";
 
@@ -1791,6 +2015,7 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
   const SourceMode source_mode = portal->config_store_.load_source_mode();
   const DisplayRotation display_rotation = portal->config_store_.load_display_rotation();
+  const bool portal_lock_enabled = portal->config_store_.load_portal_lock_enabled();
   const PrinterConnection printer = portal->config_store_.load_printer_config();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
   const BambuCloudSnapshot cloud_snapshot = portal->cloud_client_.snapshot();
@@ -1809,6 +2034,9 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   body += "\"display_rotation\":\"";
   body += to_string(display_rotation);
   body += "\",";
+  body += "\"portal_lock_enabled\":";
+  body += portal_lock_enabled ? "true" : "false";
+  body += ",";
   body += "\"state_source\":\"";
   body += to_string(source_mode);
   body += "\",";
@@ -1857,6 +2085,7 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
   const BambuCloudCredentials stored_cloud = portal->config_store_.load_cloud_credentials();
   const PrinterConnection stored_printer = portal->config_store_.load_printer_config();
   const std::string stored_cloud_access_token = portal->config_store_.load_cloud_access_token();
+  const bool stored_portal_lock_enabled = portal->config_store_.load_portal_lock_enabled();
 
   const WifiCredentials wifi = merge_wifi_credentials({
       .ssid = trim_copy(read_string_field(root, "wifi_ssid")),
@@ -1870,6 +2099,8 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
   }, stored_cloud);
   const SourceMode source_mode = parse_source_mode_field(root);
   const DisplayRotation display_rotation = parse_display_rotation_field(root);
+  const bool portal_lock_enabled =
+      read_bool_field(root, "portal_lock_enabled", stored_portal_lock_enabled);
 
   const PrinterConnection printer = merge_printer_connection({
       .host = trim_copy(read_string_field(root, "printer_host")),
@@ -1909,9 +2140,10 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
   }
 
   ESP_LOGI(kTag,
-           "Saving config: wifi_ssid=%s cloud_email_len=%u source_mode=%s local_host=%s serial_len=%u access_len=%u",
+           "Saving config: wifi_ssid=%s cloud_email_len=%u source_mode=%s portal_lock=%s local_host=%s serial_len=%u access_len=%u",
            wifi.ssid.c_str(), static_cast<unsigned int>(cloud.email.size()),
-           to_string(source_mode), printer.host.c_str(),
+           to_string(source_mode), portal_lock_enabled ? "enabled" : "disabled",
+           printer.host.c_str(),
            static_cast<unsigned int>(printer.serial.size()),
            static_cast<unsigned int>(printer.access_code.size()));
 
@@ -1922,6 +2154,8 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
                       "save source mode failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_display_rotation(display_rotation), kTag,
                       "save display rotation failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_portal_lock_enabled(portal_lock_enabled), kTag,
+                      "save portal lock failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_config(printer), kTag, "save printer failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_arc_color_scheme(arc_colors), kTag,
                       "save arc colors failed");
@@ -2037,6 +2271,39 @@ esp_err_t SetupPortal::handle_display_rotation_post(httpd_req_t* request) {
   ESP_LOGI(kTag, "Saving display rotation only: %s", to_string(rotation));
   ESP_RETURN_ON_ERROR(portal->config_store_.save_display_rotation(rotation), kTag,
                       "save display rotation failed");
+
+  if (!portal->reboot_requested_) {
+    portal->reboot_requested_ = true;
+    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  }
+
+  send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_portal_access_post(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) {
+    return parse_err;
+  }
+
+  const bool current_enabled = portal->config_store_.load_portal_lock_enabled();
+  const bool portal_lock_enabled = read_bool_field(root, "portal_lock_enabled", current_enabled);
+  cJSON_Delete(root);
+
+  ESP_LOGI(kTag, "Saving portal access only: %s",
+           portal_lock_enabled ? "lock enabled" : "lock disabled");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_portal_lock_enabled(portal_lock_enabled), kTag,
+                      "save portal lock failed");
 
   if (!portal->reboot_requested_) {
     portal->reboot_requested_ = true;

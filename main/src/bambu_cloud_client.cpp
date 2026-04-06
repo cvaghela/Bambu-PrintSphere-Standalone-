@@ -13,6 +13,7 @@
 
 #include "cJSON.h"
 #include "printsphere/bambu_status.hpp"
+#include "printsphere/error_lookup.hpp"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_system.h"
@@ -535,6 +536,82 @@ bool json_int_like(const cJSON* item, int* value) {
   return false;
 }
 
+bool parse_uint64_text(const char* text, uint64_t* value) {
+  if (text == nullptr || value == nullptr) {
+    return false;
+  }
+
+  while (*text != '\0' && std::isspace(static_cast<unsigned char>(*text)) != 0) {
+    ++text;
+  }
+  const char* start = text;
+  if (*start == '\0') {
+    return false;
+  }
+
+  const char* digits = start;
+  if (*digits == '+') {
+    ++digits;
+  }
+  if (*digits == '\0') {
+    return false;
+  }
+
+  bool all_hex = true;
+  size_t digit_count = 0;
+  for (const char* cursor = digits; *cursor != '\0'; ++cursor) {
+    if (std::isspace(static_cast<unsigned char>(*cursor)) != 0) {
+      break;
+    }
+    if (std::isxdigit(static_cast<unsigned char>(*cursor)) == 0) {
+      all_hex = false;
+      break;
+    }
+    ++digit_count;
+  }
+
+  const bool explicit_hex = (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'));
+  const int base = (explicit_hex || (all_hex && digit_count >= 8U)) ? 16 : 10;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(start, &end, base);
+  if (end == nullptr || end == start) {
+    return false;
+  }
+  *value = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+bool json_uint64_like(const cJSON* item, uint64_t* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+  if (cJSON_IsNumber(item)) {
+    if (item->valuedouble < 0.0) {
+      return false;
+    }
+    *value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+  }
+  if (cJSON_IsString(item) && item->valuestring != nullptr) {
+    return parse_uint64_text(item->valuestring, value);
+  }
+  return false;
+}
+
+bool json_uint64_field_local(const cJSON* object, std::initializer_list<const char*> keys,
+                             uint64_t* value) {
+  if (object == nullptr || value == nullptr) {
+    return false;
+  }
+  for (const char* key : keys) {
+    const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (json_uint64_like(item, value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int json_int_local(const cJSON* object, const char* key, int fallback) {
   if (object == nullptr || key == nullptr) {
     return fallback;
@@ -679,6 +756,19 @@ int count_hms_entries(const cJSON* item) {
     return cJSON_GetArraySize(item);
   }
   if (cJSON_IsObject(item)) {
+    uint64_t direct_code = 0;
+    if (json_uint64_field_local(item, {"ecode", "hms_code", "hmsCode", "full_code", "fullCode"},
+                                &direct_code) &&
+        direct_code > 0xFFFFFFFFULL) {
+      return 1;
+    }
+    uint64_t attr = 0;
+    uint64_t code = 0;
+    if (json_uint64_field_local(item, {"attr", "hms_attr", "hmsAttr"}, &attr) &&
+        json_uint64_field_local(item, {"code", "err_code", "errCode", "alarm_code", "alarmCode"},
+                                &code)) {
+      return 1;
+    }
     int count = 0;
     for (const cJSON* child = item->child; child != nullptr; child = child->next) {
       ++count;
@@ -688,6 +778,114 @@ int count_hms_entries(const cJSON* item) {
   int value = 0;
   return json_int_like(item, &value) ? value : 0;
 }
+
+void append_unique_hms_code(std::vector<uint64_t>* codes, uint64_t hms_code) {
+  if (codes == nullptr || hms_code == 0) {
+    return;
+  }
+  if (std::find(codes->begin(), codes->end(), hms_code) == codes->end()) {
+    codes->push_back(hms_code);
+  }
+}
+
+bool extract_hms_code_from_node(const cJSON* item, uint64_t* hms_code) {
+  if (item == nullptr || hms_code == nullptr) {
+    return false;
+  }
+
+  uint64_t direct_code = 0;
+  if (json_uint64_like(item, &direct_code) && direct_code > 0xFFFFFFFFULL) {
+    *hms_code = direct_code;
+    return true;
+  }
+
+  if (!cJSON_IsObject(item)) {
+    return false;
+  }
+
+  if (json_uint64_field_local(item, {"ecode", "hms_code", "hmsCode", "full_code", "fullCode"},
+                              &direct_code) &&
+      direct_code > 0xFFFFFFFFULL) {
+    *hms_code = direct_code;
+    return true;
+  }
+
+  uint64_t attr = 0;
+  uint64_t code = 0;
+  const bool have_attr = json_uint64_field_local(item, {"attr", "hms_attr", "hmsAttr"}, &attr);
+  const bool have_code = json_uint64_field_local(
+      item, {"code", "err_code", "errCode", "alarm_code", "alarmCode"}, &code);
+  if (have_attr && have_code) {
+    *hms_code = ((attr & 0xFFFFFFFFULL) << 32U) | (code & 0xFFFFFFFFULL);
+    return true;
+  }
+
+  if (json_uint64_field_local(item, {"code", "err_code", "errCode", "alarm_code", "alarmCode"},
+                              &direct_code) &&
+      direct_code > 0xFFFFFFFFULL) {
+    *hms_code = direct_code;
+    return true;
+  }
+
+  return false;
+}
+
+std::vector<uint64_t> extract_hms_codes_from_node(const cJSON* item) {
+  std::vector<uint64_t> codes;
+  if (item == nullptr) {
+    return codes;
+  }
+
+  if (cJSON_IsArray(item)) {
+    const int count = cJSON_GetArraySize(item);
+    for (int i = 0; i < count; ++i) {
+      uint64_t hms_code = 0;
+      if (extract_hms_code_from_node(cJSON_GetArrayItem(item, i), &hms_code)) {
+        append_unique_hms_code(&codes, hms_code);
+      }
+    }
+    return codes;
+  }
+
+  uint64_t direct_code = 0;
+  if (extract_hms_code_from_node(item, &direct_code)) {
+    append_unique_hms_code(&codes, direct_code);
+    return codes;
+  }
+
+  if (cJSON_IsObject(item)) {
+    for (const cJSON* child = item->child; child != nullptr; child = child->next) {
+      uint64_t hms_code = 0;
+      if (extract_hms_code_from_node(child, &hms_code)) {
+        append_unique_hms_code(&codes, hms_code);
+      }
+    }
+  }
+
+  return codes;
+}
+
+const cJSON* find_direct_hms_container(const cJSON* source) {
+  if (source == nullptr) {
+    return nullptr;
+  }
+
+  const char* keys[] = {"hms", "hms_list", "hmsList", "hms_errors",
+                        "hmsErrors", "hms_alerts", "hmsAlerts"};
+  for (const char* key : keys) {
+    const cJSON* item = cJSON_GetObjectItemCaseSensitive(source, key);
+    if (item != nullptr) {
+      return item;
+    }
+  }
+  return nullptr;
+}
+
+struct ParsedHmsAlertState {
+  bool present = false;
+  int count = 0;
+  std::vector<uint64_t> codes;
+};
 
 bool find_hms_count_recursive(const cJSON* node, int* count, int depth = 0) {
   if (node == nullptr || count == nullptr || depth > 12) {
@@ -722,26 +920,9 @@ bool find_hms_count_recursive(const cJSON* node, int* count, int depth = 0) {
   return false;
 }
 
-std::string format_error_detail(int print_error_code, int hms_count) {
-  if (print_error_code == 0 && hms_count == 0) {
-    return {};
-  }
-
-  char error_buffer[32] = {};
-  if (print_error_code != 0) {
-    std::snprintf(error_buffer, sizeof(error_buffer), "%08X", print_error_code);
-    std::string detail = "Print error ";
-    detail += std::string(error_buffer, 4);
-    detail += "_";
-    detail += std::string(error_buffer + 4, 4);
-    if (hms_count > 0) {
-      detail += " + HMS ";
-      detail += std::to_string(hms_count);
-    }
-    return detail;
-  }
-
-  return "HMS alerts: " + std::to_string(hms_count);
+std::string format_error_detail(int print_error_code, const std::vector<uint64_t>& hms_codes,
+                                int hms_count, PrinterModel model) {
+  return format_resolved_error_detail(print_error_code, hms_codes, hms_count, model);
 }
 
 bool is_chamber_light_node(const std::string& node) {
@@ -1248,26 +1429,19 @@ int extract_cloud_print_error_code(const cJSON* item, int fallback) {
   return fallback;
 }
 
-int extract_live_hms_count(const cJSON* item, int fallback) {
+ParsedHmsAlertState extract_live_hms_state(const cJSON* item) {
   const cJSON* item_print = child_object_local(item, "print");
+  ParsedHmsAlertState parsed{};
   for (const cJSON* source : {item, item_print}) {
     if (source == nullptr) {
       continue;
     }
 
-    const cJSON* direct_arrays[] = {
-        cJSON_GetObjectItemCaseSensitive(source, "hms"),
-        cJSON_GetObjectItemCaseSensitive(source, "hms_list"),
-        cJSON_GetObjectItemCaseSensitive(source, "hmsList"),
-        cJSON_GetObjectItemCaseSensitive(source, "hms_errors"),
-        cJSON_GetObjectItemCaseSensitive(source, "hmsErrors"),
-        cJSON_GetObjectItemCaseSensitive(source, "hms_alerts"),
-        cJSON_GetObjectItemCaseSensitive(source, "hmsAlerts"),
-    };
-    for (const cJSON* array : direct_arrays) {
-      if (array != nullptr) {
-        return count_hms_entries(array);
-      }
+    if (const cJSON* direct = find_direct_hms_container(source); direct != nullptr) {
+      parsed.present = true;
+      parsed.count = count_hms_entries(direct);
+      parsed.codes = extract_hms_codes_from_node(direct);
+      return parsed;
     }
 
     const int direct_count = json_int_local(
@@ -1276,23 +1450,34 @@ int extract_live_hms_count(const cJSON* item, int fallback) {
                        json_int_local(source, "hms_alert_count",
                                       json_int_local(source, "hmsAlertCount", -1))));
     if (direct_count >= 0) {
-      return direct_count;
+      parsed.present = true;
+      parsed.count = direct_count;
+      return parsed;
     }
 
     const cJSON* device = child_object_local(source, "device");
     if (device != nullptr) {
+      if (const cJSON* device_hms = find_direct_hms_container(device); device_hms != nullptr) {
+        parsed.present = true;
+        parsed.count = count_hms_entries(device_hms);
+        parsed.codes = extract_hms_codes_from_node(device_hms);
+        return parsed;
+      }
+
       const int device_count = json_int_local(
           device, "hms_count",
           json_int_local(device, "hmsCount",
                          json_int_local(device, "hms_alert_count",
                                         json_int_local(device, "hmsAlertCount", -1))));
       if (device_count >= 0) {
-        return device_count;
+        parsed.present = true;
+        parsed.count = device_count;
+        return parsed;
       }
     }
   }
 
-  return fallback;
+  return parsed;
 }
 
 int extract_cloud_hms_count(const cJSON* item, int fallback) {
@@ -1568,6 +1753,7 @@ void BambuCloudClient::apply_cloud_session_state(bool configured, bool connected
     live.current_layer = 0;
     live.total_layers = 0;
     live.print_error_code = 0;
+    live.hms_codes.clear();
     live.hms_alert_count = 0;
     live.has_error = false;
     live.chamber_light_pending = false;
@@ -1623,6 +1809,11 @@ void BambuCloudClient::publish_combined_snapshot() {
   current.preview_url = rest.preview_url;
   current.preview_blob = rest.preview_blob;
   current.preview_title = rest.preview_title;
+  current.print_error_code = 0;
+  current.hms_codes.clear();
+  current.hms_alert_count = 0;
+  current.has_error = false;
+  current.non_error_stop = false;
 
   if (live_has_recent_state && live.last_update_ms != 0) {
     current.last_update_ms = live.last_update_ms;
@@ -1655,6 +1846,7 @@ void BambuCloudClient::publish_combined_snapshot() {
     current.current_layer = live.current_layer;
     current.total_layers = live.total_layers;
     current.print_error_code = live.print_error_code;
+    current.hms_codes = live.hms_codes;
     current.hms_alert_count = live.hms_alert_count;
     current.lifecycle = live.lifecycle;
     current.has_error = live.has_error;
@@ -2180,10 +2372,15 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       runtime.chamber_temp_last_update_ms = runtime.last_update_ms;
     }
 
-    runtime.print_error_code =
-        normalize_cloud_print_error_code(extract_cloud_print_error_code(print, runtime.print_error_code));
-    runtime.hms_alert_count = static_cast<uint16_t>(
-        std::max(extract_live_hms_count(print, runtime.hms_alert_count), 0));
+    runtime.print_error_code = normalize_cloud_print_error_code(
+        extract_cloud_print_error_code(print, runtime.print_error_code));
+    const ParsedHmsAlertState hms_state = extract_live_hms_state(print);
+    if (hms_state.present) {
+      runtime.hms_alert_count = static_cast<uint16_t>(std::max(hms_state.count, 0));
+      if (!hms_state.codes.empty() || hms_state.count == 0) {
+        runtime.hms_codes = hms_state.codes;
+      }
+    }
 
     // When a healthy (non-error) status update arrives, clear stale error indicators that
     // were carried over from previous payloads via the fallback mechanism.  Cloud MQTT sends
@@ -2199,8 +2396,8 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       if (explicit_error == -1 && runtime.print_error_code != 0) {
         runtime.print_error_code = 0;
       }
-      const int explicit_hms = extract_live_hms_count(print, -1);
-      if (explicit_hms == -1 && runtime.hms_alert_count > 0) {
+      if (!hms_state.present && (runtime.hms_alert_count > 0 || !runtime.hms_codes.empty())) {
+        runtime.hms_codes.clear();
         runtime.hms_alert_count = 0;
       }
     }
@@ -2208,9 +2405,9 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     if (has_status_update) {
       runtime.non_error_stop = cloud_status_is_non_error_stop(status_text, runtime.print_error_code,
                                                               runtime.hms_alert_count);
-      runtime.has_error = (!runtime.non_error_stop &&
-                           runtime.lifecycle == PrintLifecycleState::kError) ||
-                          runtime.print_error_code != 0 || runtime.hms_alert_count > 0U;
+      runtime.has_error =
+          (!runtime.non_error_stop && runtime.lifecycle == PrintLifecycleState::kError) ||
+          runtime.print_error_code != 0;
     } else {
       // Cloud push_status often arrives as partial updates. If a packet has no status/stage,
       // preserve the last known lifecycle/error interpretation instead of re-arming a stale FAIL.
@@ -2226,8 +2423,8 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       runtime.chamber_light_pending_since_ms = 0;
     }
 
-    const std::string error_detail =
-        format_error_detail(runtime.print_error_code, runtime.hms_alert_count);
+    const std::string error_detail = format_error_detail(
+        runtime.print_error_code, runtime.hms_codes, runtime.hms_alert_count, runtime.model);
     if (!error_detail.empty()) {
       copy_text(&runtime.detail, error_detail);
     } else if (has_text(runtime.stage)) {

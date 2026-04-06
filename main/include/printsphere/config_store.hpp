@@ -88,6 +88,7 @@ class ConfigStore {
   std::string load_cloud_access_token() const;
   SourceMode load_source_mode() const;
   DisplayRotation load_display_rotation() const;
+  bool load_portal_lock_enabled() const;
   PrinterConnection load_printer_config() const;
   ArcColorScheme load_arc_color_scheme() const;
 
@@ -97,6 +98,7 @@ class ConfigStore {
   esp_err_t clear_cloud_access_token() const;
   esp_err_t save_source_mode(SourceMode mode) const;
   esp_err_t save_display_rotation(DisplayRotation rotation) const;
+  esp_err_t save_portal_lock_enabled(bool enabled) const;
   esp_err_t save_printer_config(const PrinterConnection& connection) const;
   esp_err_t save_arc_color_scheme(const ArcColorScheme& colors) const;
 

@@ -43,6 +43,7 @@ class PrinterClient {
     uint16_t current_layer = 0;
     uint16_t total_layers = 0;
     int print_error_code = 0;
+    std::vector<uint64_t> hms_codes;
     uint16_t hms_alert_count = 0;
     bool local_configured = false;
     bool local_connected = false;
@@ -81,7 +82,8 @@ class PrinterClient {
                                                   bool has_concrete_error);
   static std::string stage_label_for(const std::string& gcode_state, int stage_id,
                                      bool has_concrete_error);
-  static std::string error_detail_for(int print_error_code, int hms_count);
+  static std::string error_detail_for(int print_error_code, const std::vector<uint64_t>& hms_codes,
+                                      int hms_count, PrinterModel model);
   static std::string preview_hint_for(const std::string& gcode_file);
   static std::string trim_job_name(const std::string& name);
   static float json_number(const cJSON* object, const char* key, float fallback);

@@ -17,6 +17,7 @@ namespace printsphere {
 class Ui;
 
 struct PortalAccessSnapshot {
+  bool lock_enabled = true;
   bool request_authorized = false;
   bool session_active = false;
   bool pin_active = false;
@@ -55,6 +56,7 @@ class SetupPortal {
   static esp_err_t handle_arc_update(httpd_req_t* request, bool persist);
   static esp_err_t handle_source_mode_post(httpd_req_t* request);
   static esp_err_t handle_display_rotation_post(httpd_req_t* request);
+  static esp_err_t handle_portal_access_post(httpd_req_t* request);
   static esp_err_t handle_cloud_connect(httpd_req_t* request);
   static esp_err_t handle_cloud_verify(httpd_req_t* request);
   static esp_err_t handle_local_connect(httpd_req_t* request);
@@ -67,6 +69,7 @@ class SetupPortal {
   void prune_access_state_locked(uint64_t now_ms);
   static std::string generate_unlock_pin();
   static std::string generate_session_token();
+  bool is_lock_enabled() const;
 
   ConfigStore& config_store_;
   const WifiManager& wifi_manager_;

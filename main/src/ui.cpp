@@ -1030,7 +1030,8 @@ bool Ui::consume_portal_unlock_request() {
   return portal_unlock_requested_.exchange(false);
 }
 
-void Ui::set_portal_access_state(bool request_authorized, bool session_active, bool pin_active,
+void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
+                                 bool session_active, bool pin_active,
                                  const std::string& pin_code, uint32_t pin_remaining_s,
                                  uint32_t session_remaining_s) {
   if (!initialized_) {
@@ -1042,6 +1043,7 @@ void Ui::set_portal_access_state(bool request_authorized, bool session_active, b
     return;
   }
 
+  portal_lock_enabled_ = lock_enabled;
   portal_request_authorized_ = request_authorized;
   portal_session_active_ = session_active;
   portal_pin_active_ = pin_active;
@@ -1072,6 +1074,9 @@ void Ui::set_portal_access_state(bool request_authorized, bool session_active, b
           short_duration_text(std::max<uint32_t>(portal_session_remaining_s_, 1U));
     } else if (provisioning_context) {
       portal_hint_text_.clear();
+    } else if (!portal_lock_enabled_) {
+      portal_hint_text_ =
+          station_portal_available ? ("Open " + last_snapshot_.wifi_ip) : "Web Config open";
     } else if (portal_hint_boot_ms_ != 0 &&
                static_cast<uint64_t>(esp_timer_get_time() / 1000ULL) <
                    portal_hint_boot_ms_ + kPortalHintIntroMs) {

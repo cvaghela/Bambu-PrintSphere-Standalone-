@@ -10,6 +10,7 @@
 
 #include "cJSON.h"
 #include "printsphere/bambu_status.hpp"
+#include "printsphere/error_lookup.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -65,6 +66,244 @@ std::string text_string(const std::array<char, N>& value) {
 template <size_t N>
 bool has_text(const std::array<char, N>& value) {
   return value[0] != '\0';
+}
+
+bool parse_int_text_local(const char* text, int* value) {
+  if (text == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const char* start = text;
+  while (*start != '\0' && std::isspace(static_cast<unsigned char>(*start)) != 0) {
+    ++start;
+  }
+  if (*start == '\0') {
+    return false;
+  }
+
+  const char* digits = start;
+  if (*digits == '+' || *digits == '-') {
+    ++digits;
+  }
+
+  bool all_hex = *digits != '\0';
+  size_t digit_count = 0;
+  for (const char* cursor = digits; *cursor != '\0'; ++cursor) {
+    if (std::isspace(static_cast<unsigned char>(*cursor)) != 0) {
+      break;
+    }
+    if (std::isxdigit(static_cast<unsigned char>(*cursor)) == 0) {
+      all_hex = false;
+      break;
+    }
+    ++digit_count;
+  }
+
+  const bool explicit_hex = (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'));
+  const int base = (explicit_hex || (all_hex && digit_count >= 8U)) ? 16 : 10;
+  char* end = nullptr;
+  const long parsed = std::strtol(start, &end, base);
+  if (end == nullptr || end == start) {
+    return false;
+  }
+
+  *value = static_cast<int>(parsed);
+  return true;
+}
+
+bool parse_uint64_text_local(const char* text, uint64_t* value) {
+  if (text == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const char* start = text;
+  while (*start != '\0' && std::isspace(static_cast<unsigned char>(*start)) != 0) {
+    ++start;
+  }
+  if (*start == '\0') {
+    return false;
+  }
+
+  const char* digits = start;
+  if (*digits == '+') {
+    ++digits;
+  }
+
+  bool all_hex = *digits != '\0';
+  size_t digit_count = 0;
+  for (const char* cursor = digits; *cursor != '\0'; ++cursor) {
+    if (std::isspace(static_cast<unsigned char>(*cursor)) != 0) {
+      break;
+    }
+    if (std::isxdigit(static_cast<unsigned char>(*cursor)) == 0) {
+      all_hex = false;
+      break;
+    }
+    ++digit_count;
+  }
+
+  const bool explicit_hex = (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'));
+  const int base = (explicit_hex || (all_hex && digit_count >= 8U)) ? 16 : 10;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(start, &end, base);
+  if (end == nullptr || end == start) {
+    return false;
+  }
+
+  *value = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+bool json_uint64_like_local(const cJSON* item, uint64_t* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+  if (cJSON_IsNumber(item)) {
+    if (item->valuedouble < 0.0) {
+      return false;
+    }
+    *value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+  }
+  if (cJSON_IsString(item) && item->valuestring != nullptr) {
+    return parse_uint64_text_local(item->valuestring, value);
+  }
+  return false;
+}
+
+bool json_uint64_field_local(const cJSON* object, std::initializer_list<const char*> keys,
+                             uint64_t* value) {
+  if (object == nullptr || value == nullptr) {
+    return false;
+  }
+  for (const char* key : keys) {
+    const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (json_uint64_like_local(item, value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int count_hms_entries_local(const cJSON* item) {
+  if (item == nullptr) {
+    return 0;
+  }
+  if (cJSON_IsArray(item)) {
+    return cJSON_GetArraySize(item);
+  }
+  if (cJSON_IsObject(item)) {
+    uint64_t direct_code = 0;
+    if (json_uint64_field_local(item, {"ecode", "hms_code", "hmsCode", "full_code", "fullCode"},
+                                &direct_code) &&
+        direct_code > 0xFFFFFFFFULL) {
+      return 1;
+    }
+    uint64_t attr = 0;
+    uint64_t code = 0;
+    if (json_uint64_field_local(item, {"attr", "hms_attr", "hmsAttr"}, &attr) &&
+        json_uint64_field_local(item, {"code", "err_code", "errCode", "alarm_code", "alarmCode"},
+                                &code)) {
+      return 1;
+    }
+    int count = 0;
+    for (const cJSON* child = item->child; child != nullptr; child = child->next) {
+      ++count;
+    }
+    return count;
+  }
+
+  if (cJSON_IsNumber(item)) {
+    return item->valueint;
+  }
+  int value = 0;
+  return parse_int_text_local(cJSON_IsString(item) ? item->valuestring : nullptr, &value) ? value : 0;
+}
+
+void append_unique_hms_code(std::vector<uint64_t>* codes, uint64_t hms_code) {
+  if (codes == nullptr || hms_code == 0) {
+    return;
+  }
+  if (std::find(codes->begin(), codes->end(), hms_code) == codes->end()) {
+    codes->push_back(hms_code);
+  }
+}
+
+bool extract_hms_code_local(const cJSON* item, uint64_t* hms_code) {
+  if (item == nullptr || hms_code == nullptr) {
+    return false;
+  }
+
+  uint64_t direct_code = 0;
+  if (json_uint64_like_local(item, &direct_code) && direct_code > 0xFFFFFFFFULL) {
+    *hms_code = direct_code;
+    return true;
+  }
+
+  if (!cJSON_IsObject(item)) {
+    return false;
+  }
+
+  if (json_uint64_field_local(item, {"ecode", "hms_code", "hmsCode", "full_code", "fullCode"},
+                              &direct_code) &&
+      direct_code > 0xFFFFFFFFULL) {
+    *hms_code = direct_code;
+    return true;
+  }
+
+  uint64_t attr = 0;
+  uint64_t code = 0;
+  const bool have_attr = json_uint64_field_local(item, {"attr", "hms_attr", "hmsAttr"}, &attr);
+  const bool have_code = json_uint64_field_local(
+      item, {"code", "err_code", "errCode", "alarm_code", "alarmCode"}, &code);
+  if (have_attr && have_code) {
+    *hms_code = ((attr & 0xFFFFFFFFULL) << 32U) | (code & 0xFFFFFFFFULL);
+    return true;
+  }
+
+  if (json_uint64_field_local(item, {"code", "err_code", "errCode", "alarm_code", "alarmCode"},
+                              &direct_code) &&
+      direct_code > 0xFFFFFFFFULL) {
+    *hms_code = direct_code;
+    return true;
+  }
+
+  return false;
+}
+
+std::vector<uint64_t> extract_hms_codes_local(const cJSON* item) {
+  std::vector<uint64_t> codes;
+  if (item == nullptr) {
+    return codes;
+  }
+
+  if (cJSON_IsArray(item)) {
+    const int count = cJSON_GetArraySize(item);
+    for (int i = 0; i < count; ++i) {
+      uint64_t hms_code = 0;
+      if (extract_hms_code_local(cJSON_GetArrayItem(item, i), &hms_code)) {
+        append_unique_hms_code(&codes, hms_code);
+      }
+    }
+    return codes;
+  }
+
+  uint64_t direct_code = 0;
+  if (extract_hms_code_local(item, &direct_code)) {
+    append_unique_hms_code(&codes, direct_code);
+    return codes;
+  }
+
+  if (cJSON_IsObject(item)) {
+    for (const cJSON* child = item->child; child != nullptr; child = child->next) {
+      uint64_t hms_code = 0;
+      if (extract_hms_code_local(child, &hms_code)) {
+        append_unique_hms_code(&codes, hms_code);
+      }
+    }
+  }
+
+  return codes;
 }
 
 bool tick_elapsed(uint32_t start_tick, uint32_t now_tick, TickType_t duration) {
@@ -804,6 +1043,7 @@ PrinterSnapshot PrinterClient::build_snapshot_from_runtime(
   snapshot.current_layer = runtime.current_layer;
   snapshot.total_layers = runtime.total_layers;
   snapshot.print_error_code = runtime.print_error_code;
+  snapshot.hms_codes = runtime.hms_codes;
   snapshot.hms_alert_count = runtime.hms_alert_count;
   snapshot.local_configured = runtime.local_configured;
   snapshot.local_connected = runtime.local_connected;
@@ -867,6 +1107,12 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       copy_text(&runtime.stage, "connected");
       copy_text(&runtime.detail, "Connected to local Bambu MQTT, waiting for subscribe ack");
       copy_text(&runtime.resolved_serial, active_serial);
+      runtime.print_error_code = 0;
+      runtime.hms_codes.clear();
+      runtime.hms_alert_count = 0;
+      runtime.has_error = false;
+      runtime.warn_hms = false;
+      runtime.print_active = false;
       runtime.non_error_stop = false;
       runtime.show_stop_banner = false;
       update_local_runtime_metadata(&runtime, true, true);
@@ -890,6 +1136,12 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       copy_text(&runtime.raw_stage, "");
       copy_text(&runtime.stage, "subscribed");
       copy_text(&runtime.detail, "MQTT subscribed, requesting printer sync");
+      runtime.print_error_code = 0;
+      runtime.hms_codes.clear();
+      runtime.hms_alert_count = 0;
+      runtime.has_error = false;
+      runtime.warn_hms = false;
+      runtime.print_active = false;
       runtime.non_error_stop = false;
       runtime.show_stop_banner = false;
       update_local_runtime_metadata(&runtime, true, true);
@@ -914,6 +1166,12 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       copy_text(&runtime.raw_status, "");
       copy_text(&runtime.raw_stage, "");
       copy_text(&runtime.detail, "MQTT disconnected, waiting for reconnect");
+      runtime.print_error_code = 0;
+      runtime.hms_codes.clear();
+      runtime.hms_alert_count = 0;
+      runtime.has_error = false;
+      runtime.warn_hms = false;
+      runtime.print_active = false;
       runtime.non_error_stop = false;
       runtime.show_stop_banner = false;
       update_local_runtime_metadata(&runtime, true, false);
@@ -974,7 +1232,12 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       copy_text(&runtime.raw_status, "");
       copy_text(&runtime.raw_stage, "");
       copy_text(&runtime.stage, "mqtt-error");
+      runtime.print_error_code = 0;
+      runtime.hms_codes.clear();
+      runtime.hms_alert_count = 0;
       runtime.has_error = true;
+      runtime.warn_hms = false;
+      runtime.print_active = false;
       runtime.non_error_stop = false;
       runtime.show_stop_banner = false;
 
@@ -1049,10 +1312,19 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
                               : json_int(print, "stg_cur", -1);
     const std::string stage_name =
         cJSON_IsObject(stage) ? json_string(stage, "name", json_string(stage, "stage", {})) : "";
-    const int print_error_code = json_int(print, "print_error", 0);
+    const cJSON* print_error_item = cJSON_GetObjectItemCaseSensitive(print, "print_error");
+    const bool has_print_error_update = print_error_item != nullptr;
+    const int print_error_code =
+        has_print_error_update ? json_int(print, "print_error", runtime.print_error_code)
+                               : runtime.print_error_code;
     const cJSON* hms = cJSON_GetObjectItemCaseSensitive(print, "hms");
-    const int hms_count = cJSON_IsArray(hms) ? cJSON_GetArraySize(hms) : 0;
-    const bool has_concrete_error = print_error_code != 0 || hms_count > 0;
+    const bool has_hms_update = hms != nullptr;
+    const int hms_count =
+        has_hms_update ? count_hms_entries_local(hms) : static_cast<int>(runtime.hms_alert_count);
+    const std::vector<uint64_t> parsed_hms_codes =
+        has_hms_update ? extract_hms_codes_local(hms) : runtime.hms_codes;
+    const bool has_hms_alert = !parsed_hms_codes.empty() || hms_count > 0;
+    const bool has_concrete_error = print_error_code != 0;
     const std::string resolved_stage =
         resolved_stage_from_payload(effective_gcode_state, stage_name, stage_id, has_concrete_error);
     const bool paused_state = is_paused_gcode_state(effective_gcode_state);
@@ -1122,10 +1394,16 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
       copy_text(&runtime.raw_stage, previous_raw_stage);
     }
     runtime.print_error_code = print_error_code;
-    runtime.hms_alert_count = static_cast<uint16_t>(std::max(hms_count, 0));
+    if (has_hms_update) {
+      runtime.hms_alert_count = static_cast<uint16_t>(std::max(hms_count, 0));
+      if (!parsed_hms_codes.empty() || hms_count == 0) {
+        runtime.hms_codes = parsed_hms_codes;
+      }
+    }
     runtime.has_error = has_concrete_error || paused_fault_latched;
     runtime.warn_hms = false;
-    runtime.non_error_stop = text_string(runtime.raw_status) == "FAILED" && !has_concrete_error;
+    runtime.non_error_stop = text_string(runtime.raw_status) == "FAILED" && !has_concrete_error &&
+                             !has_hms_alert;
     runtime.show_stop_banner = false;
     runtime.print_active = false;
     runtime.lifecycle = lifecycle_from_state(text_string(runtime.raw_status), has_concrete_error);
@@ -1148,7 +1426,9 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
       copy_text(&runtime.stage, previous_stage);
     }
 
-    const std::string error_detail = error_detail_for(print_error_code, hms_count);
+    const std::string error_detail =
+        error_detail_for(runtime.print_error_code, runtime.hms_codes, runtime.hms_alert_count,
+                         runtime.local_model);
     if (!error_detail.empty()) {
       copy_text(&runtime.detail, error_detail);
     } else if (paused_fault_latched && previous_pause_fault && !previous_detail.empty() &&
@@ -1179,7 +1459,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     if ((print_error_code != previous_print_error_code ||
          runtime.hms_alert_count != previous_hms_alert_count ||
          (fault_pause_signal && !previous_pause_fault)) &&
-        (has_concrete_error || paused_fault_latched)) {
+        (has_concrete_error || has_hms_alert || paused_fault_latched)) {
       ESP_LOGW(kTag, "Local printer alert: status=%s stage=%s stg_cur=%d print_error=%d hms=%u",
                text_string(runtime.raw_status).c_str(), text_string(runtime.stage).c_str(),
                stage_id, print_error_code, static_cast<unsigned int>(runtime.hms_alert_count));
@@ -1350,7 +1630,12 @@ void PrinterClient::task_loop() {
       copy_text(&runtime.job_name, "");
       copy_text(&runtime.gcode_file, "");
       copy_text(&runtime.resolved_serial, connection.serial);
+      runtime.print_error_code = 0;
+      runtime.hms_codes.clear();
+      runtime.hms_alert_count = 0;
       runtime.has_error = false;
+      runtime.warn_hms = false;
+      runtime.print_active = false;
       runtime.non_error_stop = false;
       runtime.show_stop_banner = false;
       update_local_runtime_metadata(&runtime, true, false);
@@ -1550,26 +1835,9 @@ std::string PrinterClient::stage_label_for(const std::string& gcode_state, int s
   return "Status";
 }
 
-std::string PrinterClient::error_detail_for(int print_error_code, int hms_count) {
-  if (print_error_code == 0 && hms_count == 0) {
-    return {};
-  }
-
-  char error_buffer[32] = {};
-  if (print_error_code != 0) {
-    std::snprintf(error_buffer, sizeof(error_buffer), "%08X", print_error_code);
-    std::string detail = "Print error ";
-    detail += std::string(error_buffer, 4);
-    detail += "_";
-    detail += std::string(error_buffer + 4, 4);
-    if (hms_count > 0) {
-      detail += " + HMS ";
-      detail += std::to_string(hms_count);
-    }
-    return detail;
-  }
-
-  return "HMS alerts: " + std::to_string(hms_count);
+std::string PrinterClient::error_detail_for(int print_error_code, const std::vector<uint64_t>& hms_codes,
+                                            int hms_count, PrinterModel model) {
+  return format_resolved_error_detail(print_error_code, hms_codes, hms_count, model);
 }
 
 std::string PrinterClient::trim_job_name(const std::string& name) {
@@ -1649,7 +1917,8 @@ int PrinterClient::json_int(const cJSON* object, const char* key, int fallback) 
     return item->valueint;
   }
   if (cJSON_IsString(item) && item->valuestring != nullptr) {
-    return std::atoi(item->valuestring);
+    int value = fallback;
+    return parse_int_text_local(item->valuestring, &value) ? value : fallback;
   }
 
   return fallback;

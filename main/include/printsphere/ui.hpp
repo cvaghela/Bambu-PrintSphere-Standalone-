@@ -32,9 +32,9 @@ class Ui {
   bool is_page2_active() const { return !scrolling_ && active_page_ == 1; }
   bool is_camera_page_active() const { return !scrolling_ && active_page_ == 2; }
   bool is_page_transition_active() const { return scrolling_; }
-  void set_portal_access_state(bool request_authorized, bool session_active, bool pin_active,
-                               const std::string& pin_code, uint32_t pin_remaining_s,
-                               uint32_t session_remaining_s);
+  void set_portal_access_state(bool lock_enabled, bool request_authorized, bool session_active,
+                               bool pin_active, const std::string& pin_code,
+                               uint32_t pin_remaining_s, uint32_t session_remaining_s);
   bool consume_camera_refresh_request();
   bool consume_chamber_light_toggle_request();
   bool consume_portal_unlock_request();
@@ -155,6 +155,7 @@ class Ui {
   bool logo_clickable_ = false;
   bool logo_recolor_enabled_ = false;
   uint32_t logo_recolor_hex_ = 0;
+  bool portal_lock_enabled_ = true;
   bool portal_request_authorized_ = false;
   bool portal_session_active_ = false;
   bool portal_pin_active_ = false;

@@ -41,6 +41,7 @@ bool hybrid_local_status_ready(const PrinterSnapshot& snapshot) {
          snapshot.total_layers > 0U || snapshot.nozzle_temp_c > 0.0f ||
          snapshot.bed_temp_c > 0.0f || snapshot.chamber_temp_c > 0.0f ||
          snapshot.secondary_nozzle_temp_c > 0.0f || snapshot.print_error_code != 0 ||
+         !snapshot.hms_codes.empty() ||
          snapshot.hms_alert_count > 0U;
 }
 
@@ -371,7 +372,8 @@ void Application::run() {
 
     resolve_ui_state(snapshot);
     ui_.apply_snapshot(snapshot);
-    ui_.set_portal_access_state(portal_access.request_authorized, portal_access.session_active,
+    ui_.set_portal_access_state(portal_access.lock_enabled,
+                                portal_access.request_authorized, portal_access.session_active,
                                 portal_access.pin_active, portal_access.pin_code,
                                 portal_access.pin_remaining_s, portal_access.session_remaining_s);
     last_local_print_live_ = local_print_is_live(local_snapshot);
