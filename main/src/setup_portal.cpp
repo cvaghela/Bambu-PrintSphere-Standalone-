@@ -2019,6 +2019,14 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
         "Debug Console",
         "Live ESP-IDF log stream captured on-device. Only available in debug builds.",
         "DBG", "idle", false);
+    html += "<div style=\"background:#161b22;border:1px solid #30363d;border-radius:8px;"
+            "padding:10px 14px;margin-bottom:12px;font-size:12.5px;line-height:1.6;"
+            "color:#8b949e;\">"
+            "&#x1F512;&nbsp;<strong style=\"color:#c9d1d9;\">Anonymised log</strong> &mdash; "
+            "IPs, MACs, Wi-Fi credentials, cloud tokens and pre-signed URLs are automatically "
+            "replaced before this log is written. The full log remains available on the serial "
+            "(UART) console for local debugging."
+            "</div>";
     html += "<div id=\"dbg-terminal\""
             " style=\"background:#0d1117;border:1px solid #21262d;border-radius:10px;"
             "height:320px;overflow-y:auto;padding:10px 12px;font-family:monospace;"
