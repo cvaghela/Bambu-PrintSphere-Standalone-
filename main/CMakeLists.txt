@@ -51,8 +51,9 @@ idf_component_register(
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PRINTSPHERE_RELEASE_VERSION="${PRINTSPHERE_RELEASE_VERSION}"
 )
-string(FIND "${PRINTSPHERE_RELEASE_VERSION}" "_debug" _debug_pos)
-if(_debug_pos GREATER -1)
+string(FIND "${PRINTSPHERE_RELEASE_VERSION}" "-debug" _debug_pos)
+string(FIND "${PRINTSPHERE_RELEASE_VERSION}" "_debug" _debug_pos2)
+if(_debug_pos GREATER -1 OR _debug_pos2 GREATER -1)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE PRINTSPHERE_DEBUG_BUILD=1)
 endif()
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra)

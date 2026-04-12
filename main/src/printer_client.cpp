@@ -1079,7 +1079,9 @@ bool PrinterClient::set_chamber_light(bool on) {
     return false;
   }
 
-  publish_request(kPushAll);
+  // No pushall here — the printer sends a status update automatically when the light changes.
+  // Sending pushall triggered a burst of ~30 full-status reports (1/sec) that spiked internal
+  // heap usage and starved DMA-capable memory needed by the SPI display driver.
 
   runtime.chamber_light_supported = true;
   runtime.chamber_light_state_known = true;
@@ -1639,6 +1641,21 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
           }
         }
         if (unit_count > runtime.ams->count) runtime.ams->count = unit_count;
+
+        // AMS tray diagnostics — log humidity, temperature, and per-tray details.
+        for (uint8_t u = 0; u < unit_count; ++u) {
+          const AmsUnitInfo& du = runtime.ams->units[u];
+          if (!du.present) continue;
+          ESP_LOGI(kTag, "[DIAG] ams unit=%d hum=%d%% temp=%.1f°C", u,
+                   du.humidity_pct, static_cast<double>(du.temperature_c));
+          for (int t = 0; t < kMaxAmsTrays; ++t) {
+            const AmsTrayInfo& dt = du.trays[t];
+            ESP_LOGI(kTag, "[DIAG]   tray[%d] present=%d type=%s color=0x%08X remain=%d%% active=%d",
+                     t, dt.present ? 1 : 0,
+                     dt.material_type.empty() ? "(-)" : dt.material_type.c_str(),
+                     (unsigned)dt.color_rgba, dt.remain_pct, dt.active ? 1 : 0);
+          }
+        }
       }
     }
 

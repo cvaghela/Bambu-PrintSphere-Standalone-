@@ -49,7 +49,6 @@ constexpr int kSwipeThresholdPx = 24;
 constexpr int kRotatedVisualOffsetX = 0;
 constexpr int kRotatedVisualOffsetY = 0;
 constexpr int kManualMinBrightnessPercent = 4;
-constexpr uint32_t kRingAnimationTickMs = 33U;
 constexpr uint8_t kRingPulseDepthPercent = 55U;
 constexpr uint32_t kDotPulseDurationMs = 1500U;
 constexpr int32_t kDotPulseOpaMin = 80;
@@ -64,7 +63,6 @@ constexpr uint64_t kPortalHintIntroMs = 5ULL * 60ULL * 1000ULL;
 constexpr uint32_t kCardRevealDurationMs = 300U;
 constexpr int32_t kCardRevealYStart = 28;
 constexpr uint32_t kCardRevealStaggerMs = 55U;
-constexpr uint32_t kPrintRotPeriodMs = 18000U;  // 18s per ambient sweep rotation
 constexpr uint32_t kRingBaseDark = 0x101010;
 constexpr uint32_t kRingIdleSolid = 0x404040;
 constexpr char kDegreeC[] = "\xC2\xB0""C";
@@ -103,11 +101,26 @@ class LvglLockGuard {
     locked_ = bsp_display_lock(timeout_ms) == ESP_OK;
     const uint32_t wait_ms = esp_log_timestamp() - before;
     if (!locked_) {
-      ESP_LOGW(kTag, "LVGL lock FAILED after %lums (timeout=%lu, caller=%s)",
-               (unsigned long)wait_ms, (unsigned long)timeout_ms, caller_);
-    } else if (wait_ms > 150) {
-      ESP_LOGW(kTag, "LVGL lock waited %lums (caller=%s)",
-               (unsigned long)wait_ms, caller_);
+      ESP_LOGW(kTag, "LVGL lock FAILED after %lums (timeout=%lu, caller=%s) "
+               "heap_int=%lu heap_dma=%lu",
+               (unsigned long)wait_ms, (unsigned long)timeout_ms, caller_,
+               (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA));
+      lock_fail_count_++;
+      if (lock_fail_count_ >= 5 && (lock_fail_count_ % 10) == 0) {
+        ESP_LOGE(kTag, "LVGL lock failed %lu times consecutively — worker task may be stuck",
+                 (unsigned long)lock_fail_count_);
+      }
+    } else {
+      if (lock_fail_count_ > 0) {
+        ESP_LOGI(kTag, "LVGL lock recovered after %lu failures (wait=%lums, caller=%s)",
+                 (unsigned long)lock_fail_count_, (unsigned long)wait_ms, caller_);
+      }
+      lock_fail_count_ = 0;
+      if (wait_ms > 150) {
+        ESP_LOGW(kTag, "LVGL lock waited %lums (caller=%s)",
+                 (unsigned long)wait_ms, caller_);
+      }
     }
     acquired_ts_ = esp_log_timestamp();
   }
@@ -125,11 +138,15 @@ class LvglLockGuard {
 
   bool locked() const { return locked_; }
 
+  static uint32_t lock_fail_count_;
+
  private:
   const char* caller_ = "?";
   uint32_t acquired_ts_ = 0;
   bool locked_ = false;
 };
+
+uint32_t LvglLockGuard::lock_fail_count_ = 0;
 
 bsp_display_rotation_t bsp_rotation_for(DisplayRotation rotation) {
   switch (rotation) {
@@ -392,8 +409,8 @@ uint32_t scale_color(uint32_t color, uint16_t scale_0_to_255) {
   return (static_cast<uint32_t>(sr) << 16) | (static_cast<uint32_t>(sg) << 8) | sb;
 }
 
-// pulse_between() removed — color pulses are now driven by lv_anim_t
-// in apply_ring_visual_locked() via pulse_anim_exec_cb.
+// Ambient sweep (kAmbientSweep) removed — the rotating arc during printing caused
+// excessive LVGL redraws.  Filament load/unload and color pulse animations are kept.
 
 enum class RingAnimKind : uint8_t {
   kNone,           // Static — no animation
@@ -401,7 +418,7 @@ enum class RingAnimKind : uint8_t {
   kFilamentUnload, // Arc value sweeps 100→0, repeat
   kPulseBoth,      // Both MAIN & INDICATOR color pulse
   kPulseIndicator, // Only INDICATOR color pulses
-  kAmbientSweep,   // Slow rotation (printing state)
+  // kAmbientSweep removed — caused excessive LVGL redraws
 };
 
 struct RingVisual {
@@ -409,8 +426,8 @@ struct RingVisual {
   uint32_t indicator_hex = 0xFFFFFF;
   int value_override = -1;
   RingAnimKind anim_kind = RingAnimKind::kNone;
-  uint32_t pulse_base_hex = 0;    // Base color for pulse animations
-  uint32_t pulse_period_ms = 0;   // Period for pulse animations
+  uint32_t pulse_base_hex = 0;
+  uint32_t pulse_period_ms = 0;
   bool animated() const { return anim_kind != RingAnimKind::kNone; }
 };
 
@@ -545,7 +562,6 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
     case PrintLifecycleState::kPaused:
       visual.main_hex = kRingBaseDark;
       visual.indicator_hex = colors.printing;
-      visual.anim_kind = RingAnimKind::kAmbientSweep;
       return visual;
     case PrintLifecycleState::kPreparing:
       visual.main_hex = colors.preheat;
@@ -1059,8 +1075,7 @@ esp_err_t Ui::initialize() {
     }
   }
 
-  ring_anim_timer_ = lv_timer_create(&Ui::ring_timer_cb, kRingAnimationTickMs, this);
-  lv_timer_pause(ring_anim_timer_);  // Starts paused; resumed only for ambient sweep.
+  // Ambient sweep timer removed — only pulse/filament animations remain (driven by lv_anim_t).
 
   initialized_ = true;
   ESP_LOGI(kTag, "UI ready with YAML-style pager layout (rotation=%s)",
@@ -1494,9 +1509,7 @@ void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
   // --- Manage lv_anim transitions ---
   const auto anim_kind_u8 = static_cast<uint8_t>(ring.anim_kind);
   if (anim_kind_u8 != active_ring_anim_kind_) {
-    // Stop any running ring animations.
     stop_ring_animations_locked();
-
     active_ring_anim_kind_ = anim_kind_u8;
 
     switch (ring.anim_kind) {
@@ -1536,21 +1549,16 @@ void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
         lv_anim_start(&a);
         break;
       }
-      case RingAnimKind::kAmbientSweep:
-        // Future: slow rotation animation. For now just static.
-        break;
       case RingAnimKind::kNone:
         break;
     }
   } else if (ring.anim_kind == RingAnimKind::kPulseBoth ||
              ring.anim_kind == RingAnimKind::kPulseIndicator) {
-    // Same animation kind but base color might have changed (e.g. color scheme switch).
     pulse_base_hex_ = ring.pulse_base_hex;
     pulse_both_parts_ = (ring.anim_kind == RingAnimKind::kPulseBoth);
   }
 
   // --- Apply static properties ---
-  // For non-filament states, set the arc value from progress.
   if (ring.anim_kind != RingAnimKind::kFilamentLoad &&
       ring.anim_kind != RingAnimKind::kFilamentUnload) {
     const int displayed_value = (ring.value_override >= 0) ? ring.value_override : progress;
@@ -1559,7 +1567,6 @@ void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
     }
   }
 
-  // Set colors for non-pulse states (pulse callback handles colors itself).
   if (ring.anim_kind != RingAnimKind::kPulseBoth &&
       ring.anim_kind != RingAnimKind::kPulseIndicator) {
     if (last_ring_main_hex_ != ring.main_hex) {
@@ -1577,43 +1584,6 @@ void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
     lv_obj_set_style_text_color(progress_label_, text_color, 0);
     lv_obj_set_style_text_color(status_label_, text_color, 0);
     last_ring_text_hex_ = text_hex;
-  }
-  // Reset arc rotation to top (270°) for non-sweep states.
-  if (ring.anim_kind != RingAnimKind::kAmbientSweep) {
-    lv_arc_set_rotation(status_arc_, 270);
-  }
-
-  // Resume/pause the ring timer — only needed for ambient sweep rotation.
-  if (ring_anim_timer_ != nullptr) {
-    if (ring.anim_kind == RingAnimKind::kAmbientSweep) {
-      lv_timer_resume(ring_anim_timer_);
-    } else {
-      lv_timer_pause(ring_anim_timer_);
-    }
-  }
-}
-
-void Ui::stop_ring_animations_locked() {
-  // Stop filament value animation (var = status_arc_).
-  lv_anim_delete(status_arc_, nullptr);
-  // Stop pulse color animation (var = this).
-  lv_anim_delete(this, pulse_anim_exec_cb);
-  active_ring_anim_kind_ = static_cast<uint8_t>(RingAnimKind::kNone);
-}
-
-void Ui::pulse_anim_exec_cb(void* var, int32_t scale) {
-  auto* ui = static_cast<Ui*>(var);
-  if (ui == nullptr || ui->status_arc_ == nullptr) return;
-  const uint32_t hex = scale_color(ui->pulse_base_hex_, static_cast<uint16_t>(scale));
-  if (ui->pulse_both_parts_) {
-    if (ui->last_ring_main_hex_ != hex) {
-      lv_obj_set_style_arc_color(ui->status_arc_, lv_color_hex(hex), LV_PART_MAIN);
-      ui->last_ring_main_hex_ = hex;
-    }
-  }
-  if (ui->last_ring_indicator_hex_ != hex) {
-    lv_obj_set_style_arc_color(ui->status_arc_, lv_color_hex(hex), LV_PART_INDICATOR);
-    ui->last_ring_indicator_hex_ = hex;
   }
 }
 
@@ -1980,34 +1950,30 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   apply_page_visibility();
 }
 
-void Ui::ring_timer_cb(lv_timer_t* timer) {
-  if (timer == nullptr) {
-    return;
-  }
-
-  auto* ui = static_cast<Ui*>(lv_timer_get_user_data(timer));
-  if (ui == nullptr) {
-    return;
-  }
-
-  ui->handle_ring_timer();
+void Ui::stop_ring_animations_locked() {
+  lv_anim_delete(status_arc_, nullptr);
+  lv_anim_delete(this, pulse_anim_exec_cb);
+  active_ring_anim_kind_ = static_cast<uint8_t>(RingAnimKind::kNone);
 }
 
-void Ui::handle_ring_timer() {
-  // With lv_anim_t driving all animations, this timer is only needed for
-  // the ambient sweep rotation during printing.  For all other states the
-  // timer is paused by apply_ring_visual_locked().
-  if (!initialized_ || status_arc_ == nullptr ||
-      screen_power_mode_ == ScreenPowerMode::kOff || scrolling_) {
-    return;
+void Ui::pulse_anim_exec_cb(void* var, int32_t scale) {
+  auto* ui = static_cast<Ui*>(var);
+  if (ui == nullptr || ui->status_arc_ == nullptr) return;
+  const uint32_t hex = scale_color(ui->pulse_base_hex_, static_cast<uint16_t>(scale));
+  if (ui->pulse_both_parts_) {
+    if (ui->last_ring_main_hex_ != hex) {
+      lv_obj_set_style_arc_color(ui->status_arc_, lv_color_hex(hex), LV_PART_MAIN);
+      ui->last_ring_main_hex_ = hex;
+    }
   }
-
-  if (active_ring_anim_kind_ == static_cast<uint8_t>(RingAnimKind::kAmbientSweep)) {
-    const uint32_t phase = lv_tick_get() % kPrintRotPeriodMs;
-    const int32_t angle = 270 + static_cast<int32_t>((phase * 360U) / kPrintRotPeriodMs);
-    lv_arc_set_rotation(status_arc_, angle % 360);
+  if (ui->last_ring_indicator_hex_ != hex) {
+    lv_obj_set_style_arc_color(ui->status_arc_, lv_color_hex(hex), LV_PART_INDICATOR);
+    ui->last_ring_indicator_hex_ = hex;
   }
 }
+
+// Ambient sweep timer (ring_timer_cb, handle_ring_timer) removed — the rotating
+// arc during printing caused excessive LVGL redraws on single-buffered display.
 
 esp_err_t Ui::build_dashboard() {
   LvglLockGuard lock(3000, "build_dashboard");
@@ -2302,24 +2268,6 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_size(badge_slot_, 86, 86);
   lv_obj_align(badge_slot_, LV_ALIGN_CENTER, 0, -7);
   lv_obj_clear_flag(badge_slot_, LV_OBJ_FLAG_SCROLLABLE);
-
-  sync_spinner_ = lv_spinner_create(badge_slot_);
-  lv_spinner_set_anim_params(sync_spinner_, 2000, 60);
-  lv_obj_set_size(sync_spinner_, 86, 86);
-  make_transparent(sync_spinner_);
-  lv_obj_set_style_arc_width(sync_spinner_, 8, LV_PART_MAIN);
-  lv_obj_set_style_arc_width(sync_spinner_, 8, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_color(sync_spinner_, lv_color_hex(0x000000), LV_PART_MAIN);
-  lv_obj_set_style_arc_color(sync_spinner_, lv_color_hex(0xFFFFFF), LV_PART_INDICATOR);
-  lv_obj_set_style_arc_rounded(sync_spinner_, true, LV_PART_MAIN);
-  lv_obj_set_style_arc_rounded(sync_spinner_, true, LV_PART_INDICATOR);
-  lv_obj_center(sync_spinner_);
-
-  sync_label_ = lv_label_create(badge_slot_);
-  set_label_text_if_changed(sync_label_, kMdiSync);
-  lv_obj_set_style_text_font(sync_label_, mdi40, 0);
-  lv_obj_set_style_text_color(sync_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_center(sync_label_);
 
   logo_badge_ = lv_obj_create(badge_slot_);
   lv_obj_set_size(logo_badge_, 120, 120);
@@ -2624,14 +2572,10 @@ void Ui::apply_logo_visibility() {
   const bool show_badge_slot = scrolling_ || active_page_ == 2;
   if (!show_badge_slot) {
     set_hidden(logo_badge_, true);
-    set_hidden(sync_spinner_, true);
-    set_hidden(sync_label_, true);
     return;
   }
 
   set_hidden(logo_badge_, !show_logo_);
-  set_hidden(sync_spinner_, show_logo_);
-  set_hidden(sync_label_, show_logo_);
 }
 
 void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
@@ -2826,9 +2770,6 @@ void Ui::handle_pager_event(lv_event_t* event) {
 
   if (code == LV_EVENT_SCROLL_BEGIN) {
     scrolling_ = true;
-    if (ring_anim_timer_ != nullptr) {
-      lv_timer_pause(ring_anim_timer_);
-    }
 
     // Eagerly load images for adjacent pages so they are visible during the
     // scroll transition.  ensure_preview_image_loaded_locked() uses the cached
@@ -3078,15 +3019,29 @@ void Ui::update_power_save(bool on_battery, bool print_active) {
     const bool was_off = screen_power_mode_ == ScreenPowerMode::kOff;
     const bool going_off = target_mode == ScreenPowerMode::kOff;
     screen_power_mode_ = target_mode;
+
+    // IMPORTANT: When turning the screen off, pause the LVGL worker BEFORE
+    // setting brightness to 0.  The AMOLED panel stops generating the TE
+    // signal on GPIO13 at brightness 0.  If lv_timer_handler() is in the
+    // flush path it will block forever on xSemaphoreTake(te_vsync_sem,
+    // portMAX_DELAY).  Pausing first ensures the worker finishes its current
+    // render cycle (while TE is still active) and then idles.
+    //
+    // If pause times out (worker stuck in flush), we must NOT kill the TE
+    // signal — that would permanently deadlock the worker.  Instead, abort
+    // the screen-off transition and stay in the current power mode.
+    if (going_off && !was_off) {
+      esp_err_t pause_ret = esp_lv_adapter_pause(1000);
+      if (pause_ret != ESP_OK) {
+        ESP_LOGW(kTag, "LVGL worker pause timeout — aborting screen-off to avoid TE deadlock");
+        screen_power_mode_ = was_off ? ScreenPowerMode::kOff : ScreenPowerMode::kAwake;
+        return;
+      }
+    }
+
     apply_brightness_policy();
 
-    // Pause the LVGL worker when the screen is off so lv_timer_handler() does
-    // not run.  This prevents the flush path from blocking indefinitely on a TE
-    // signal (GPIO13 edge via portMAX_DELAY semaphore) while the display panel
-    // may have stopped producing TE edges at brightness 0.
-    if (going_off && !was_off) {
-      esp_lv_adapter_pause(1000);
-    } else if (was_off && !going_off) {
+    if (was_off && !going_off) {
       esp_lv_adapter_resume();
     }
   }

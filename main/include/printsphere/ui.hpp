@@ -68,7 +68,6 @@ class Ui {
   void apply_page_visibility();
   void apply_logo_visibility();
   void update_page_availability_locked(const PrinterSnapshot& snapshot);
-  void handle_ring_timer();
   void note_activity(bool wake_display);
   void wake_display();
   void apply_brightness_policy();
@@ -86,7 +85,6 @@ class Ui {
   void set_brightness_percent(int brightness_percent);
   void stop_ring_animations_locked();
   static void pulse_anim_exec_cb(void* var, int32_t scale);
-  static void ring_timer_cb(lv_timer_t* timer);
   static void pager_event_cb(lv_event_t* event);
   static void screen_event_cb(lv_event_t* event);
   static void logo_event_cb(lv_event_t* event);
@@ -141,8 +139,6 @@ class Ui {
   lv_obj_t* battery_icon_label_ = nullptr;
   lv_obj_t* battery_pct_label_ = nullptr;
   lv_obj_t* badge_slot_ = nullptr;
-  lv_obj_t* sync_spinner_ = nullptr;
-  lv_obj_t* sync_label_ = nullptr;
   lv_obj_t* logo_badge_ = nullptr;
   lv_obj_t* logo_image_ = nullptr;
   lv_obj_t* status_label_ = nullptr;
@@ -170,7 +166,7 @@ class Ui {
   lv_obj_t* portal_overlay_title_ = nullptr;
   lv_obj_t* portal_overlay_value_ = nullptr;
   lv_obj_t* portal_overlay_detail_ = nullptr;
-  lv_timer_t* ring_anim_timer_ = nullptr;
+  lv_timer_t* ring_anim_timer_ = nullptr;  // unused, ambient sweep timer removed
   int user_brightness_percent_ = 80;
   int applied_brightness_percent_ = -1;
   bool gesture_active_ = false;
