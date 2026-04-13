@@ -1,5 +1,6 @@
 #include "printsphere/application.hpp"
 
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -7,6 +8,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "bsp/esp32_s3_touch_amoled_1_75.h"
 #include "printsphere/error_lookup.hpp"
 #include "printsphere/status_resolver.hpp"
 
@@ -18,6 +20,7 @@ constexpr TickType_t kStopBannerDuration = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCloudFallbackDelayLocalFirst = pdMS_TO_TICKS(35000);
 constexpr TickType_t kHybridCloudFallbackDelayCloudFirst = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCameraCloudCooldown = pdMS_TO_TICKS(8000);
+constexpr TickType_t kScreenOffTouchWakePollSlice = pdMS_TO_TICKS(25);
 constexpr uint64_t kChamberLightOverrideMs = 6000;
 
 esp_err_t configure_power_management() {
@@ -85,6 +88,27 @@ TickType_t hybrid_cloud_fallback_delay(const PrinterSnapshot& local_snapshot,
   return hybrid_prefers_cloud_status(local_snapshot, cloud_snapshot)
              ? kHybridCloudFallbackDelayCloudFirst
              : kHybridCloudFallbackDelayLocalFirst;
+}
+
+void wait_for_next_iteration(Ui& ui, TickType_t delay) {
+  TickType_t remaining = delay;
+  while (remaining > 0) {
+    const bool touch_wake_poll_active = ui.screen_power_mode() == ScreenPowerMode::kOff;
+    const TickType_t slice =
+        (touch_wake_poll_active && remaining > kScreenOffTouchWakePollSlice)
+            ? kScreenOffTouchWakePollSlice
+            : remaining;
+    vTaskDelay(slice);
+    remaining -= slice;
+
+    if (touch_wake_poll_active && gpio_get_level(BSP_LCD_TOUCH_INT) == 0) {
+      // The LVGL worker is paused while the screen is off, so a short tap can
+      // be missed if the main loop sleeps for the full low-power interval.
+      // Poll the raw touch IRQ in short slices so wake feels immediate.
+      ui.request_wake_display();
+      break;
+    }
+  }
 }
 }
 
@@ -473,7 +497,7 @@ void Application::run() {
     last_source_mode_ = source_mode_;
     last_wifi_connected_ = wifi_connected;
     last_camera_page_active_ = camera_page_visible;
-    vTaskDelay(loop_delay);
+    wait_for_next_iteration(ui_, loop_delay);
   }
 }
 

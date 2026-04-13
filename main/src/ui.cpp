@@ -46,6 +46,8 @@ constexpr int kPage3NoteWithImageY = 150;
 constexpr int kPage3SubnoteWithImageY = 182;
 constexpr int kAuxTempRowY = 28;
 constexpr int kSwipeThresholdPx = 24;
+constexpr int kGestureAxisLockMarginPx = 16;
+constexpr int kBrightnessHorizontalTolerancePx = 18;
 constexpr int kRotatedVisualOffsetX = 0;
 constexpr int kRotatedVisualOffsetY = 0;
 constexpr int kManualMinBrightnessPercent = 4;
@@ -2756,8 +2758,36 @@ void Ui::set_active_page(int page) {
   }
 }
 
+void Ui::set_pager_scroll_locked(bool locked) {
+  if (pager_ == nullptr || pager_scroll_locked_ == locked) {
+    return;
+  }
+
+  pager_scroll_locked_ = locked;
+  lv_obj_set_scroll_dir(pager_, locked ? LV_DIR_NONE : LV_DIR_HOR);
+
+  if (!locked) {
+    return;
+  }
+
+  // Snap back to the currently active page as soon as brightness control wins
+  // the gesture, so a slightly diagonal drag doesn't leave the pager half-way
+  // between pages.
+  lv_obj_update_layout(pager_);
+  if (lv_obj_t* target_page = page_object(active_page_); target_page != nullptr) {
+    lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
+  }
+  scrolling_ = false;
+  apply_page0_parallax();
+  apply_page_visibility();
+}
+
 void Ui::handle_pager_event(lv_event_t* event) {
   const lv_event_code_t code = lv_event_get_code(event);
+
+  if (pager_scroll_locked_) {
+    return;
+  }
 
   if (code == LV_EVENT_SCROLL) {
     apply_page0_parallax();
@@ -2814,6 +2844,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
   lv_indev_get_point(indev, &point);
 
   if (code == LV_EVENT_PRESSED) {
+    set_pager_scroll_locked(false);
     if (screen_power_mode_ == ScreenPowerMode::kOff) {
       // First touch wakes the screen; a second touch performs UI actions.
       note_activity(true);
@@ -2840,8 +2871,31 @@ void Ui::handle_screen_event(lv_event_t* event) {
     const int abs_dx = std::abs(dx);
     const int abs_dy = std::abs(dy);
 
-    if (abs_dy < 12 || abs_dy < abs_dx) {
+    if (swipe_switched_) {
       return;
+    }
+
+    if (!overlay_visible_) {
+      // Resolve the gesture once: either a horizontal page swipe or a mostly
+      // vertical brightness drag. This avoids accidental brightness changes
+      // while the finger is moving diagonally during page navigation.
+      const bool horizontal_swipe =
+          abs_dx >= kSwipeThresholdPx &&
+          abs_dx >= (abs_dy - kGestureAxisLockMarginPx);
+      const bool vertical_brightness =
+          abs_dy >= kSwipeThresholdPx &&
+          abs_dx <= kBrightnessHorizontalTolerancePx &&
+          abs_dy >= (abs_dx + kGestureAxisLockMarginPx);
+
+      if (horizontal_swipe) {
+        swipe_switched_ = true;
+        return;
+      }
+      if (!vertical_brightness) {
+        return;
+      }
+
+      set_pager_scroll_locked(true);
     }
 
     const float delta = static_cast<float>(dy) * (100.0f / 250.0f);
@@ -2860,7 +2914,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
 
   if (code == LV_EVENT_LONG_PRESSED && gesture_active_) {
     note_activity(false);
-    if (!overlay_visible_ && !scrolling_) {
+    if (!overlay_visible_ && !scrolling_ && !swipe_switched_) {
       portal_unlock_requested_.store(true);
     }
     return;
@@ -2872,12 +2926,17 @@ void Ui::handle_screen_event(lv_event_t* event) {
     const int dy = static_cast<int>(gesture_start_y_ - point.y);
     const int abs_dx = std::abs(dx);
     const int abs_dy = std::abs(dy);
+    const bool swipe_locked = swipe_switched_;
 
     gesture_active_ = false;
     swipe_switched_ = false;
+    set_pager_scroll_locked(false);
     if (overlay_visible_) {
       lv_obj_add_flag(brightness_overlay_, LV_OBJ_FLAG_HIDDEN);
       overlay_visible_ = false;
+      return;
+    }
+    if (swipe_locked) {
       return;
     }
 
@@ -2959,7 +3018,7 @@ void Ui::wake_display() {
 }
 
 void Ui::request_wake_display() {
-  wake_display();
+  note_activity(true);
 }
 
 void Ui::set_battery_display_policy(const BatteryDisplayPolicy& policy) {
@@ -3034,6 +3093,9 @@ void Ui::update_power_save(bool on_battery, bool print_active) {
       esp_err_t pause_ret = esp_lv_adapter_pause(1000);
       if (pause_ret != ESP_OK) {
         ESP_LOGW(kTag, "LVGL worker pause timeout — aborting screen-off to avoid TE deadlock");
+        // Treat a failed screen-off attempt like fresh activity so we don't
+        // immediately hammer pause() again on the next main-loop iteration.
+        last_activity_tick_ms_.store(now);
         screen_power_mode_ = was_off ? ScreenPowerMode::kOff : ScreenPowerMode::kAwake;
         return;
       }

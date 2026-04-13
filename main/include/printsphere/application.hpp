@@ -8,6 +8,7 @@
 #include "printsphere/setup_portal.hpp"
 #include "printsphere/ui.hpp"
 #include "printsphere/wifi_manager.hpp"
+#include "freertos/FreeRTOS.h"
 
 namespace printsphere {
 

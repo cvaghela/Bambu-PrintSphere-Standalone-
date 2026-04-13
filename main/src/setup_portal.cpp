@@ -1312,10 +1312,18 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
                       : (portal_lock_enabled ? "PIN lock on" : "Open on LAN");
   const char* portal_lock_badge_class =
       setup_ap_active ? "info" : (portal_lock_enabled ? "info" : "warn");
+  const std::string ams_display_badge_value = filament_wake || !filament_anim ? "On" : "Off";
+  const char* ams_display_badge_class = filament_wake || !filament_anim ? "info" : "idle";
   const std::string arc_badge_value = arc_colors_custom ? "Custom" : "Default";
   const char* arc_badge_class = arc_colors_custom ? "info" : "idle";
+  const int device_settings_count = show_connection_steps ? 5 : 4;
+  const std::string device_settings_badge_value =
+      std::to_string(device_settings_count) + (device_settings_count == 1 ? " Panel" : " Panels");
+  const bool device_settings_section_open = true;
   const bool wifi_section_open = !wifi_configured || !wifi_connected || setup_ap_active;
   const bool rotation_section_open = false;
+  const bool energy_section_open = false;
+  const bool ams_display_section_open = false;
   const bool connection_mode_section_open = false;
   const bool portal_access_section_open = !portal_lock_enabled && !setup_ap_active;
   const bool cloud_section_configured =
@@ -1393,6 +1401,23 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
         html += "<span class=\"section-toggle-icon\" aria-hidden=\"true\"></span></div></summary><div class=\"section-body\">";
       };
   const auto end_collapsible_section = [&html]() { html += "</div></details>"; };
+  const auto begin_settings_panel =
+      [&html, &add_summary_pill](const char* title, const char* detail,
+                                 const std::string& badge_value, const char* badge_class,
+                                 bool open) {
+        html += "<details class=\"settings-panel\"";
+        if (open) {
+          html += " open";
+        }
+        html += "><summary class=\"settings-panel-summary\"><div class=\"settings-panel-copy\"><h3>";
+        html += title;
+        html += "</h3><p>";
+        html += detail;
+        html += "</p></div><div class=\"settings-panel-side\">";
+        add_summary_pill(&html, badge_value, badge_class);
+        html += "<span class=\"settings-panel-icon\" aria-hidden=\"true\"></span></div></summary><div class=\"settings-panel-body\">";
+      };
+  const auto end_settings_panel = [&html]() { html += "</div></details>"; };
   html += "<!doctype html><html><head><meta charset=\"utf-8\">";
   html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
   html += "<title>PrintSphere Web Config</title>";
@@ -1442,6 +1467,16 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           ".badge-value{font-size:15px;font-weight:700;line-height:1.35;color:var(--text);}"
           ".badge.ok{border-color:#22614c;background:#10231d;} .badge.warn{border-color:#7d6222;background:#241c0e;}"
           ".badge.info{border-color:#31557d;background:#111b29;} .badge.idle{border-color:#334456;background:#121a23;}";
+  html += ".settings-accordion{display:grid;gap:12px;} .settings-panel{border:1px solid var(--line);border-radius:20px;"
+          "background:#0f1721;overflow:hidden;} .settings-panel[open]{border-color:#365064;background:#111b29;}"
+          ".settings-panel-summary{display:grid;grid-template-columns:1fr auto;gap:10px 14px;align-items:center;"
+          "padding:16px 18px;cursor:pointer;list-style:none;} .settings-panel-summary::-webkit-details-marker{display:none;}"
+          ".settings-panel-copy{display:grid;gap:4px;} .settings-panel-copy h3{font-size:17px;line-height:1.2;}"
+          ".settings-panel-copy p{font-size:13px;line-height:1.45;color:var(--muted);} .settings-panel-side{display:flex;"
+          "align-items:center;gap:10px;} .settings-panel-icon{width:28px;height:28px;border-radius:999px;border:1px solid #365064;"
+          "background:#0c131b;display:grid;place-items:center;flex:0 0 auto;} .settings-panel-icon::before{content:'+';"
+          "font-size:18px;line-height:1;color:#cfe0f1;} details[open]>.settings-panel-summary .settings-panel-icon::before{content:'-';}"
+          ".settings-panel-body{padding:0 18px 18px;display:grid;gap:14px;}";
   html += ".grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:14px;}"
           ".grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}"
           ".field{display:grid;gap:8px;} .actions{display:flex;flex-wrap:wrap;gap:12px;align-items:center;}"
@@ -1470,7 +1505,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "@media(max-width:640px){body{padding:16px;} .title{font-size:28px;} .badge-grid,.grid-2,.grid-3,.color-grid"
           "{grid-template-columns:1fr;} .hero,.footer-card{padding:18px;} .hero-brand{gap:10px;} .eyebrow{font-size:16px;}"
           ".section-summary{padding:18px;flex-direction:column;}"
-          ".section-summary-side{width:100%;justify-content:space-between;} .section-body{padding:0 18px 18px;}}";
+          ".section-summary-side,.settings-panel-side{width:100%;justify-content:space-between;} .section-body{padding:0 18px 18px;}"
+          ".settings-panel-summary{padding:16px;} .settings-panel-body{padding:0 16px 16px;}}";
   html += "</style></head><body><main>";
 
   const auto add_color_field = [&html](const char* id, const char* label, uint32_t color) {
@@ -1619,47 +1655,48 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     render_local_section();
   }
 
-  if (show_connection_steps) {
-    html += "<div class=\"grid-2\">";
-  }
-
   if (wifi_configured) {
-  begin_collapsible_section(
-      "Screen Rotation",
-      "Uses the board's hardware display rotation and keeps touch aligned with it. Changing it restarts the ESP.",
-      rotation_section_badge_value, "info", rotation_section_open);
-  html += "<div class=\"field\"><label for=\"display_rotation\">Screen Rotation</label><select id=\"display_rotation\">";
-  html += "<option value=\"0\"";
-  if (display_rotation == DisplayRotation::k0) {
-    html += " selected";
-  }
-  html += ">0 deg (default)</option>";
-  html += "<option value=\"90\"";
-  if (display_rotation == DisplayRotation::k90) {
-    html += " selected";
-  }
-  html += ">90 deg</option>";
-  html += "<option value=\"180\"";
-  if (display_rotation == DisplayRotation::k180) {
-    html += " selected";
-  }
-  html += ">180 deg</option>";
-  html += "<option value=\"270\"";
-  if (display_rotation == DisplayRotation::k270) {
-    html += " selected";
-  }
-  html += ">270 deg</option></select></div>";
-  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"display-rotation-apply-button\">Apply + Restart</button>";
-  html += "<div class=\"micro hidden\" id=\"display-rotation-apply-hint\">The new panel orientation is applied on the next boot so display and touch stay in sync.</div></div>";
-  html += "<p class=\"micro\">Current orientation: ";
-  html += json_escape(display_rotation_badge_value(display_rotation));
-  html += "</p>";
-  end_collapsible_section();
+    begin_collapsible_section(
+        "Device Settings",
+        "Grouped into a vertical accordion so the restart-based device options stay compact on phones and easy to scan on desktop.",
+        device_settings_badge_value, "info", device_settings_section_open);
+    html += "<div class=\"settings-accordion\">";
+    begin_settings_panel(
+        "Screen Rotation",
+        "Hardware panel orientation and touch alignment. This change applies after restart.",
+        rotation_section_badge_value, "info", rotation_section_open);
+    html += "<div class=\"field\"><label for=\"display_rotation\">Screen Rotation</label><select id=\"display_rotation\">";
+    html += "<option value=\"0\"";
+    if (display_rotation == DisplayRotation::k0) {
+      html += " selected";
+    }
+    html += ">0 deg (default)</option>";
+    html += "<option value=\"90\"";
+    if (display_rotation == DisplayRotation::k90) {
+      html += " selected";
+    }
+    html += ">90 deg</option>";
+    html += "<option value=\"180\"";
+    if (display_rotation == DisplayRotation::k180) {
+      html += " selected";
+    }
+    html += ">180 deg</option>";
+    html += "<option value=\"270\"";
+    if (display_rotation == DisplayRotation::k270) {
+      html += " selected";
+    }
+    html += ">270 deg</option></select></div>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"display-rotation-apply-button\">Apply + Restart</button>";
+    html += "<div class=\"micro hidden\" id=\"display-rotation-apply-hint\">The new panel orientation is applied on the next boot so display and touch stay in sync.</div></div>";
+    html += "<p class=\"micro\">Current orientation: ";
+    html += json_escape(display_rotation_badge_value(display_rotation));
+    html += "</p>";
+    end_settings_panel();
 
-  begin_collapsible_section(
-      "Energy",
-      "Controls display dim/off behaviour. On battery this is always active. For USB-powered use, enable the USB option below. Touch always wakes the display. Changes apply after restart.",
-      bat_badge_value, bat_badge_class, false);
+    begin_settings_panel(
+        "Energy",
+        "Display dim/off behaviour for battery and optionally USB power. Touch wake stays active.",
+        bat_badge_value, bat_badge_class, energy_section_open);
 
   // Dim on/off
   html += "<div class=\"field\"><label for=\"bat_dim_enabled\">Dim Display on Battery</label><select id=\"bat_dim_enabled\">";
@@ -1806,67 +1843,93 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
 
   html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"bat-display-apply-button\">Apply + Restart</button>";
   html += "<div class=\"micro hidden\" id=\"bat-display-apply-hint\">Energy settings apply after the ESP restarts.</div></div>";
-  end_collapsible_section();
+    end_settings_panel();
 
-  begin_collapsible_section(
-      "AMS Display",
-      "AMS page display settings: screen wake behavior and animation during filament changes.",
-      filament_wake || !filament_anim ? "On" : "Off",
-      filament_wake || !filament_anim ? "info" : "idle", false);
-  html += "<div class=\"field\"><label for=\"filament_wake\">Filament Change Wake</label><select id=\"filament_wake\">";
-  html += "<option value=\"true\"";
-  if (filament_wake) {
-    html += " selected";
-  }
-  html += ">Enabled: allow screen to sleep during AMS changes, wake for external spool</option>";
-  html += "<option value=\"false\"";
-  if (!filament_wake) {
-    html += " selected";
-  }
-  html += ">Disabled: screen stays on during all filament changes while printing</option></select></div>";
-  html += "<div class=\"field\"><label for=\"filament_anim\">Filament Change Animation</label><select id=\"filament_anim\">";
-  html += "<option value=\"true\"";
-  if (filament_anim) {
-    html += " selected";
-  }
-  html += ">Enabled: show loading / unloading arc animation</option>";
-  html += "<option value=\"false\"";
-  if (!filament_anim) {
-    html += " selected";
-  }
-  html += ">Disabled: show 'printing' during automatic AMS filament changes</option></select></div>";
-  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"ams-display-apply-button\">Apply + Restart</button>";
-  html += "<div class=\"micro hidden\" id=\"ams-display-apply-hint\">AMS display settings apply after the ESP restarts.</div></div>";
-  end_collapsible_section();
-  } // wifi_configured (Screen Rotation + Energy + AMS Display)
+    begin_settings_panel(
+        "AMS Display",
+        "Wake behaviour and animation policy for automatic filament changes.",
+        ams_display_badge_value, ams_display_badge_class, ams_display_section_open);
+    html += "<div class=\"field\"><label for=\"filament_wake\">Filament Change Wake</label><select id=\"filament_wake\">";
+    html += "<option value=\"true\"";
+    if (filament_wake) {
+      html += " selected";
+    }
+    html += ">Enabled: allow screen to sleep during AMS changes, wake for external spool</option>";
+    html += "<option value=\"false\"";
+    if (!filament_wake) {
+      html += " selected";
+    }
+    html += ">Disabled: screen stays on during all filament changes while printing</option></select></div>";
+    html += "<div class=\"field\"><label for=\"filament_anim\">Filament Change Animation</label><select id=\"filament_anim\">";
+    html += "<option value=\"true\"";
+    if (filament_anim) {
+      html += " selected";
+    }
+    html += ">Enabled: show loading / unloading arc animation</option>";
+    html += "<option value=\"false\"";
+    if (!filament_anim) {
+      html += " selected";
+    }
+    html += ">Disabled: show 'printing' during automatic AMS filament changes</option></select></div>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"ams-display-apply-button\">Apply + Restart</button>";
+    html += "<div class=\"micro hidden\" id=\"ams-display-apply-hint\">AMS display settings apply after the ESP restarts.</div></div>";
+    end_settings_panel();
 
-  if (show_connection_steps) {
+    if (show_connection_steps) {
+      begin_settings_panel(
+          "Connection Mode",
+          "Choose which runtime path drives the UI. This rewires active clients after restart.",
+          source_badge_value, "info", connection_mode_section_open);
+      html += "<div class=\"field\"><label for=\"source_mode\">Connection Mode</label><select id=\"source_mode\">";
+      html += "<option value=\"hybrid\"";
+      if (source_mode == SourceMode::kHybrid) {
+        html += " selected";
+      }
+      html += ">Hybrid (recommended): auto-pick the best status path for your printer, keep local camera when available</option>";
+      html += "<option value=\"cloud_only\"";
+      if (source_mode == SourceMode::kCloudOnly) {
+        html += " selected";
+      }
+      html += ">Cloud only: cloud monitoring and preview, local MQTT/camera disabled</option>";
+      html += "<option value=\"local_only\"";
+      if (source_mode == SourceMode::kLocalOnly) {
+        html += " selected";
+      }
+      html += ">Local only</option></select></div>";
+      html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"source-mode-apply-button\">Apply + Restart</button>";
+      html += "<div class=\"micro hidden\" id=\"source-mode-apply-hint\">A mode change rewires the active clients, so the ESP restarts right away after saving it.</div></div>";
+      end_settings_panel();
+    }
+
+    begin_settings_panel(
+        "Portal Access",
+        "PIN protection for the web portal on your home network after provisioning.",
+        portal_lock_badge_value, portal_lock_badge_class, portal_access_section_open);
+    html += "<div class=\"field\"><label for=\"portal_lock_enabled\">Portal Lock</label><select id=\"portal_lock_enabled\">";
+    html += "<option value=\"true\"";
+    if (portal_lock_enabled) {
+      html += " selected";
+    }
+    html += ">Enabled: require PIN unlock on the home network</option>";
+    html += "<option value=\"false\"";
+    if (!portal_lock_enabled) {
+      html += " selected";
+    }
+    html += ">Disabled: keep the portal open on the home network</option></select></div>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"portal-access-apply-button\">Apply + Restart</button>";
+    html += "<div class=\"micro hidden\" id=\"portal-access-apply-hint\">Portal access changes apply after the ESP restarts so the new lock mode is active immediately.</div></div>";
+    html += "<div class=\"hint-box\"><strong>Security:</strong> ";
+    html += setup_ap_active
+                ? "The portal always stays open while the setup access point is active."
+                : (portal_lock_enabled
+                       ? "Long-press on the device display to show a temporary 6-digit unlock PIN whenever you need browser access."
+                       : "With the PIN lock disabled, anyone on the same home network can open Web Config without the device-generated PIN.");
     html += "</div>";
-    html += "<div class=\"grid-2\">";
-    begin_collapsible_section(
-        "Connection Mode",
-        "This decides which printer path drives the UI. Changing it needs a reboot because the active runtime wiring changes between cloud, local and hybrid.",
-        source_badge_value, "info", connection_mode_section_open);
-    html += "<div class=\"field\"><label for=\"source_mode\">Connection Mode</label><select id=\"source_mode\">";
-    html += "<option value=\"hybrid\"";
-    if (source_mode == SourceMode::kHybrid) {
-      html += " selected";
-    }
-    html += ">Hybrid (recommended): auto-pick the best status path for your printer, keep local camera when available</option>";
-    html += "<option value=\"cloud_only\"";
-    if (source_mode == SourceMode::kCloudOnly) {
-      html += " selected";
-    }
-    html += ">Cloud only: cloud monitoring and preview, local MQTT/camera disabled</option>";
-    html += "<option value=\"local_only\"";
-    if (source_mode == SourceMode::kLocalOnly) {
-      html += " selected";
-    }
-    html += ">Local only</option></select></div>";
-    html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"source-mode-apply-button\">Apply + Restart</button>";
-    html += "<div class=\"micro hidden\" id=\"source-mode-apply-hint\">A mode change rewires the active clients, so the ESP restarts right away after saving it.</div></div>";
+    html += "<p class=\"micro\">The lock never applies while PrintSphere is still in setup AP mode.</p>";
+    end_settings_panel();
+    html += "</div>";
     end_collapsible_section();
-  }
+  } // wifi_configured (Device Settings)
 
   // --- Printer Selection section ---
   if (show_connection_steps) {
@@ -1982,39 +2045,6 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     }
     html += "<div class=\"hint-box\"><strong>Tip:</strong> Selecting a printer reconnects all paths (cloud, local MQTT, camera) live — no reboot needed.</div>";
     end_collapsible_section();
-  }
-
-  if (wifi_configured) {
-  begin_collapsible_section(
-      "Portal Access",
-      "Controls whether the setup portal requires a 6-digit PIN on your home network after provisioning is complete.",
-      portal_lock_badge_value, portal_lock_badge_class, portal_access_section_open);
-  html += "<div class=\"field\"><label for=\"portal_lock_enabled\">Portal Lock</label><select id=\"portal_lock_enabled\">";
-  html += "<option value=\"true\"";
-  if (portal_lock_enabled) {
-    html += " selected";
-  }
-  html += ">Enabled: require PIN unlock on the home network</option>";
-  html += "<option value=\"false\"";
-  if (!portal_lock_enabled) {
-    html += " selected";
-  }
-  html += ">Disabled: keep the portal open on the home network</option></select></div>";
-  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"portal-access-apply-button\">Apply + Restart</button>";
-  html += "<div class=\"micro hidden\" id=\"portal-access-apply-hint\">Portal access changes apply after the ESP restarts so the new lock mode is active immediately.</div></div>";
-  html += "<div class=\"hint-box\"><strong>Security:</strong> ";
-  html += setup_ap_active
-              ? "The portal always stays open while the setup access point is active."
-              : (portal_lock_enabled
-                     ? "Long-press on the device display to show a temporary 6-digit unlock PIN whenever you need browser access."
-                     : "With the PIN lock disabled, anyone on the same home network can open Web Config without the device-generated PIN.");
-  html += "</div>";
-  html += "<p class=\"micro\">The lock never applies while PrintSphere is still in setup AP mode.</p>";
-  end_collapsible_section();
-  } // wifi_configured (Portal Access)
-
-  if (show_connection_steps) {
-    html += "</div>";
   }
 
   // Configured provisioning sections (sunk to bottom)
@@ -2152,6 +2182,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const batOffSelect=document.getElementById('bat_off_enabled');";
   html += "const batOffTimeoutIdleSelect=document.getElementById('bat_off_timeout_idle');";
   html += "const batOffTimeoutActiveSelect=document.getElementById('bat_off_timeout_active');";
+  html += "const batUsbPsSelect=document.getElementById('bat_usb_ps');";
   html += "const batDisplayApplyButton=document.getElementById('bat-display-apply-button');";
   html += "const batDisplayApplyHint=document.getElementById('bat-display-apply-hint');";
   html += "const amsDisplayApplyButton=document.getElementById('ams-display-apply-button');";
@@ -2190,6 +2221,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "let cloudSuccessReloadScheduled=false;";
   html += "let healthInFlight=false;";
   html += "let wifiScanInFlight=false;";
+  html += "document.querySelectorAll('.settings-accordion').forEach(group=>{group.querySelectorAll('.settings-panel').forEach(panel=>{panel.addEventListener('toggle',()=>{if(!panel.open)return;group.querySelectorAll('.settings-panel').forEach(other=>{if(other!==panel)other.open=false;});});});});";
   html += "const savedConfig={cloud_email:\"";
   html += json_escape(cloud.email);
   html += "\",cloud_region:\"";
@@ -2403,8 +2435,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const diActNow=batDimTimeoutActiveSelect?batDimTimeoutActiveSelect.value:String(savedConfig.bat_dim_timeout_active||30);"
           "const ofIdleNow=batOffTimeoutIdleSelect?batOffTimeoutIdleSelect.value:String(savedConfig.bat_off_timeout_idle||60);"
           "const ofActNow=batOffTimeoutActiveSelect?batOffTimeoutActiveSelect.value:String(savedConfig.bat_off_timeout_active||120);"
-          "const usbPsEl=document.getElementById('bat_usb_ps');"
-          "const usbPsNow=usbPsEl?usbPsEl.value==='true':savedConfig.bat_usb_ps===true;"
+          "const usbPsNow=batUsbPsSelect?batUsbPsSelect.value==='true':savedConfig.bat_usb_ps===true;"
           "const changed=dimNow!==(savedConfig.bat_dim_enabled!==false)"
               "||pctNow!==String(savedConfig.bat_dim_brightness||'0')"
               "||offNow!==(savedConfig.bat_off_enabled!==false)"
@@ -2509,6 +2540,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "if(batDimTimeoutActiveSelect){batDimTimeoutActiveSelect.addEventListener('change',updateBatDisplayControls);}";
   html += "if(batOffTimeoutIdleSelect){batOffTimeoutIdleSelect.addEventListener('change',updateBatDisplayControls);}";
   html += "if(batOffTimeoutActiveSelect){batOffTimeoutActiveSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batUsbPsSelect){batUsbPsSelect.addEventListener('change',updateBatDisplayControls);}";
   html += "if(batDisplayApplyButton){batDisplayApplyButton.addEventListener('click',async()=>{"
           "const bat_dim_enabled=batDimSelect?batDimSelect.value==='true':savedConfig.bat_dim_enabled!==false;"
           "const bat_dim_brightness=batDimBrightnessSelect?batDimBrightnessSelect.value:String(savedConfig.bat_dim_brightness||'0');"
@@ -2517,8 +2549,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const bat_dim_timeout_active=Number(batDimTimeoutActiveSelect?batDimTimeoutActiveSelect.value:savedConfig.bat_dim_timeout_active||30);"
           "const bat_off_timeout_idle=Number(batOffTimeoutIdleSelect?batOffTimeoutIdleSelect.value:savedConfig.bat_off_timeout_idle||60);"
           "const bat_off_timeout_active=Number(batOffTimeoutActiveSelect?batOffTimeoutActiveSelect.value:savedConfig.bat_off_timeout_active||120);"
-          "const usbPsEl2=document.getElementById('bat_usb_ps');"
-          "const bat_usb_ps=usbPsEl2?usbPsEl2.value==='true':savedConfig.bat_usb_ps===true;"
+          "const bat_usb_ps=batUsbPsSelect?batUsbPsSelect.value==='true':savedConfig.bat_usb_ps===true;"
           "batDisplayApplyButton.disabled=true;setStatus('Applying energy settings...','Saving settings and restarting the ESP now.',15000);"
           "try{const response=await fetch('/api/battery-display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bat_dim_enabled,bat_dim_brightness,bat_off_enabled,bat_dim_timeout_idle,bat_dim_timeout_active,bat_off_timeout_idle,bat_off_timeout_active,bat_usb_ps})});"
           "const body=await response.json().catch(()=>({}));"

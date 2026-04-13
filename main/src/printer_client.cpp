@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "lwip/sockets.h"
 
 namespace printsphere {
@@ -165,6 +167,18 @@ std::string text_string(const std::array<char, N>& value) {
 template <size_t N>
 bool has_text(const std::array<char, N>& value) {
   return value[0] != '\0';
+}
+
+bool same_temperature_c(float lhs, float rhs) {
+  return std::fabs(lhs - rhs) < 0.05f;
+}
+
+bool same_ams_tray_diag_state(const AmsTrayInfo& lhs, const AmsTrayInfo& rhs) {
+  return lhs.present == rhs.present &&
+         lhs.active == rhs.active &&
+         lhs.material_type == rhs.material_type &&
+         lhs.color_rgba == rhs.color_rgba &&
+         lhs.remain_pct == rhs.remain_pct;
 }
 
 bool parse_int_text_local(const char* text, int* value) {
@@ -486,6 +500,50 @@ const char* connect_return_code_name(esp_mqtt_connect_return_code_t code) {
     default:
       return "unknown";
   }
+}
+
+const char* wifi_second_channel_name(wifi_second_chan_t second) {
+  switch (second) {
+    case WIFI_SECOND_CHAN_ABOVE:
+      return "above";
+    case WIFI_SECOND_CHAN_BELOW:
+      return "below";
+    case WIFI_SECOND_CHAN_NONE:
+    default:
+      return "none";
+  }
+}
+
+const char* wifi_rssi_quality_label(int8_t rssi) {
+  if (rssi >= -55) {
+    return "excellent";
+  }
+  if (rssi >= -67) {
+    return "good";
+  }
+  if (rssi >= -75) {
+    return "fair";
+  }
+  if (rssi >= -82) {
+    return "weak";
+  }
+  return "very weak";
+}
+
+void log_wifi_link_diagnostics(const char* context) {
+  wifi_ap_record_t ap = {};
+  const esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+  if (err != ESP_OK) {
+    ESP_LOGW(kTag, "%s Wi-Fi link info unavailable: %s",
+             context != nullptr ? context : "MQTT", esp_err_to_name(err));
+    return;
+  }
+
+  ESP_LOGW(kTag,
+           "%s Wi-Fi link: rssi=%d dBm (%s) channel=%u second=%s",
+           context != nullptr ? context : "MQTT", static_cast<int>(ap.rssi),
+           wifi_rssi_quality_label(ap.rssi), static_cast<unsigned int>(ap.primary),
+           wifi_second_channel_name(ap.second));
 }
 
 int json_int_local(const cJSON* object, const char* key, int fallback) {
@@ -823,15 +881,68 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
   return bundle;
 }
 
-float extract_progress_percent(const cJSON* print, float fallback) {
-  const char* keys[] = {"mc_percent", "percent", "progress", "task_progress", "print_progress"};
-  for (const char* key : keys) {
-    const float value = json_number_local(print, key, -1.0f);
-    if (value >= 0.0f) {
-      return value <= 1.0f ? (value * 100.0f) : value;
-    }
+struct LocalProgressPercent {
+  bool has_value = false;
+  float value = 0.0f;
+  bool is_download_related = false;
+};
+
+bool read_progress_percent_candidate_local(const cJSON* print, const char* const* keys,
+                                           size_t key_count, float* value) {
+  if (print == nullptr || value == nullptr) {
+    return false;
   }
-  return fallback;
+
+  for (size_t index = 0; index < key_count; ++index) {
+    const float candidate = json_number_local(print, keys[index], -1.0f);
+    if (candidate < 0.0f) {
+      continue;
+    }
+    *value = candidate <= 1.0f ? (candidate * 100.0f) : candidate;
+    return true;
+  }
+  return false;
+}
+
+LocalProgressPercent extract_progress_percent_local(const cJSON* print,
+                                                    bool prefer_download_related) {
+  static const char* const kGenericKeys[] = {
+      "mc_percent", "percent", "progress", "task_progress", "taskProgress",
+      "print_progress", "printPercent"};
+  static const char* const kDownloadKeys[] = {
+      "gcode_file_prepare_percent", "gcodeFilePreparePercent",
+      "prepare_percent", "preparePercent",
+      "gcode_prepare_percent", "gcodePreparePercent",
+      "download_progress", "downloadProgress",
+      "model_download_progress", "modelDownloadProgress"};
+
+  LocalProgressPercent result = {};
+  const auto set_result = [&](bool download_related, float candidate) {
+    result.has_value = true;
+    result.value = candidate;
+    result.is_download_related = download_related;
+  };
+
+  float candidate = 0.0f;
+  if (prefer_download_related &&
+      read_progress_percent_candidate_local(print, kDownloadKeys,
+                                            sizeof(kDownloadKeys) / sizeof(kDownloadKeys[0]),
+                                            &candidate)) {
+    set_result(true, candidate);
+    return result;
+  }
+  if (read_progress_percent_candidate_local(print, kGenericKeys,
+                                            sizeof(kGenericKeys) / sizeof(kGenericKeys[0]),
+                                            &candidate)) {
+    set_result(false, candidate);
+    return result;
+  }
+  if (read_progress_percent_candidate_local(print, kDownloadKeys,
+                                            sizeof(kDownloadKeys) / sizeof(kDownloadKeys[0]),
+                                            &candidate)) {
+    set_result(true, candidate);
+  }
+  return result;
 }
 
 uint16_t extract_current_layer_local(const cJSON* print, uint16_t fallback) {
@@ -929,6 +1040,10 @@ std::string lower_copy(std::string value) {
   return value;
 }
 
+bool contains_token(const std::string& value, const char* token) {
+  return token != nullptr && value.find(token) != std::string::npos;
+}
+
 bool is_placeholder_stage_name(const std::string& stage_name) {
   if (stage_name.empty()) {
     return true;
@@ -968,6 +1083,14 @@ bool is_filament_change_stage(const std::string& stage_name) {
   const std::string lower = lower_copy(stage_name);
   return lower == "changing_filament" || lower == "filament_loading" ||
          lower == "filament_unloading";
+}
+
+bool is_download_stage_local(const std::string& stage_name, const std::string& gcode_state) {
+  const std::string lower_stage = lower_copy(stage_name);
+  const std::string lower_status = lower_copy(gcode_state);
+  return contains_token(lower_stage, "model_download") ||
+         contains_token(lower_stage, "download") ||
+         contains_token(lower_status, "download");
 }
 
 bool is_paused_gcode_state(const std::string& gcode_state) {
@@ -1305,6 +1428,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       update_local_runtime_metadata(&runtime, true, false);
       store_runtime_state(std::move(runtime), true);
       ESP_LOGW(kTag, "MQTT disconnected");
+      log_wifi_link_diagnostics("MQTT disconnected");
       break;
     }
 
@@ -1354,6 +1478,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       connection_state_tick_ = xTaskGetTickCount();
       watchdog_probe_tick_ = 0;
       log_heap_status("MQTT error");
+      log_wifi_link_diagnostics("MQTT error");
 
       // Determine whether this is a permanent auth error or a transient transport error.
       bool is_auth_error = false;
@@ -1450,9 +1575,16 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     const std::string previous_raw_stage = text_string(runtime.raw_stage);
     const std::string previous_stage = text_string(runtime.stage);
     const std::string previous_detail = text_string(runtime.detail);
+    const PrintLifecycleState previous_lifecycle = runtime.lifecycle;
     const int previous_print_error_code = runtime.print_error_code;
     const uint16_t previous_hms_alert_count = runtime.hms_alert_count;
     const bool previous_pause_fault = runtime.has_error && is_paused_gcode_state(previous_raw_status);
+    const bool previous_ams_change_latched = runtime.ams_filament_change_latched;
+    const int previous_hw_switch_state = runtime.hw_switch_state;
+    const int previous_tray_now = runtime.tray_now;
+    const int previous_tray_tar = runtime.tray_tar;
+    const AmsSnapshot previous_ams = runtime.ams ? *runtime.ams : AmsSnapshot{};
+    const bool had_previous_ams = runtime.ams != nullptr;
     const std::string gcode_state = json_string(print, "gcode_state", {});
     const std::string effective_gcode_state = !gcode_state.empty() ? gcode_state : previous_raw_status;
     const cJSON* stage = cJSON_GetObjectItemCaseSensitive(print, "stage");
@@ -1461,6 +1593,22 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
                               : json_int(print, "stg_cur", -1);
     const std::string stage_name =
         cJSON_IsObject(stage) ? json_string(stage, "name", json_string(stage, "stage", {})) : "";
+    const cJSON* ams_obj = cJSON_GetObjectItemCaseSensitive(print, "ams");
+    const bool has_hw_switch_state_update =
+        cJSON_GetObjectItemCaseSensitive(print, "hw_switch_state") != nullptr;
+    const int new_hw_switch_state = json_int(print, "hw_switch_state", previous_hw_switch_state);
+    const bool has_tray_now_update =
+        cJSON_IsObject(ams_obj) &&
+        cJSON_GetObjectItemCaseSensitive(ams_obj, "tray_now") != nullptr;
+    const bool has_tray_tar_update =
+        cJSON_IsObject(ams_obj) &&
+        cJSON_GetObjectItemCaseSensitive(ams_obj, "tray_tar") != nullptr;
+    const int new_tray_now = cJSON_IsObject(ams_obj)
+                                 ? json_int(ams_obj, "tray_now", previous_tray_now)
+                                 : previous_tray_now;
+    const int new_tray_tar = cJSON_IsObject(ams_obj)
+                                 ? json_int(ams_obj, "tray_tar", previous_tray_tar)
+                                 : previous_tray_tar;
     // A1 / printers without a named stage object report filament-change state via ams_status
     // (high byte 0x01 = AMS_STATUS_MAIN_FILAMENT_CHANGE) while stg_cur stays at 0 (printing).
     // Synthesize stg_cur=4 (changing_filament) in that case so the animation triggers.
@@ -1502,22 +1650,39 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     const bool has_status_update = !gcode_state.empty();
     const bool has_stage_update = !resolved_stage.empty();
 
-    // [DIAG] Log incoming local MQTT print payload — only when it carries state-relevant fields.
+    // [DIAG] Log incoming local MQTT print payload only when it carries a real state change.
     const bool diag_has_state_fields = !gcode_state.empty() || stage_id >= 0 ||
-                                       !stage_name.empty() || raw_ams_status >= 0;
-    if (diag_has_state_fields) {
+                                       !stage_name.empty() || raw_ams_status >= 0 ||
+                                       has_hw_switch_state_update || has_tray_now_update ||
+                                       has_tray_tar_update;
+    const bool diag_has_state_change =
+        (!gcode_state.empty() && gcode_state != previous_raw_status) ||
+        (!stage_name.empty() && stage_name != previous_raw_stage) ||
+        (raw_ams_status >= 0 && ams_filament_change != previous_ams_change_latched) ||
+        (has_hw_switch_state_update && new_hw_switch_state != previous_hw_switch_state) ||
+        (has_tray_now_update && new_tray_now != previous_tray_now) ||
+        (has_tray_tar_update && new_tray_tar != previous_tray_tar);
+    if (diag_has_state_fields && diag_has_state_change) {
       ESP_LOGI(kTag, "[DIAG] local mqtt: gcode=%s stg_cur=%d stage_name=%s ams_status=0x%04X "
                "ams_change=%d(latch=%d) hw_switch=%d tray_now=%d tray_tar=%d",
                gcode_state.empty() ? "(-)" : gcode_state.c_str(), stage_id,
                stage_name.empty() ? "(-)" : stage_name.c_str(),
                raw_ams_status, ams_filament_change ? 1 : 0,
                ams_change_active ? 1 : 0,
-               json_int(print, "hw_switch_state", runtime.hw_switch_state),
-               runtime.tray_now, runtime.tray_tar);
+               new_hw_switch_state, new_tray_now, new_tray_tar);
     }
 
     runtime.connection = PrinterConnectionState::kOnline;
-    runtime.progress_percent = extract_progress_percent(print, runtime.progress_percent);
+    const bool payload_download_stage =
+        is_download_stage_local(!resolved_stage.empty() ? resolved_stage : stage_name,
+                                effective_gcode_state);
+    const LocalProgressPercent progress_update =
+        extract_progress_percent_local(print, payload_download_stage);
+    const bool has_progress_update = progress_update.has_value;
+    const bool progress_is_download_related = progress_update.is_download_related;
+    if (has_progress_update) {
+      runtime.progress_percent = progress_update.value;
+    }
     const NozzleTemperatureBundle nozzle_temps =
         extract_nozzle_temperature_bundle(print, runtime.nozzle_temp_c,
                                           runtime.secondary_nozzle_temp_c);
@@ -1540,7 +1705,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     }
 
     // Parse hw_switch_state (extruder filament sensor: 0=no filament, 1=filament present).
-    const int new_hw_switch = json_int(print, "hw_switch_state", runtime.hw_switch_state);
+    const int new_hw_switch = new_hw_switch_state;
     if (new_hw_switch != runtime.hw_switch_state) {
       ESP_LOGI(kTag, "hw_switch_state: %d -> %d", runtime.hw_switch_state, new_hw_switch);
       runtime.hw_switch_state = new_hw_switch;
@@ -1548,7 +1713,6 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 
     // Parse tray_now / tray_tar from ams object.
     // tray_now encoding: 255=none, 254=external spool, else ams_index*4+tray_index.
-    const cJSON* ams_obj = cJSON_GetObjectItemCaseSensitive(print, "ams");
     if (ams_obj != nullptr) {
       const int new_tray_now = json_int(ams_obj, "tray_now", runtime.tray_now);
       const int new_tray_tar = json_int(ams_obj, "tray_tar", runtime.tray_tar);
@@ -1642,14 +1806,35 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
         }
         if (unit_count > runtime.ams->count) runtime.ams->count = unit_count;
 
-        // AMS tray diagnostics — log humidity, temperature, and per-tray details.
+        // AMS tray diagnostics — log only the unit/trays whose visible state changed.
+        const AmsUnitInfo empty_unit = {};
         for (uint8_t u = 0; u < unit_count; ++u) {
           const AmsUnitInfo& du = runtime.ams->units[u];
           if (!du.present) continue;
+          const AmsUnitInfo& prev_unit =
+              (had_previous_ams && u < previous_ams.count) ? previous_ams.units[u] : empty_unit;
+          bool any_tray_changed = false;
+          for (int t = 0; t < kMaxAmsTrays; ++t) {
+            if (!same_ams_tray_diag_state(du.trays[t], prev_unit.trays[t])) {
+              any_tray_changed = true;
+              break;
+            }
+          }
+          const bool unit_summary_changed =
+              !had_previous_ams ||
+              du.present != prev_unit.present ||
+              du.humidity_pct != prev_unit.humidity_pct ||
+              !same_temperature_c(du.temperature_c, prev_unit.temperature_c);
+          if (!unit_summary_changed && !any_tray_changed) {
+            continue;
+          }
           ESP_LOGI(kTag, "[DIAG] ams unit=%d hum=%d%% temp=%.1f°C", u,
                    du.humidity_pct, static_cast<double>(du.temperature_c));
           for (int t = 0; t < kMaxAmsTrays; ++t) {
             const AmsTrayInfo& dt = du.trays[t];
+            if (had_previous_ams && same_ams_tray_diag_state(dt, prev_unit.trays[t])) {
+              continue;
+            }
             ESP_LOGI(kTag, "[DIAG]   tray[%d] present=%d type=%s color=0x%08X remain=%d%% active=%d",
                      t, dt.present ? 1 : 0,
                      dt.material_type.empty() ? "(-)" : dt.material_type.c_str(),
@@ -1758,6 +1943,36 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
       copy_text(&runtime.stage, stage_label_for(raw_status, stage_id, has_concrete_error));
     } else {
       copy_text(&runtime.stage, previous_stage);
+    }
+
+    const std::string current_stage_for_progress =
+        !text_string(runtime.raw_stage).empty() ? text_string(runtime.raw_stage)
+                                                : text_string(runtime.stage);
+    const std::string previous_stage_for_progress =
+        !previous_raw_stage.empty() ? previous_raw_stage : previous_stage;
+    const bool current_download_phase =
+        is_download_stage_local(current_stage_for_progress, text_string(runtime.raw_status));
+    const bool current_prepare_phase =
+        current_download_phase || runtime.lifecycle == PrintLifecycleState::kPreparing;
+    const bool entering_new_active_cycle =
+        has_status_update && is_active_gcode_state(text_string(runtime.raw_status)) &&
+        !is_active_gcode_state(previous_raw_status);
+    const bool leaving_download_phase =
+        is_download_stage_local(previous_stage_for_progress, previous_raw_status) &&
+        !current_download_phase;
+    const bool should_reset_progress_for_new_cycle =
+        ((entering_new_active_cycle && current_prepare_phase &&
+          (previous_lifecycle == PrintLifecycleState::kFinished ||
+           previous_lifecycle == PrintLifecycleState::kIdle ||
+           previous_lifecycle == PrintLifecycleState::kUnknown ||
+           previous_lifecycle == PrintLifecycleState::kError) &&
+          (!has_progress_update || !current_download_phase || !progress_is_download_related))) ||
+        (leaving_download_phase && (!has_progress_update || progress_is_download_related));
+    if (should_reset_progress_for_new_cycle) {
+      runtime.progress_percent = 0.0f;
+      runtime.remaining_seconds = 0U;
+      runtime.current_layer = 0U;
+      runtime.total_layers = 0U;
     }
 
     const std::string error_detail =
@@ -2045,6 +2260,7 @@ void PrinterClient::task_loop() {
             if (consecutive_probe_failures_ <= 1) {
               ESP_LOGW(kTag, "TCP probe: host %s unreachable on first attempt (errno=%d), retrying silently",
                        connection.host.c_str(), probe_errno);
+              log_wifi_link_diagnostics("TCP probe failed");
               const uint32_t backoff_ms = 1500U;
               schedule_client_rebuild("tcp probe failed (first attempt)", backoff_ms);
               vTaskDelay(pdMS_TO_TICKS(500));
@@ -2075,6 +2291,7 @@ void PrinterClient::task_loop() {
               ESP_LOGW(kTag, "TCP probe: host %s unreachable (errno=%d)",
                        connection.host.c_str(), probe_errno);
             }
+            log_wifi_link_diagnostics("TCP probe failed");
 
             update_local_runtime_metadata(&probe_fail, true, false);
             store_runtime_state(std::move(probe_fail), false);

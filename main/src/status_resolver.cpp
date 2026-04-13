@@ -857,12 +857,21 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
     apply_cloud_error_bundle(snapshot, cloud_snapshot);
   }
 
-  // AMS / tray data is local-only (MQTT); forward when local data is fresh.
-  if (local_fresh) {
+  const bool local_ams_usable =
+      local_fresh && (local_snapshot.ams != nullptr) && local_snapshot.ams->count > 0;
+  const bool cloud_ams_usable =
+      cloud_fresh && (cloud_snapshot.ams != nullptr) && cloud_snapshot.ams->count > 0;
+
+  if (local_ams_usable) {
     snapshot.hw_switch_state = local_snapshot.hw_switch_state;
     snapshot.tray_now = local_snapshot.tray_now;
     snapshot.tray_tar = local_snapshot.tray_tar;
     snapshot.ams = local_snapshot.ams;
+  } else if (cloud_ams_usable) {
+    snapshot.hw_switch_state = cloud_snapshot.hw_switch_state;
+    snapshot.tray_now = cloud_snapshot.tray_now;
+    snapshot.tray_tar = cloud_snapshot.tray_tar;
+    snapshot.ams = cloud_snapshot.ams;
   }
 
   if (cloud_enabled && cloud_preview_available(cloud_snapshot, now_ms)) {

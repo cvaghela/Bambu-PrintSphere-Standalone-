@@ -21,6 +21,7 @@
 #include "esp_log.h"
 #include "esp_tls.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "mbedtls/base64.h"
 
 namespace printsphere {
@@ -48,10 +49,92 @@ constexpr TickType_t kCloudInitialPreviewDelay = pdMS_TO_TICKS(8000);
 constexpr TickType_t kCloudPreviewWakePoll = pdMS_TO_TICKS(2000);
 constexpr TickType_t kCloudPreviewRetryBackoff = pdMS_TO_TICKS(30000);
 constexpr TickType_t kCloudBindingRefresh = pdMS_TO_TICKS(300000);
+constexpr int kCloudAuthRetryBackoffSeconds = 30;
+constexpr int64_t kCloudAuthRetryBackoffUs =
+    static_cast<int64_t>(kCloudAuthRetryBackoffSeconds) * 1000000LL;
 constexpr uint64_t kCloudLiveDataFreshMs = 120000ULL;
 constexpr uint64_t kCloudOptimisticLightMs = 8000ULL;
 constexpr int kCloudPrintErrorTaskCanceled = 0x0300400C;
 constexpr int kCloudPrintErrorPrintingCancelled = 0x0500400E;
+
+const char* wifi_second_channel_name(wifi_second_chan_t second) {
+  switch (second) {
+    case WIFI_SECOND_CHAN_ABOVE:
+      return "above";
+    case WIFI_SECOND_CHAN_BELOW:
+      return "below";
+    case WIFI_SECOND_CHAN_NONE:
+    default:
+      return "none";
+  }
+}
+
+const char* wifi_rssi_quality_label(int8_t rssi) {
+  if (rssi >= -55) {
+    return "excellent";
+  }
+  if (rssi >= -67) {
+    return "good";
+  }
+  if (rssi >= -75) {
+    return "fair";
+  }
+  if (rssi >= -82) {
+    return "weak";
+  }
+  return "very weak";
+}
+
+void log_wifi_link_diagnostics(const char* context) {
+  wifi_ap_record_t ap = {};
+  const esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+  if (err != ESP_OK) {
+    ESP_LOGW(kTag, "%s Wi-Fi link info unavailable: %s",
+             context != nullptr ? context : "Cloud MQTT", esp_err_to_name(err));
+    return;
+  }
+
+  ESP_LOGW(kTag,
+           "%s Wi-Fi link: rssi=%d dBm (%s) channel=%u second=%s",
+           context != nullptr ? context : "Cloud MQTT", static_cast<int>(ap.rssi),
+           wifi_rssi_quality_label(ap.rssi), static_cast<unsigned int>(ap.primary),
+           wifi_second_channel_name(ap.second));
+}
+
+const char* connect_return_code_name(esp_mqtt_connect_return_code_t code) {
+  switch (code) {
+    case MQTT_CONNECTION_ACCEPTED:
+      return "accepted";
+    case MQTT_CONNECTION_REFUSE_PROTOCOL:
+      return "wrong protocol";
+    case MQTT_CONNECTION_REFUSE_ID_REJECTED:
+      return "client id rejected";
+    case MQTT_CONNECTION_REFUSE_SERVER_UNAVAILABLE:
+      return "server unavailable";
+    case MQTT_CONNECTION_REFUSE_BAD_USERNAME:
+      return "bad username";
+    case MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED:
+      return "not authorized";
+    default:
+      return "unknown";
+  }
+}
+
+const char* yes_no(bool value) { return value ? "yes" : "no"; }
+
+void log_cloud_mqtt_auth_context(const BambuCloudCredentials& credentials,
+                                 const std::string& mqtt_username,
+                                 const std::string& requested_serial,
+                                 const std::string& resolved_serial,
+                                 bool token_present) {
+  const bool serial_ready = !resolved_serial.empty() || !requested_serial.empty();
+  ESP_LOGW(kTag,
+           "Cloud MQTT auth context: region=%s identity=%s password_login=%s "
+           "token_present=%s username_ready=%s serial_ready=%s",
+           to_string(credentials.region), yes_no(credentials.has_identity()),
+           yes_no(credentials.can_password_login()), yes_no(token_present),
+           yes_no(!mqtt_username.empty()), yes_no(serial_ready));
+}
 
 const char* cloud_api_base(CloudRegion region) {
   switch (region) {
@@ -1072,9 +1155,12 @@ bool extract_live_progress_percent(const cJSON* item, float* value) {
 
   const cJSON* item_print = child_object_local(item, "print");
   const char* keys[] = {"progress", "percent", "mc_percent", "task_progress", "taskProgress",
-                        "print_progress", "printPercent", "download_progress",
-                        "downloadProgress", "model_download_progress",
-                        "modelDownloadProgress"};
+                        "print_progress", "printPercent",
+                        "gcode_file_prepare_percent", "gcodeFilePreparePercent",
+                        "prepare_percent", "preparePercent",
+                        "gcode_prepare_percent", "gcodePreparePercent",
+                        "download_progress", "downloadProgress",
+                        "model_download_progress", "modelDownloadProgress"};
   for (const cJSON* source : {item, item_print}) {
     if (source == nullptr) {
       continue;
@@ -1553,6 +1639,10 @@ void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string 
   cached_preview_blob_.reset();
   clear_auth_state();
   mqtt_username_.clear();
+  mqtt_auth_recovery_requested_ = false;
+  mqtt_auth_connect_return_code_ = static_cast<int>(MQTT_CONNECTION_ACCEPTED);
+  mqtt_auth_retry_not_before_us_ = 0;
+  cloud_payload_probe_logs_remaining_ = 3;
 
   access_token_.clear();
   token_expiry_us_ = 0;
@@ -1763,6 +1853,10 @@ void BambuCloudClient::apply_cloud_session_state(bool configured, bool connected
     live.current_layer = 0;
     live.total_layers = 0;
     live.print_error_code = 0;
+    live.hw_switch_state = -1;
+    live.tray_now = -1;
+    live.tray_tar = -1;
+    live.ams.reset();
     live.hms_codes.clear();
     live.hms_alert_count = 0;
     live.has_error = false;
@@ -1847,6 +1941,17 @@ void BambuCloudClient::publish_combined_snapshot() {
   }
   if (live_has_recent_data && has_text(live.stage)) {
     current.stage = text_string(live.stage);
+  }
+  if (live_has_recent_data) {
+    current.hw_switch_state = live.hw_switch_state;
+    current.tray_now = live.tray_now;
+    current.tray_tar = live.tray_tar;
+    current.ams = live.ams;
+  } else {
+    current.hw_switch_state = -1;
+    current.tray_now = -1;
+    current.tray_tar = -1;
+    current.ams.reset();
   }
   if (live_has_recent_state &&
       (live.live_data_last_update_ms != 0 || live.progress_percent > 0.0f ||
@@ -2075,6 +2180,7 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         store_live_runtime(std::move(runtime), true);
       }
       ESP_LOGW(kTag, "Cloud MQTT disconnected");
+      log_wifi_link_diagnostics("Cloud MQTT disconnected");
       break;
 
     case MQTT_EVENT_DATA: {
@@ -2119,7 +2225,23 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         runtime.setup_stage = CloudSetupStage::kIdle;
         store_live_runtime(std::move(runtime), true);
       }
+      if (const auto* error = event->error_handle;
+          error != nullptr && error->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+        const esp_mqtt_connect_return_code_t code = error->connect_return_code;
+        mqtt_auth_connect_return_code_ = static_cast<int>(code);
+        mqtt_auth_retry_not_before_us_ =
+            credentials_.can_password_login() ? esp_timer_get_time() + kCloudAuthRetryBackoffUs : 0;
+        mqtt_auth_recovery_requested_ = true;
+        ESP_LOGW(kTag, "Cloud MQTT refused by broker: %s", connect_return_code_name(code));
+        log_cloud_mqtt_auth_context(credentials_, mqtt_username_, requested_serial_, resolved_serial_,
+                                    !access_token_.empty());
+        if (task_handle_ != nullptr && xTaskGetCurrentTaskHandle() != task_handle_) {
+          xTaskNotifyGive(task_handle_);
+        }
+        break;
+      }
       ESP_LOGW(kTag, "Cloud MQTT transport error");
+      log_wifi_link_diagnostics("Cloud MQTT error");
       break;
 
     default:
@@ -2293,7 +2415,10 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     return;
   }
 
-  const cJSON* print = child_object(root, "print");
+  const cJSON* print_wrapper = child_object(root, "pushall");
+  const cJSON* print =
+      cJSON_IsObject(child_object(root, "print")) ? child_object(root, "print")
+                                                   : child_object(print_wrapper, "print");
   if (cJSON_IsObject(print)) {
     received_live_payload_ = true;
     initial_sync_sent_ = false;
@@ -2326,6 +2451,30 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     std::string stage_text;
     extract_live_stage_text(print, &stage_text);
     const bool has_status_update = !status_text.empty() || !stage_text.empty();
+    if (cloud_payload_probe_logs_remaining_.load() > 0) {
+      const cJSON* ams_obj = cJSON_GetObjectItemCaseSensitive(print, "ams");
+      const cJSON* ams_array =
+          cJSON_IsObject(ams_obj) ? cJSON_GetObjectItemCaseSensitive(ams_obj, "ams") : nullptr;
+      ESP_LOGI(kTag,
+               "[DIAG] cloud payload: cmd=%s msg=%d has_ams=%d has_ams_units=%d has_hw_switch=%d "
+               "has_tray_now=%d has_tray_tar=%d status=%s stage=%s",
+               json_string(print, "command", "(-)").c_str(),
+               json_int(print, "msg", -1),
+               cJSON_IsObject(ams_obj) ? 1 : 0,
+               cJSON_IsArray(ams_array) ? 1 : 0,
+               cJSON_GetObjectItemCaseSensitive(print, "hw_switch_state") != nullptr ? 1 : 0,
+               cJSON_IsObject(ams_obj) &&
+                       cJSON_GetObjectItemCaseSensitive(ams_obj, "tray_now") != nullptr
+                   ? 1
+                   : 0,
+               cJSON_IsObject(ams_obj) &&
+                       cJSON_GetObjectItemCaseSensitive(ams_obj, "tray_tar") != nullptr
+                   ? 1
+                   : 0,
+               status_text.empty() ? "(-)" : status_text.c_str(),
+               stage_text.empty() ? "(-)" : stage_text.c_str());
+      --cloud_payload_probe_logs_remaining_;
+    }
 
     // [DIAG] Log every incoming cloud MQTT print payload summary.
     if (has_status_update) {
@@ -2422,6 +2571,127 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       }
     }
 
+    runtime.hw_switch_state = json_int(print, "hw_switch_state", runtime.hw_switch_state);
+    const cJSON* ams_obj = cJSON_GetObjectItemCaseSensitive(print, "ams");
+    if (cJSON_IsObject(ams_obj)) {
+      runtime.tray_now = json_int(ams_obj, "tray_now", runtime.tray_now);
+      runtime.tray_tar = json_int(ams_obj, "tray_tar", runtime.tray_tar);
+
+      const cJSON* ams_array = cJSON_GetObjectItemCaseSensitive(ams_obj, "ams");
+      if (cJSON_IsArray(ams_array)) {
+        if (!runtime.ams) {
+          runtime.ams = std::make_shared<AmsSnapshot>();
+        }
+
+        uint8_t unit_count = runtime.ams->count;
+        const cJSON* ams_unit = nullptr;
+        int ams_unit_index = 0;
+        cJSON_ArrayForEach(ams_unit, ams_array) {
+          int unit_id = json_int(ams_unit, "id", -1);
+          if (unit_id < 0) {
+            unit_id = ams_unit_index;
+          }
+          ++ams_unit_index;
+          if (unit_id < 0 || unit_id >= kMaxAmsUnits) {
+            continue;
+          }
+
+          AmsUnitInfo& unit = runtime.ams->units[unit_id];
+          unit.present = true;
+          if ((unit_id + 1) > unit_count) {
+            unit_count = static_cast<uint8_t>(unit_id + 1);
+          }
+
+          const int humidity_raw = json_int(ams_unit, "humidity_raw", -1);
+          if (humidity_raw >= 0 && humidity_raw <= 100) {
+            unit.humidity_pct = humidity_raw;
+          } else {
+            const int humidity_idx = json_int(ams_unit, "humidity", -1);
+            if (humidity_idx >= 1 && humidity_idx <= 5) {
+              static constexpr int kHumApprox[] = {10, 30, 48, 63, 85};
+              unit.humidity_pct = kHumApprox[humidity_idx - 1];
+            }
+          }
+
+          const float temp = json_number(ams_unit, "temp", -999.0f);
+          if (temp >= 0.0f && temp <= 100.0f) {
+            unit.temperature_c = temp;
+          }
+
+          const cJSON* tray_array = cJSON_GetObjectItemCaseSensitive(ams_unit, "tray");
+          if (!cJSON_IsArray(tray_array)) {
+            continue;
+          }
+
+          const cJSON* tray_obj = nullptr;
+          int tray_index = 0;
+          cJSON_ArrayForEach(tray_obj, tray_array) {
+            int tray_id = json_int(tray_obj, "id", -1);
+            if (tray_id < 0) {
+              tray_id = tray_index;
+            }
+            ++tray_index;
+            if (tray_id < 0 || tray_id >= kMaxAmsTrays) {
+              continue;
+            }
+
+            AmsTrayInfo& tray = unit.trays[tray_id];
+            const int field_count = cJSON_GetArraySize(tray_obj);
+            const bool has_only_metadata =
+                field_count <= 2 &&
+                cJSON_GetObjectItemCaseSensitive(tray_obj, "id") != nullptr &&
+                cJSON_GetObjectItemCaseSensitive(tray_obj, "tray_type") == nullptr;
+            if (has_only_metadata) {
+              tray.present = false;
+              tray.active = false;
+              tray.material_type.clear();
+              tray.material_name.clear();
+              tray.color_rgba = 0;
+              tray.remain_pct = -1;
+              continue;
+            }
+
+            tray.present = true;
+            const std::string tray_type = json_string(tray_obj, "tray_type", tray.material_type);
+            if (!tray_type.empty()) {
+              tray.material_type = tray_type;
+            }
+            const std::string material_name =
+                json_string(tray_obj, "tray_sub_brands", tray.material_name);
+            if (!material_name.empty()) {
+              tray.material_name = material_name;
+            }
+            const std::string color_str = json_string(tray_obj, "tray_color", {});
+            if (color_str.size() >= 6) {
+              char* end = nullptr;
+              const uint32_t rgba =
+                  static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
+              if (end != color_str.c_str()) {
+                tray.color_rgba = rgba;
+              }
+            }
+            const int remain = json_int(tray_obj, "remain", -1);
+            if (remain >= 0 && remain <= 100) {
+              tray.remain_pct = remain;
+            }
+          }
+        }
+
+        runtime.ams->count = unit_count;
+      }
+
+      if (runtime.ams) {
+        for (uint8_t unit_id = 0; unit_id < runtime.ams->count && unit_id < kMaxAmsUnits; ++unit_id) {
+          AmsUnitInfo& unit = runtime.ams->units[unit_id];
+          for (int tray_id = 0; tray_id < kMaxAmsTrays; ++tray_id) {
+            AmsTrayInfo& tray = unit.trays[tray_id];
+            const int global_tray_idx = unit_id * kMaxAmsTrays + tray_id;
+            tray.active = tray.present && runtime.tray_now == global_tray_idx;
+          }
+        }
+      }
+    }
+
     // When a healthy (non-error) status update arrives, clear stale error indicators that
     // were carried over from previous payloads via the fallback mechanism.  Cloud MQTT sends
     // partial updates—if a fragment omits hms/print_error the extract helpers return the
@@ -2487,7 +2757,10 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     return;
   }
 
-  const cJSON* info = child_object(root, "info");
+  const cJSON* info_wrapper = child_object(root, "get_version");
+  const cJSON* info =
+      cJSON_IsObject(child_object(root, "info")) ? child_object(root, "info")
+                                                  : child_object(info_wrapper, "info");
   if (cJSON_IsObject(info)) {
     CloudLiveRuntimeState runtime = live_runtime_copy();
     runtime.configured = true;
@@ -2597,6 +2870,38 @@ void BambuCloudClient::task_loop() {
       last_binding_fetch_tick = 0;
     }
 
+    if (mqtt_auth_recovery_requested_.exchange(false)) {
+      stop_mqtt_client();
+      mqtt_connected_ = false;
+      mqtt_subscription_acknowledged_ = false;
+      const auto code = static_cast<esp_mqtt_connect_return_code_t>(
+          mqtt_auth_connect_return_code_.load());
+      access_token_.clear();
+      token_expiry_us_ = 0;
+      mqtt_username_.clear();
+
+      if (credentials_.can_password_login()) {
+        const std::string detail =
+            code == MQTT_CONNECTION_REFUSE_BAD_USERNAME
+                ? "Bambu Cloud MQTT username rejected; retrying login in " +
+                      std::to_string(kCloudAuthRetryBackoffSeconds) + " s"
+                : "Bambu Cloud auth rejected; retrying login in " +
+                      std::to_string(kCloudAuthRetryBackoffSeconds) + " s";
+        apply_cloud_session_state(true, false, false, false, detail, false, true);
+      } else {
+        clear_persisted_access_token();
+        apply_cloud_session_state(
+            true, false, false, false,
+            code == MQTT_CONNECTION_REFUSE_BAD_USERNAME
+                ? "Bambu Cloud MQTT username rejected; please re-login in setup portal"
+                : "Bambu Cloud auth rejected; please re-login in setup portal",
+            false, true);
+      }
+
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+      continue;
+    }
+
     if (access_token_.empty() && !credentials_.can_password_login()) {
       stop_mqtt_client();
       apply_cloud_session_state(
@@ -2616,6 +2921,21 @@ void BambuCloudClient::task_loop() {
     }
 
     const int64_t now_us = esp_timer_get_time();
+    const int64_t auth_retry_not_before_us = mqtt_auth_retry_not_before_us_.load();
+    if (auth_retry_not_before_us != 0 && now_us < auth_retry_not_before_us) {
+      stop_mqtt_client();
+      const int64_t remaining_us = auth_retry_not_before_us - now_us;
+      const TickType_t retry_wait =
+          pdMS_TO_TICKS(static_cast<uint32_t>(std::max<int64_t>(1, remaining_us / 1000LL)));
+      const TickType_t wait_slice =
+          retry_wait > pdMS_TO_TICKS(1000) ? pdMS_TO_TICKS(1000) : retry_wait;
+      ulTaskNotifyTake(pdTRUE, wait_slice);
+      continue;
+    }
+    if (auth_retry_not_before_us != 0) {
+      mqtt_auth_retry_not_before_us_ = 0;
+    }
+
     if (access_token_.empty() || now_us >= token_expiry_us_) {
       stop_mqtt_client();
       mqtt_username_.clear();
@@ -2852,6 +3172,9 @@ bool BambuCloudClient::authenticate_with_password() {
   access_token_ = token;
   token_expiry_us_ = esp_timer_get_time() + static_cast<int64_t>(std::max(expires_in - 60, 60)) * 1000000LL;
   mqtt_username_.clear();
+  mqtt_auth_recovery_requested_ = false;
+  mqtt_auth_connect_return_code_ = static_cast<int>(MQTT_CONNECTION_ACCEPTED);
+  mqtt_auth_retry_not_before_us_ = 0;
   stop_mqtt_client();
   const bool token_persisted = persist_access_token();
   if (token_persisted && config_store_ != nullptr) {
@@ -2916,6 +3239,9 @@ bool BambuCloudClient::authenticate_with_email_code(const std::string& code) {
     token_expiry_us_ =
         esp_timer_get_time() + static_cast<int64_t>(std::max(expires_in - 60, 60)) * 1000000LL;
     mqtt_username_.clear();
+    mqtt_auth_recovery_requested_ = false;
+    mqtt_auth_connect_return_code_ = static_cast<int>(MQTT_CONNECTION_ACCEPTED);
+    mqtt_auth_retry_not_before_us_ = 0;
     stop_mqtt_client();
     const bool token_persisted = persist_access_token();
     if (token_persisted && config_store_ != nullptr) {
@@ -3808,10 +4134,8 @@ int BambuCloudClient::json_int(const cJSON* object, const char* key, int fallbac
   }
 
   const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
-  if (cJSON_IsNumber(item)) {
-    return item->valueint;
-  }
-  return fallback;
+  int value = fallback;
+  return json_int_like(item, &value) ? value : fallback;
 }
 
 float BambuCloudClient::json_number(const cJSON* object, const char* key, float fallback) {
@@ -3820,10 +4144,8 @@ float BambuCloudClient::json_number(const cJSON* object, const char* key, float 
   }
 
   const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
-  if (cJSON_IsNumber(item)) {
-    return static_cast<float>(item->valuedouble);
-  }
-  return fallback;
+  float value = fallback;
+  return json_float_like(item, &value) ? value : fallback;
 }
 
 bool BambuCloudClient::json_bool(const cJSON* object, const char* key, bool fallback) {

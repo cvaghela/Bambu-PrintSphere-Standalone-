@@ -68,6 +68,10 @@ struct BambuCloudSnapshot {
   uint16_t current_layer = 0;
   uint16_t total_layers = 0;
   int print_error_code = 0;
+  int hw_switch_state = -1;
+  int tray_now = -1;
+  int tray_tar = -1;
+  std::shared_ptr<AmsSnapshot> ams;
   std::vector<uint64_t> hms_codes;
   uint16_t hms_alert_count = 0;
   uint64_t live_data_last_update_ms = 0;
@@ -116,6 +120,10 @@ class BambuCloudClient {
     uint16_t current_layer = 0;
     uint16_t total_layers = 0;
     int print_error_code = 0;
+    int hw_switch_state = -1;
+    int tray_now = -1;
+    int tray_tar = -1;
+    std::shared_ptr<AmsSnapshot> ams;
     std::vector<uint64_t> hms_codes;
     uint16_t hms_alert_count = 0;
     bool has_error = false;
@@ -270,6 +278,11 @@ class BambuCloudClient {
   std::atomic<uint32_t> initial_sync_tick_{0};
   std::atomic<bool> live_runtime_dirty_{false};
   std::atomic<bool> rest_runtime_dirty_{false};
+  std::atomic<bool> mqtt_auth_recovery_requested_{false};
+  std::atomic<int> mqtt_auth_connect_return_code_{
+      static_cast<int>(MQTT_CONNECTION_ACCEPTED)};
+  std::atomic<int64_t> mqtt_auth_retry_not_before_us_{0};
+  std::atomic<int> cloud_payload_probe_logs_remaining_{3};
   mutable std::mutex auth_mutex_{};
   AuthMode auth_mode_ = AuthMode::kPassword;
   std::string tfa_key_{};

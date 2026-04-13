@@ -71,6 +71,7 @@ class Ui {
   void note_activity(bool wake_display);
   void wake_display();
   void apply_brightness_policy();
+  void set_pager_scroll_locked(bool locked);
   void set_active_page(int page);
   int clamp_enabled_page(int page) const;
   int next_enabled_page(int page, int direction) const;
@@ -186,6 +187,7 @@ class Ui {
   bool bed_aux_visible_ = false;
   bool ring_animation_active_ = false;
   bool swipe_switched_ = false;
+  bool pager_scroll_locked_ = false;
   uint8_t active_ring_anim_kind_ = 0;
   uint32_t pulse_base_hex_ = 0;
   bool pulse_both_parts_ = false;
