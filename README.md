@@ -41,6 +41,50 @@ Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch se
 - AMS page with individual tray pills and EXT spool indicator
 - OTA firmware update support
 
+## Flashing
+
+[`release/initial/printsphere_full.bin`](release/initial/printsphere_full.bin) is the merged initial-flash image for empty devices.
+
+For OTA updates, use [`release/ota/printsphere_ota.bin`](release/ota/printsphere_ota.bin).
+
+Versioned builds are archived in the `archive/` subfolder of each release directory.
+
+### Web Flashers
+
+`web.esphome.io`
+`https://web.esphome.io/`
+
+- connect USB
+- choose the COM port
+- do not use "Prepare for first use"
+- install `printsphere_full.bin` directly
+
+`espboards.dev`
+`https://www.espboards.dev/tools/program/`
+
+- write `printsphere_full.bin` to address `0x0`
+
+`esptool-js`
+`https://espressif.github.io/esptool-js/`
+
+- write `printsphere_full.bin` to address `0x0`
+
+The bootloader is already included in the merged image.
+
+### Local Build / Flash
+
+If you clone the repo and build it yourself:
+
+```bash
+idf.py -p PORT flash
+```
+
+Alternatively, write the merged image directly with `esptool`:
+
+```bash
+esptool.exe --chip esp32s3 --port PORT write_flash 0x0 release/initial/printsphere_full.bin
+```
+
 ## Setup Flow
 
 1. Flash [`printsphere_full.bin`](https://github.com/cptkirki/PrintSphere/blob/main/release/initial/printsphere_full.bin)
@@ -138,46 +182,4 @@ Arc colors are intended to preview live immediately and can be saved without res
 - `Local only` works, but the broadest hands-on validation so far is still in `Hybrid` and `Cloud only`
 - most hands-on testing so far has been on `P1S` and `P1P`
 
-## Flashing
 
-[`release/initial/printsphere_full.bin`](release/initial/printsphere_full.bin) is the merged initial-flash image for empty devices.
-
-For OTA updates, use [`release/ota/printsphere_ota.bin`](release/ota/printsphere_ota.bin).
-
-Versioned builds are archived in the `archive/` subfolder of each release directory.
-
-### Web Flashers
-
-`web.esphome.io`
-`https://web.esphome.io/`
-
-- connect USB
-- choose the COM port
-- do not use "Prepare for first use"
-- install `printsphere_full.bin` directly
-
-`espboards.dev`
-`https://www.espboards.dev/tools/program/`
-
-- write `printsphere_full.bin` to address `0x0`
-
-`esptool-js`
-`https://espressif.github.io/esptool-js/`
-
-- write `printsphere_full.bin` to address `0x0`
-
-The bootloader is already included in the merged image.
-
-### Local Build / Flash
-
-If you clone the repo and build it yourself:
-
-```bash
-idf.py -p PORT flash
-```
-
-Alternatively, write the merged image directly with `esptool`:
-
-```bash
-esptool.exe --chip esp32s3 --port PORT write_flash 0x0 release/initial/printsphere_full.bin
-```
