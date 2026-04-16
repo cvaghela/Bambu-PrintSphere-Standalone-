@@ -1452,6 +1452,35 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
   return bundle;
 }
 
+// Extract tray_now override from device.extruder.info[].snow (V2 protocol).
+// See extract_extruder_snow_tray_now in printer_client.cpp for full documentation.
+int extract_extruder_snow_tray_now(const cJSON* source) {
+  const cJSON* device = child_object_local(source, "device");
+  if (device == nullptr) return -1;
+  const cJSON* extruder = child_object_local(device, "extruder");
+  if (extruder == nullptr) return -1;
+  const cJSON* info_array = cJSON_GetObjectItemCaseSensitive(extruder, "info");
+  if (!cJSON_IsArray(info_array)) return -1;
+
+  const cJSON* item = nullptr;
+  cJSON_ArrayForEach(item, info_array) {
+    const int id = json_int_local(item, "id", -1);
+    if (id != 0) continue;
+    const cJSON* snow_item = cJSON_GetObjectItemCaseSensitive(item, "snow");
+    if (snow_item == nullptr || !cJSON_IsNumber(snow_item)) return -1;
+
+    const int snow = snow_item->valueint;
+    const int ams_id = (snow >> 8) & 0xFF;
+    const int slot_id = snow & 0xFF;
+    ESP_LOGI(kTag, "[DIAG] cloud extruder snow: raw=%d ams_id=%d slot_id=%d", snow, ams_id, slot_id);
+
+    if (ams_id == 255) return 254;
+    if (ams_id >= 128) return ams_id;
+    return ams_id * 4 + slot_id;
+  }
+  return -1;
+}
+
 TemperatureSample extract_cloud_bed_temperature_c(const cJSON* item, float fallback) {
   TemperatureSample sample{fallback, false};
   const cJSON* item_print = child_object_local(item, "print");
@@ -2014,11 +2043,13 @@ void BambuCloudClient::publish_combined_snapshot() {
     current.hw_switch_state = live.hw_switch_state;
     current.tray_now = live.tray_now;
     current.tray_tar = live.tray_tar;
+    current.ams_status_main = live.ams_status_main;
     current.ams = live.ams;
   } else {
     current.hw_switch_state = -1;
     current.tray_now = -1;
     current.tray_tar = -1;
+    current.ams_status_main = -1;
     current.ams.reset();
   }
   if (live_has_recent_state &&
@@ -2665,6 +2696,14 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       runtime.tray_now = json_int(ams_obj, "tray_now", runtime.tray_now);
       runtime.tray_tar = json_int(ams_obj, "tray_tar", runtime.tray_tar);
 
+      // V2 protocol override: P2S/H2 series send device.extruder.info[].snow.
+      const int snow_tray = extract_extruder_snow_tray_now(print);
+      if (snow_tray >= 0 && snow_tray != runtime.tray_now) {
+        ESP_LOGI(kTag, "cloud tray_now override from snow: ams.tray_now=%d -> snow=%d",
+                 runtime.tray_now, snow_tray);
+        runtime.tray_now = snow_tray;
+      }
+
       const cJSON* ams_array = cJSON_GetObjectItemCaseSensitive(ams_obj, "ams");
       if (cJSON_IsArray(ams_array)) {
         if (!runtime.ams) {
@@ -2780,32 +2819,67 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       }
     }
 
-    // Parse vt_tray (external spool) from cloud MQTT.
-    // Some printers place vt_tray inside "ams", others as sibling under "print".
+    // Parse vt_tray / vir_slot (external spool) from cloud MQTT.
+    // Legacy printers use "vt_tray" (object), P2S/H2 use "vir_slot" (array).
     {
-      const cJSON* vt_tray = (ams_obj != nullptr)
-          ? cJSON_GetObjectItemCaseSensitive(ams_obj, "vt_tray") : nullptr;
-      if (vt_tray == nullptr || !cJSON_IsObject(vt_tray)) {
-        vt_tray = cJSON_GetObjectItemCaseSensitive(print, "vt_tray");
-      }
-      if (vt_tray != nullptr && cJSON_IsObject(vt_tray)) {
-        if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
-        AmsTrayInfo& ext = runtime.ams->external_spool;
-        const int field_count = cJSON_GetArraySize(vt_tray);
-        if (field_count > 1) {
-          ext.present = true;
-          const std::string tray_type = json_string(vt_tray, "tray_type", ext.material_type);
-          if (!tray_type.empty()) ext.material_type = tray_type;
-          const std::string sub_brands = json_string(vt_tray, "tray_sub_brands", ext.material_name);
-          if (!sub_brands.empty()) ext.material_name = sub_brands;
-          const std::string color_str = json_string(vt_tray, "tray_color", "");
-          if (color_str.size() >= 6) {
-            char* end = nullptr;
-            const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
-            if (end != color_str.c_str()) ext.color_rgba = rgba;
+      bool parsed_ext_spool = false;
+
+      // V2 path: vir_slot array (P2S/H2 series).
+      const cJSON* vir_slot = cJSON_GetObjectItemCaseSensitive(print, "vir_slot");
+      if (vir_slot != nullptr && cJSON_IsArray(vir_slot)) {
+        const cJSON* slot_item = nullptr;
+        cJSON_ArrayForEach(slot_item, vir_slot) {
+          if (!cJSON_IsObject(slot_item)) continue;
+          const std::string slot_id = json_string(slot_item, "id", "");
+          if (slot_id != "255") continue;
+          if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
+          AmsTrayInfo& ext = runtime.ams->external_spool;
+          const int field_count = cJSON_GetArraySize(slot_item);
+          if (field_count > 1) {
+            ext.present = true;
+            const std::string tray_type = json_string(slot_item, "tray_type", ext.material_type);
+            if (!tray_type.empty()) ext.material_type = tray_type;
+            const std::string sub_brands = json_string(slot_item, "tray_sub_brands", ext.material_name);
+            if (!sub_brands.empty()) ext.material_name = sub_brands;
+            const std::string color_str = json_string(slot_item, "tray_color", "");
+            if (color_str.size() >= 6) {
+              char* end = nullptr;
+              const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
+              if (end != color_str.c_str()) ext.color_rgba = rgba;
+            }
           }
+          ext.active = (runtime.tray_now == 254);
+          parsed_ext_spool = true;
+          break;
         }
-        ext.active = (runtime.tray_now == 254);
+      }
+
+      // V1 path: vt_tray object (X1/P1/A1 series).
+      if (!parsed_ext_spool) {
+        const cJSON* vt_tray = (ams_obj != nullptr)
+            ? cJSON_GetObjectItemCaseSensitive(ams_obj, "vt_tray") : nullptr;
+        if (vt_tray == nullptr || !cJSON_IsObject(vt_tray)) {
+          vt_tray = cJSON_GetObjectItemCaseSensitive(print, "vt_tray");
+        }
+        if (vt_tray != nullptr && cJSON_IsObject(vt_tray)) {
+          if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
+          AmsTrayInfo& ext = runtime.ams->external_spool;
+          const int field_count = cJSON_GetArraySize(vt_tray);
+          if (field_count > 1) {
+            ext.present = true;
+            const std::string tray_type = json_string(vt_tray, "tray_type", ext.material_type);
+            if (!tray_type.empty()) ext.material_type = tray_type;
+            const std::string sub_brands = json_string(vt_tray, "tray_sub_brands", ext.material_name);
+            if (!sub_brands.empty()) ext.material_name = sub_brands;
+            const std::string color_str = json_string(vt_tray, "tray_color", "");
+            if (color_str.size() >= 6) {
+              char* end = nullptr;
+              const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
+              if (end != color_str.c_str()) ext.color_rgba = rgba;
+            }
+          }
+          ext.active = (runtime.tray_now == 254);
+        }
       }
     }
 
@@ -2853,8 +2927,11 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       runtime.chamber_light_pending_since_ms = 0;
     }
 
-    const std::string error_detail = format_error_detail(
-        runtime.print_error_code, runtime.hms_codes, runtime.hms_alert_count, runtime.model);
+    const bool finished_no_error = runtime.lifecycle == PrintLifecycleState::kFinished &&
+                                    runtime.print_error_code == 0;
+    const std::string error_detail = finished_no_error ? std::string{} :
+        format_error_detail(
+            runtime.print_error_code, runtime.hms_codes, runtime.hms_alert_count, runtime.model);
     if (!error_detail.empty()) {
       copy_text(&runtime.detail, error_detail);
     } else if (has_text(runtime.stage)) {

@@ -568,12 +568,17 @@ bool is_generic_finished_detail(const std::string& detail, const std::string& st
 }
 
 void apply_resolved_detail(PrinterSnapshot& snapshot) {
-  const PrinterModel model = effective_model_for_snapshot(snapshot);
-  const std::string resolved_error = format_resolved_error_detail(
-      snapshot.print_error_code, snapshot.hms_codes, snapshot.hms_alert_count, model);
-  if (!resolved_error.empty()) {
-    snapshot.detail = resolved_error;
-    return;
+  const bool finished_no_error =
+      (snapshot.lifecycle == PrintLifecycleState::kFinished || snapshot.ui_status == "done") &&
+      snapshot.print_error_code == 0;
+  if (!finished_no_error) {
+    const PrinterModel model = effective_model_for_snapshot(snapshot);
+    const std::string resolved_error = format_resolved_error_detail(
+        snapshot.print_error_code, snapshot.hms_codes, snapshot.hms_alert_count, model);
+    if (!resolved_error.empty()) {
+      snapshot.detail = resolved_error;
+      return;
+    }
   }
 
   if (snapshot.lifecycle == PrintLifecycleState::kFinished || snapshot.ui_status == "done") {

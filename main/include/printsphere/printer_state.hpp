@@ -164,6 +164,7 @@ struct PrinterSnapshot {
   int hw_switch_state = -1;
   int tray_now = -1;
   int tray_tar = -1;
+  int ams_status_main = -1;
   std::shared_ptr<AmsSnapshot> ams;
 };
 

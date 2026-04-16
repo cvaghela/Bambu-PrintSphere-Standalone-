@@ -882,6 +882,39 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
   return bundle;
 }
 
+// Extract tray_now override from device.extruder.info[].snow (V2 protocol).
+// P2S, H2, and newer Bambu printers send the active slot via the "snow" field
+// in device.extruder.info[] alongside (or instead of) the legacy ams.tray_now.
+// snow encoding: bits[0:7] = slot_id, bits[8:15] = ams_id.
+// ams_id == 255 means external spool (VIRTUAL_TRAY_MAIN_ID).
+// Returns the mapped tray_now value, or -1 if no snow field is present.
+int extract_extruder_snow_tray_now(const cJSON* print) {
+  const cJSON* device = child_object_local(print, "device");
+  if (device == nullptr) return -1;
+  const cJSON* extruder = child_object_local(device, "extruder");
+  if (extruder == nullptr) return -1;
+  const cJSON* info_array = cJSON_GetObjectItemCaseSensitive(extruder, "info");
+  if (!cJSON_IsArray(info_array)) return -1;
+
+  const cJSON* item = nullptr;
+  cJSON_ArrayForEach(item, info_array) {
+    const int id = json_int_local(item, "id", -1);
+    if (id != 0) continue;  // Primary extruder only.
+    const cJSON* snow_item = cJSON_GetObjectItemCaseSensitive(item, "snow");
+    if (snow_item == nullptr || !cJSON_IsNumber(snow_item)) return -1;
+
+    const int snow = snow_item->valueint;
+    const int ams_id = (snow >> 8) & 0xFF;
+    const int slot_id = snow & 0xFF;
+    ESP_LOGI(kTag, "[DIAG] extruder snow: raw=%d ams_id=%d slot_id=%d", snow, ams_id, slot_id);
+
+    if (ams_id == 255) return 254;        // External spool.
+    if (ams_id >= 128) return ams_id;     // AMS HT (single-tray).
+    return ams_id * 4 + slot_id;          // Standard AMS.
+  }
+  return -1;
+}
+
 struct LocalProgressPercent {
   bool has_value = false;
   float value = 0.0f;
@@ -1302,6 +1335,7 @@ PrinterSnapshot PrinterClient::build_snapshot_from_runtime(
   snapshot.hw_switch_state = runtime.hw_switch_state;
   snapshot.tray_now = runtime.tray_now;
   snapshot.tray_tar = runtime.tray_tar;
+  snapshot.ams_status_main = runtime.ams_status_main;
   snapshot.ams = runtime.ams;
   return snapshot;
 }
@@ -1611,6 +1645,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     // Absent ams_status (field not in JSON → -1) does not touch the latch.
     if (raw_ams_status >= 0) {
       runtime.ams_filament_change_latched = ams_filament_change;
+      runtime.ams_status_main = ams_status_main;
     }
     const bool ams_change_active = runtime.ams_filament_change_latched;
     const bool stage_id_generic = (stage_id == 0 || stage_id == -1 || stage_id == 255);
@@ -1709,12 +1744,23 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     // Parse tray_now / tray_tar from ams object.
     // tray_now encoding: 255=none, 254=external spool, else ams_index*4+tray_index.
     if (ams_obj != nullptr) {
-      const int new_tray_now = json_int(ams_obj, "tray_now", runtime.tray_now);
+      int effective_tray_now = json_int(ams_obj, "tray_now", runtime.tray_now);
       const int new_tray_tar = json_int(ams_obj, "tray_tar", runtime.tray_tar);
-      if (new_tray_now != runtime.tray_now || new_tray_tar != runtime.tray_tar) {
+
+      // V2 protocol override: P2S/H2 series send device.extruder.info[].snow which is
+      // the authoritative source for the active tray on newer printers.  Map it back to
+      // legacy tray_now encoding so all downstream ext-spool / AMS-tray logic works.
+      const int snow_tray = extract_extruder_snow_tray_now(print);
+      if (snow_tray >= 0 && snow_tray != effective_tray_now) {
+        ESP_LOGI(kTag, "tray_now override from snow: ams.tray_now=%d -> snow=%d",
+                 effective_tray_now, snow_tray);
+        effective_tray_now = snow_tray;
+      }
+
+      if (effective_tray_now != runtime.tray_now || new_tray_tar != runtime.tray_tar) {
         ESP_LOGI(kTag, "tray: now=%d->%d tar=%d->%d",
-                 runtime.tray_now, new_tray_now, runtime.tray_tar, new_tray_tar);
-        runtime.tray_now = new_tray_now;
+                 runtime.tray_now, effective_tray_now, runtime.tray_tar, new_tray_tar);
+        runtime.tray_now = effective_tray_now;
         runtime.tray_tar = new_tray_tar;
       }
 
@@ -1793,9 +1839,9 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
               const int remain = json_int(tray_obj, "remain", -1);
               if (remain >= 0 && remain <= 100) tray.remain_pct = remain;
 
-              // Mark active based on global tray_now.
+              // Mark active based on global tray_now (which may include snow override).
               const int global_tray_idx = unit_id * kMaxAmsTrays + tray_id;
-              tray.active = (new_tray_now == global_tray_idx);
+              tray.active = (runtime.tray_now == global_tray_idx);
             }
           }
         }
@@ -1841,46 +1887,95 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     }
 
     // Parse vt_tray (external / virtual tray) for external spool info.
+    // Legacy printers use "vt_tray" (object), P2S/H2 use "vir_slot" (array).
     // Some printers place vt_tray inside the "ams" object, others as a
     // sibling of "ams" directly under "print".  Check both locations.
     {
-      const cJSON* vt_tray = (ams_obj != nullptr)
-          ? cJSON_GetObjectItemCaseSensitive(ams_obj, "vt_tray") : nullptr;
-      if (vt_tray == nullptr || !cJSON_IsObject(vt_tray)) {
-        vt_tray = cJSON_GetObjectItemCaseSensitive(print, "vt_tray");
-      }
-      if (vt_tray != nullptr && cJSON_IsObject(vt_tray)) {
-        if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
-        AmsTrayInfo& ext = runtime.ams->external_spool;
-        const int field_count = cJSON_GetArraySize(vt_tray);
-        if (field_count > 1) {
-          ext.present = true;
-          const std::string tray_type = json_string(vt_tray, "tray_type", ext.material_type);
-          if (!tray_type.empty()) ext.material_type = tray_type;
-          const std::string sub_brands = json_string(vt_tray, "tray_sub_brands", ext.material_name);
-          if (!sub_brands.empty()) ext.material_name = sub_brands;
-          if (ext.material_name.empty()) {
-            const std::string tray_idx = json_string(vt_tray, "tray_info_idx", "");
-            if (!tray_idx.empty()) {
-              const char* resolved = resolve_filament_name(tray_idx.c_str());
-              if (resolved) ext.material_name = resolved;
+      bool parsed_ext_spool = false;
+
+      // V2 path: vir_slot is an array of virtual tray objects (P2S/H2 series).
+      // Each element has "id": "255" (main ext spool) or "254" (deputy).
+      const cJSON* vir_slot = cJSON_GetObjectItemCaseSensitive(print, "vir_slot");
+      if (vir_slot != nullptr && cJSON_IsArray(vir_slot)) {
+        const cJSON* slot_item = nullptr;
+        cJSON_ArrayForEach(slot_item, vir_slot) {
+          if (!cJSON_IsObject(slot_item)) continue;
+          const std::string slot_id = json_string(slot_item, "id", "");
+          if (slot_id != "255") continue;  // Only parse main ext spool.
+          if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
+          AmsTrayInfo& ext = runtime.ams->external_spool;
+          const int field_count = cJSON_GetArraySize(slot_item);
+          if (field_count > 1) {
+            ext.present = true;
+            const std::string tray_type = json_string(slot_item, "tray_type", ext.material_type);
+            if (!tray_type.empty()) ext.material_type = tray_type;
+            const std::string sub_brands = json_string(slot_item, "tray_sub_brands", ext.material_name);
+            if (!sub_brands.empty()) ext.material_name = sub_brands;
+            if (ext.material_name.empty()) {
+              const std::string tray_idx = json_string(slot_item, "tray_info_idx", "");
+              if (!tray_idx.empty()) {
+                const char* resolved = resolve_filament_name(tray_idx.c_str());
+                if (resolved) ext.material_name = resolved;
+              }
             }
+            const std::string color_str = json_string(slot_item, "tray_color", "");
+            if (color_str.size() >= 6) {
+              char* end = nullptr;
+              const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
+              if (end != color_str.c_str()) ext.color_rgba = rgba;
+            }
+            ESP_LOGI(kTag, "[DIAG] vir_slot[255]: fields=%d type=%s name=%s color=0x%08X",
+                     field_count,
+                     ext.material_type.empty() ? "(-)" : ext.material_type.c_str(),
+                     ext.material_name.empty() ? "(-)" : ext.material_name.c_str(),
+                     (unsigned)ext.color_rgba);
           }
-          const std::string color_str = json_string(vt_tray, "tray_color", "");
-          if (color_str.size() >= 6) {
-            char* end = nullptr;
-            const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
-            if (end != color_str.c_str()) ext.color_rgba = rgba;
-          }
-          ESP_LOGI(kTag, "[DIAG] vt_tray: fields=%d type=%s name=%s color=0x%08X",
-                   field_count,
-                   ext.material_type.empty() ? "(-)" : ext.material_type.c_str(),
-                   ext.material_name.empty() ? "(-)" : ext.material_name.c_str(),
-                   (unsigned)ext.color_rgba);
-        } else {
-          ESP_LOGD(kTag, "[DIAG] vt_tray: only %d field(s), skipped", field_count);
+          ext.active = (runtime.tray_now == 254);
+          parsed_ext_spool = true;
+          break;
         }
-        ext.active = (runtime.tray_now == 254);
+      }
+
+      // V1 path: vt_tray is a single object (X1/P1/A1 series).
+      if (!parsed_ext_spool) {
+        const cJSON* vt_tray = (ams_obj != nullptr)
+            ? cJSON_GetObjectItemCaseSensitive(ams_obj, "vt_tray") : nullptr;
+        if (vt_tray == nullptr || !cJSON_IsObject(vt_tray)) {
+          vt_tray = cJSON_GetObjectItemCaseSensitive(print, "vt_tray");
+        }
+        if (vt_tray != nullptr && cJSON_IsObject(vt_tray)) {
+          if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
+          AmsTrayInfo& ext = runtime.ams->external_spool;
+          const int field_count = cJSON_GetArraySize(vt_tray);
+          if (field_count > 1) {
+            ext.present = true;
+            const std::string tray_type = json_string(vt_tray, "tray_type", ext.material_type);
+            if (!tray_type.empty()) ext.material_type = tray_type;
+            const std::string sub_brands = json_string(vt_tray, "tray_sub_brands", ext.material_name);
+            if (!sub_brands.empty()) ext.material_name = sub_brands;
+            if (ext.material_name.empty()) {
+              const std::string tray_idx = json_string(vt_tray, "tray_info_idx", "");
+              if (!tray_idx.empty()) {
+                const char* resolved = resolve_filament_name(tray_idx.c_str());
+                if (resolved) ext.material_name = resolved;
+              }
+            }
+            const std::string color_str = json_string(vt_tray, "tray_color", "");
+            if (color_str.size() >= 6) {
+              char* end = nullptr;
+              const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
+              if (end != color_str.c_str()) ext.color_rgba = rgba;
+            }
+            ESP_LOGI(kTag, "[DIAG] vt_tray: fields=%d type=%s name=%s color=0x%08X",
+                     field_count,
+                     ext.material_type.empty() ? "(-)" : ext.material_type.c_str(),
+                     ext.material_name.empty() ? "(-)" : ext.material_name.c_str(),
+                     (unsigned)ext.color_rgba);
+          } else {
+            ESP_LOGD(kTag, "[DIAG] vt_tray: only %d field(s), skipped", field_count);
+          }
+          ext.active = (runtime.tray_now == 254);
+        }
       }
     }
 
@@ -2038,7 +2133,10 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
       runtime.progress_is_download_related = false;
     }
 
+    const bool finished_no_error = runtime.lifecycle == PrintLifecycleState::kFinished &&
+                                    runtime.print_error_code == 0;
     const std::string error_detail =
+        finished_no_error ? std::string{} :
         error_detail_for(runtime.print_error_code, runtime.hms_codes, runtime.hms_alert_count,
                          runtime.local_model);
     if (!error_detail.empty()) {
