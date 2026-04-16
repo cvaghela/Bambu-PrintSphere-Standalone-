@@ -7,7 +7,6 @@ Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch se
 ## MakerWorld
 
 - MakerWorld model: `https://makerworld.com/de/models/2517189-printsphere-bambu-status-display-standalone-1-75`
-- End-user setup guide: [`MAKERWORLD.md`](MAKERWORLD.md)
 
 ## Hardware And Stack
 
