@@ -534,12 +534,12 @@ std::string decode_username_from_access_token(const std::string& token) {
     username = item->valuestring;
   }
   if (username.empty()) {
-    int uid = -1;
+    int64_t uid = -1;
     const cJSON* uid_item = cJSON_GetObjectItemCaseSensitive(root, "uid");
     if (cJSON_IsNumber(uid_item)) {
-      uid = uid_item->valueint;
+      uid = static_cast<int64_t>(uid_item->valuedouble);
     } else if (cJSON_IsString(uid_item) && uid_item->valuestring != nullptr) {
-      uid = static_cast<int>(std::strtol(uid_item->valuestring, nullptr, 10));
+      uid = std::strtoll(uid_item->valuestring, nullptr, 10);
     }
     if (uid > 0) {
       username = "u_" + std::to_string(uid);
@@ -2402,10 +2402,20 @@ bool BambuCloudClient::ensure_cloud_mqtt_identity() {
       cJSON* root = cJSON_Parse(response_body.c_str());
       if (root != nullptr) {
         const cJSON* data = child_object(root, "data");
-        const int uid = json_int(root, "uid",
-                                 json_int(data, "uid",
-                                          json_int(root, "uidStr",
-                                                   json_int(data, "uidStr", -1))));
+        int64_t uid = -1;
+        for (const char* key : {"uid", "uidStr"}) {
+          if (uid > 0) break;
+          for (const cJSON* obj : {static_cast<const cJSON*>(root), data}) {
+            if (obj == nullptr) continue;
+            const cJSON* item = cJSON_GetObjectItemCaseSensitive(obj, key);
+            if (cJSON_IsNumber(item)) {
+              uid = static_cast<int64_t>(item->valuedouble);
+            } else if (cJSON_IsString(item) && item->valuestring != nullptr) {
+              uid = std::strtoll(item->valuestring, nullptr, 10);
+            }
+            if (uid > 0) break;
+          }
+        }
         if (uid > 0) {
           username = "u_" + std::to_string(uid);
         }
