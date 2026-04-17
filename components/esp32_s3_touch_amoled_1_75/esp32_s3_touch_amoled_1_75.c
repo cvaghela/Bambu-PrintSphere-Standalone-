@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_interface.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_io_additions.h"
 
@@ -33,6 +35,7 @@ static lv_indev_t *disp_indev = NULL;
 sdmmc_card_t *bsp_sdcard = NULL; // Global uSD card handler
 static esp_lcd_touch_handle_t tp = NULL;
 static esp_lcd_panel_handle_t panel_handle = NULL; // LCD panel handle
+static esp_lcd_panel_handle_t adapter_panel_handle = NULL; // Rotation-aware panel handle for LVGL
 static esp_lcd_panel_io_handle_t io_handle = NULL;
 uint8_t brightness;
 static i2s_chan_handle_t i2s_tx_chan = NULL;
@@ -71,6 +74,210 @@ static const co5300_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x11, NULL, 0, 600},
     {0x29, NULL, 0, 0},
 };
+
+typedef struct {
+    esp_lcd_panel_t base;
+    esp_lcd_panel_handle_t target;
+    bsp_display_rotation_t rotation;
+    uint16_t *rotation_buffer;
+    size_t rotation_buffer_pixels;
+} bsp_rotation_panel_t;
+
+static bsp_rotation_panel_t rotation_panel = {0};
+
+static bsp_rotation_panel_t *bsp_rotation_panel_from_base(esp_lcd_panel_t *panel)
+{
+    return panel ? (bsp_rotation_panel_t *)panel->user_data : NULL;
+}
+
+static esp_err_t bsp_rotation_panel_reset(esp_lcd_panel_t *panel)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_reset(ctx->target) : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t bsp_rotation_panel_init(esp_lcd_panel_t *panel)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_init(ctx->target) : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t bsp_rotation_panel_del(esp_lcd_panel_t *panel)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    if (!ctx || !ctx->target)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    free(ctx->rotation_buffer);
+    ctx->rotation_buffer = NULL;
+    ctx->rotation_buffer_pixels = 0;
+    return esp_lcd_panel_del(ctx->target);
+}
+
+static bool bsp_rotation_panel_ensure_buffer(bsp_rotation_panel_t *ctx, size_t pixels)
+{
+    if (ctx->rotation_buffer_pixels >= pixels && ctx->rotation_buffer != NULL)
+    {
+        return true;
+    }
+
+    free(ctx->rotation_buffer);
+    ctx->rotation_buffer = heap_caps_malloc(pixels * sizeof(uint16_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ctx->rotation_buffer == NULL)
+    {
+        ctx->rotation_buffer = heap_caps_malloc(pixels * sizeof(uint16_t), MALLOC_CAP_8BIT);
+    }
+    ctx->rotation_buffer_pixels = ctx->rotation_buffer ? pixels : 0;
+    return ctx->rotation_buffer != NULL;
+}
+
+static void bsp_rotation_panel_rotate_region_90(const uint16_t *src, uint16_t *dst,
+                                                int src_w, int src_h)
+{
+    // Write the rotated output row-contiguously. On PSRAM this is much cheaper
+    // than the naive source-row loop, which writes one pixel every destination row.
+    for (int dst_y = 0; dst_y < src_w; ++dst_y)
+    {
+        const uint16_t *src_col = src + dst_y;
+        uint16_t *dst_row = dst + ((size_t)dst_y * src_h);
+        for (int dst_x = 0; dst_x < src_h; ++dst_x)
+        {
+            dst_row[dst_x] = src_col[(size_t)(src_h - 1 - dst_x) * src_w];
+        }
+    }
+}
+
+static void bsp_rotation_panel_rotate_region_270(const uint16_t *src, uint16_t *dst,
+                                                 int src_w, int src_h)
+{
+    // Same layout strategy as 90 deg: contiguous writes into the rotated buffer.
+    for (int dst_y = 0; dst_y < src_w; ++dst_y)
+    {
+        const int src_x = src_w - 1 - dst_y;
+        uint16_t *dst_row = dst + ((size_t)dst_y * src_h);
+        for (int dst_x = 0; dst_x < src_h; ++dst_x)
+        {
+            dst_row[dst_x] = src[((size_t)dst_x * src_w) + src_x];
+        }
+    }
+}
+
+static esp_err_t bsp_rotation_panel_draw_bitmap(esp_lcd_panel_t *panel, int x_start, int y_start,
+                                                int x_end, int y_end, const void *color_data)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    if (!ctx || !ctx->target)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (ctx->rotation != BSP_DISPLAY_ROTATE_90 && ctx->rotation != BSP_DISPLAY_ROTATE_270)
+    {
+        return esp_lcd_panel_draw_bitmap(ctx->target, x_start, y_start, x_end, y_end, color_data);
+    }
+
+    const int src_w = x_end - x_start;
+    const int src_h = y_end - y_start;
+    if (src_w <= 0 || src_h <= 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t pixels = (size_t)src_w * src_h;
+    if (!bsp_rotation_panel_ensure_buffer(ctx, pixels))
+    {
+        ESP_LOGE(TAG, "Unable to allocate %" PRIu32 " px rotation buffer", (uint32_t)pixels);
+        return ESP_ERR_NO_MEM;
+    }
+
+    const uint16_t *src = (const uint16_t *)color_data;
+    int dst_x_start = 0;
+    int dst_y_start = 0;
+    int dst_x_end = 0;
+    int dst_y_end = 0;
+    if (ctx->rotation == BSP_DISPLAY_ROTATE_90)
+    {
+        bsp_rotation_panel_rotate_region_90(src, ctx->rotation_buffer, src_w, src_h);
+        dst_x_start = BSP_LCD_H_RES - y_end;
+        dst_x_end = BSP_LCD_H_RES - y_start;
+        dst_y_start = x_start;
+        dst_y_end = x_end;
+    }
+    else
+    {
+        bsp_rotation_panel_rotate_region_270(src, ctx->rotation_buffer, src_w, src_h);
+        dst_x_start = y_start;
+        dst_x_end = y_end;
+        dst_y_start = BSP_LCD_V_RES - x_end;
+        dst_y_end = BSP_LCD_V_RES - x_start;
+    }
+
+    return esp_lcd_panel_draw_bitmap(ctx->target, dst_x_start, dst_y_start, dst_x_end, dst_y_end,
+                                     ctx->rotation_buffer);
+}
+
+static esp_err_t bsp_rotation_panel_mirror(esp_lcd_panel_t *panel, bool x_axis, bool y_axis)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_mirror(ctx->target, x_axis, y_axis)
+                              : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t bsp_rotation_panel_swap_xy(esp_lcd_panel_t *panel, bool swap_axes)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_swap_xy(ctx->target, swap_axes)
+                              : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t bsp_rotation_panel_set_gap(esp_lcd_panel_t *panel, int x_gap, int y_gap)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_set_gap(ctx->target, x_gap, y_gap)
+                              : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t bsp_rotation_panel_invert_color(esp_lcd_panel_t *panel, bool invert_color_data)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_invert_color(ctx->target, invert_color_data)
+                              : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t bsp_rotation_panel_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_disp_on_off(ctx->target, on_off)
+                              : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t bsp_rotation_panel_disp_sleep(esp_lcd_panel_t *panel, bool sleep)
+{
+    bsp_rotation_panel_t *ctx = bsp_rotation_panel_from_base(panel);
+    return ctx && ctx->target ? esp_lcd_panel_disp_sleep(ctx->target, sleep)
+                              : ESP_ERR_INVALID_STATE;
+}
+
+static esp_lcd_panel_handle_t bsp_rotation_panel_wrap(esp_lcd_panel_handle_t target)
+{
+    rotation_panel.base.reset = bsp_rotation_panel_reset;
+    rotation_panel.base.init = bsp_rotation_panel_init;
+    rotation_panel.base.del = bsp_rotation_panel_del;
+    rotation_panel.base.draw_bitmap = bsp_rotation_panel_draw_bitmap;
+    rotation_panel.base.mirror = bsp_rotation_panel_mirror;
+    rotation_panel.base.swap_xy = bsp_rotation_panel_swap_xy;
+    rotation_panel.base.set_gap = bsp_rotation_panel_set_gap;
+    rotation_panel.base.invert_color = bsp_rotation_panel_invert_color;
+    rotation_panel.base.disp_on_off = bsp_rotation_panel_disp_on_off;
+    rotation_panel.base.disp_sleep = bsp_rotation_panel_disp_sleep;
+    rotation_panel.base.user_data = &rotation_panel;
+    rotation_panel.target = target;
+    rotation_panel.rotation = BSP_DISPLAY_ROTATE_0;
+    return &rotation_panel.base;
+}
 
 #define BSP_I2S_DUPLEX_MONO_CFG(_sample_rate)                                                         \
     {                                                                                                 \
@@ -539,6 +746,7 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
     };
 
     BSP_ERROR_CHECK_RETURN_NULL(bsp_display_new(&disp_config, &panel_handle, &io_handle));
+    adapter_panel_handle = bsp_rotation_panel_wrap(panel_handle);
 
     ESP_LOGI(TAG, "LVGL display buffers: psram=%s height=%" PRIu32 " max_transfer=%u queue_depth=%d double_buffer=%s",
              use_psram ? "yes" : "no",
@@ -549,7 +757,7 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
 
     ESP_LOGD(TAG, "Add LCD screen");
     esp_lv_adapter_display_config_t disp_cfg = {
-        .panel = panel_handle,
+        .panel = adapter_panel_handle,
         .panel_io = io_handle,
         .profile = {
             .interface = ESP_LV_ADAPTER_PANEL_IF_OTHER,
@@ -678,28 +886,29 @@ esp_err_t bsp_display_rotation_set(bsp_display_rotation_t rotation)
         x_gap = 6; y_gap = 0;
         break;
     case BSP_DISPLAY_ROTATE_90:
-        madctl = 0x60;
-        // MV bit (row/column exchange): native column axis maps to RASET.
-        // The 6-pixel physical column offset must be applied to y_gap.
-        x_gap = 0; y_gap = 6;
+        // 90 deg is handled by the BSP panel wrapper. Keep the real panel in
+        // its native active window to avoid exposing guard columns.
+        madctl = 0x00;
+        x_gap = 6; y_gap = 0;
         break;
     case BSP_DISPLAY_ROTATE_180:
         madctl = 0xC0;
-        // No MV: column axis unchanged, same gap as 0°.
-        x_gap = 6; y_gap = 0;
+        // Hardware 180 deg is clean on this panel with the measured column gap.
+        x_gap = 8; y_gap = 0;
         break;
     case BSP_DISPLAY_ROTATE_270:
-        madctl = 0xA0;
-        // MV bit set: same axis swap as 90°.
-        x_gap = 0; y_gap = 6;
+        // 270 deg is handled by the BSP panel wrapper.
+        madctl = 0x00;
+        x_gap = 6; y_gap = 0;
         break;
     default:
         ESP_LOGE(TAG, "Invalid rotation value: %d", rotation);
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Re-apply the panel gap so draw_bitmap adds the offset to the correct
-    // axis (CASET for 0°/180°, RASET for 90°/270° where MV swaps axes).
+    rotation_panel.rotation = rotation;
+
+    // Re-apply the draw offset expected by the current panel orientation.
     esp_lcd_panel_set_gap(panel_handle, x_gap, y_gap);
 
     uint32_t lcd_cmd = 0x36;
@@ -707,7 +916,8 @@ esp_err_t bsp_display_rotation_set(bsp_display_rotation_t rotation)
     lcd_cmd <<= 8;
     lcd_cmd |= 0x02 << 24;
 
-    ESP_LOGI(TAG, "Set display rotation: %d (MADCTL=0x%02X)", rotation, madctl);
+    ESP_LOGI(TAG, "Set display rotation: %d (MADCTL=0x%02X gap=%d,%d)",
+             rotation, madctl, x_gap, y_gap);
 
     return esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, &madctl, 1);
 }
