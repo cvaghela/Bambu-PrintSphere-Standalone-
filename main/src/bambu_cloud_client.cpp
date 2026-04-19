@@ -1108,6 +1108,7 @@ struct NozzleTemperatureBundle {
   float secondary = 0.0f;
   bool active_present = false;
   bool secondary_present = false;
+  int active_nozzle_index = -1;  // -1 = single nozzle, 0 = right, 1 = left (H2D)
 };
 
 struct TemperatureSample {
@@ -1328,7 +1329,10 @@ bool extract_live_total_layers(const cJSON* item, uint16_t* value) {
 
 int extract_active_nozzle_index(const cJSON* device) {
   const cJSON* extruder = child_object_local(device, "extruder");
-  return std::max(json_int_local(extruder, "state", 0) >> 4, 0);
+  const int state = json_int_local(extruder, "state", 0);
+  const int total = state & 0xF;
+  if (total <= 1) return -1;  // Single nozzle — no index needed.
+  return (state >> 4) & 0xF;
 }
 
 void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_index,
@@ -1405,11 +1409,13 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
     }
 
     const int active_nozzle_index = extract_active_nozzle_index(device);
+    bundle.active_nozzle_index = active_nozzle_index;
+    const int merge_index = active_nozzle_index >= 0 ? active_nozzle_index : 0;
     merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "nozzle"), "info"),
-                                 active_nozzle_index, &bundle.active, &bundle.active_present,
+                                 merge_index, &bundle.active, &bundle.active_present,
                                  &bundle.secondary, &bundle.secondary_present);
     merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "extruder"), "info"),
-                                 active_nozzle_index, &bundle.active, &bundle.active_present,
+                                 merge_index, &bundle.active, &bundle.active_present,
                                  &bundle.secondary, &bundle.secondary_present);
   }
 
@@ -2073,6 +2079,9 @@ void BambuCloudClient::publish_combined_snapshot() {
     current.nozzle_temp_c = live.nozzle_temp_c;
     current.nozzle_temp_last_update_ms = live.nozzle_temp_last_update_ms;
   }
+  if (live_has_recent_state && live.active_nozzle_index >= 0) {
+    current.active_nozzle_index = live.active_nozzle_index;
+  }
   if (live_has_recent_state &&
       (live.secondary_nozzle_temp_last_update_ms != 0 || live.secondary_nozzle_temp_c > 0.0f)) {
     current.secondary_nozzle_temp_c = live.secondary_nozzle_temp_c;
@@ -2675,6 +2684,9 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
         extract_cloud_chamber_temperature_c(print, runtime.chamber_temp_c);
     runtime.nozzle_temp_c = nozzle_temps.active;
     runtime.secondary_nozzle_temp_c = nozzle_temps.secondary;
+    if (nozzle_temps.active_nozzle_index >= 0) {
+      runtime.active_nozzle_index = nozzle_temps.active_nozzle_index;
+    }
     runtime.bed_temp_c = bed_temp.value;
     runtime.chamber_temp_c = chamber_temp.value;
     if (nozzle_temps.active_present) {

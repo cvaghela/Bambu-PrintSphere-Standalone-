@@ -468,6 +468,9 @@ void apply_local_temperature_bundle(PrinterSnapshot& target, const PrinterSnapsh
   target.secondary_nozzle_temp_c = local_snapshot.secondary_nozzle_temp_c;
   target.secondary_nozzle_temp_known =
       local_snapshot.secondary_nozzle_temp_known || local_snapshot.secondary_nozzle_temp_c > 0.0f;
+  if (local_snapshot.active_nozzle_index >= 0) {
+    target.active_nozzle_index = local_snapshot.active_nozzle_index;
+  }
 }
 
 void apply_cloud_temperature_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot,
@@ -486,6 +489,9 @@ void apply_cloud_temperature_bundle(PrinterSnapshot& target, const BambuCloudSna
       cloud_snapshot.secondary_nozzle_temp_last_update_ms, cloud_snapshot.connected);
   target.secondary_nozzle_temp_c =
       target.secondary_nozzle_temp_known ? cloud_snapshot.secondary_nozzle_temp_c : 0.0f;
+  if (cloud_snapshot.active_nozzle_index >= 0) {
+    target.active_nozzle_index = cloud_snapshot.active_nozzle_index;
+  }
 }
 
 void apply_local_error_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {

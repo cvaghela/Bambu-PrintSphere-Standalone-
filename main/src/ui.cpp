@@ -1593,10 +1593,13 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   set_label_text_if_changed(remaining_label_, remaining);
 
   char temp_buffer[24] = {};
+  const bool is_dual_nozzle = snapshot.active_nozzle_index >= 0;
+  const char* active_prefix = is_dual_nozzle ? (snapshot.active_nozzle_index == 1 ? "L " : "R ") : "";
+  const char* secondary_prefix = is_dual_nozzle ? (snapshot.active_nozzle_index == 1 ? "R " : "L ") : "";
   if (snapshot.nozzle_temp_known || snapshot.nozzle_temp_c > 0.0f) {
-    std::snprintf(temp_buffer, sizeof(temp_buffer), "%.0f%s", snapshot.nozzle_temp_c, kDegreeC);
+    std::snprintf(temp_buffer, sizeof(temp_buffer), "%s%.0f%s", active_prefix, snapshot.nozzle_temp_c, kDegreeC);
   } else {
-    std::snprintf(temp_buffer, sizeof(temp_buffer), "--%s", kDegreeC);
+    std::snprintf(temp_buffer, sizeof(temp_buffer), "%s--%s", active_prefix, kDegreeC);
   }
   set_label_text_if_changed(nozzle_value_label_, temp_buffer);
 
@@ -1607,9 +1610,18 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   }
   set_label_text_if_changed(bed_value_label_, temp_buffer);
 
-  const std::string nozzle_aux =
-      optional_temperature_text("Other nozzle", snapshot.secondary_nozzle_temp_c,
-                                snapshot.secondary_nozzle_temp_known);
+  char nozzle_aux_buf[40] = {};
+  if (is_dual_nozzle &&
+      (snapshot.secondary_nozzle_temp_known || snapshot.secondary_nozzle_temp_c > 0.0f)) {
+    std::snprintf(nozzle_aux_buf, sizeof(nozzle_aux_buf), "%s%.0f%s",
+                  secondary_prefix, snapshot.secondary_nozzle_temp_c, kDegreeC);
+  } else if (!is_dual_nozzle) {
+    const std::string tmp =
+        optional_temperature_text("Other nozzle", snapshot.secondary_nozzle_temp_c,
+                                  snapshot.secondary_nozzle_temp_known);
+    std::snprintf(nozzle_aux_buf, sizeof(nozzle_aux_buf), "%s", tmp.c_str());
+  }
+  const std::string nozzle_aux(nozzle_aux_buf);
   nozzle_aux_visible_ = !nozzle_aux.empty();
   if (nozzle_aux_visible_) {
     set_label_text_if_changed(nozzle_aux_label_, nozzle_aux);

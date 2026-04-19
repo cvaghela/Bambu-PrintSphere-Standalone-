@@ -770,11 +770,15 @@ float normalize_temperature_candidate(float value) {
 struct NozzleTemperatureBundle {
   float active = 0.0f;
   float secondary = 0.0f;
+  int active_nozzle_index = -1;  // -1 = single nozzle, 0 = right, 1 = left (H2D)
 };
 
 int extract_active_nozzle_index(const cJSON* device) {
   const cJSON* extruder = child_object_local(device, "extruder");
-  return std::max(json_int_local(extruder, "state", 0) >> 4, 0);
+  const int state = json_int_local(extruder, "state", 0);
+  const int total = state & 0xF;
+  if (total <= 1) return -1;  // Single nozzle — no index needed.
+  return (state >> 4) & 0xF;
 }
 
 void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_index,
@@ -873,9 +877,11 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
   const cJSON* device = child_object_local(print, "device");
   const cJSON* extruder = child_object_local(device, "extruder");
   const int active_nozzle_index = extract_active_nozzle_index(device);
+  bundle.active_nozzle_index = active_nozzle_index;
+  const int merge_index = active_nozzle_index >= 0 ? active_nozzle_index : 0;
   merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "nozzle"), "info"),
-                               active_nozzle_index, &bundle.active, &bundle.secondary);
-  merge_nozzle_temp_candidates(child_array_local(extruder, "info"), active_nozzle_index,
+                               merge_index, &bundle.active, &bundle.secondary);
+  merge_nozzle_temp_candidates(child_array_local(extruder, "info"), merge_index,
                                &bundle.active, &bundle.secondary);
   ESP_LOGD(kTag, "[DBG] nozzle bundle final: active=%.1f secondary=%.1f active_nozzle_idx=%d",
            bundle.active, bundle.secondary, active_nozzle_index);
@@ -1312,6 +1318,7 @@ PrinterSnapshot PrinterClient::build_snapshot_from_runtime(
   snapshot.chamber_temp_known = runtime.chamber_temp_c > 0.0f;
   snapshot.secondary_nozzle_temp_c = runtime.secondary_nozzle_temp_c;
   snapshot.secondary_nozzle_temp_known = runtime.secondary_nozzle_temp_c > 0.0f;
+  snapshot.active_nozzle_index = runtime.active_nozzle_index;
   snapshot.chamber_light_supported = runtime.chamber_light_supported;
   snapshot.chamber_light_state_known = runtime.chamber_light_state_known;
   snapshot.chamber_light_on = runtime.chamber_light_on;
@@ -1718,6 +1725,9 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
                                           runtime.secondary_nozzle_temp_c);
     runtime.nozzle_temp_c = nozzle_temps.active;
     runtime.secondary_nozzle_temp_c = nozzle_temps.secondary;
+    if (nozzle_temps.active_nozzle_index >= 0) {
+      runtime.active_nozzle_index = nozzle_temps.active_nozzle_index;
+    }
     runtime.bed_temp_c = extract_bed_temperature_c(print, runtime.bed_temp_c);
     runtime.chamber_temp_c = extract_chamber_temperature_c(print, runtime.chamber_temp_c);
     runtime.current_layer = extract_current_layer_local(print, runtime.current_layer);

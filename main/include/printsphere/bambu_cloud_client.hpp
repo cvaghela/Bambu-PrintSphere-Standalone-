@@ -59,6 +59,7 @@ struct BambuCloudSnapshot {
   uint64_t chamber_temp_last_update_ms = 0;
   float secondary_nozzle_temp_c = 0.0f;
   uint64_t secondary_nozzle_temp_last_update_ms = 0;
+  int active_nozzle_index = -1;  // -1 = single nozzle, 0 = right, 1 = left (H2D)
   bool chamber_light_supported = false;
   bool chamber_light_state_known = false;
   bool chamber_light_on = false;
@@ -113,6 +114,7 @@ class BambuCloudClient {
     uint64_t chamber_temp_last_update_ms = 0;
     float secondary_nozzle_temp_c = 0.0f;
     uint64_t secondary_nozzle_temp_last_update_ms = 0;
+    int active_nozzle_index = -1;  // -1 = single nozzle, 0 = right, 1 = left (H2D)
     bool chamber_light_supported = false;
     bool chamber_light_state_known = false;
     bool chamber_light_on = false;
