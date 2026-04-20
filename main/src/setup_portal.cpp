@@ -426,17 +426,17 @@ bool parse_arc_colors_from_json(const cJSON* root, ArcColorScheme* colors) {
 }
 
 std::string cloud_verify_label(const BambuCloudSnapshot& snapshot) {
-  return snapshot.tfa_required ? "2FA Code" : "Email Code";
+  return snapshot.tfa_required ? "2FA Code" : "Verification Code";
 }
 
 std::string cloud_verify_placeholder(const BambuCloudSnapshot& snapshot) {
   return snapshot.tfa_required ? "Only needed if Bambu requests a 2FA code"
-                               : "Only needed if Bambu requests an email code";
+                               : "Only needed if Bambu requests a verification code";
 }
 
 std::string cloud_verify_note(const BambuCloudSnapshot& snapshot) {
   return snapshot.tfa_required ? "Bambu is currently waiting for a 2FA code."
-                               : "Bambu is currently waiting for an email code. The cloud login completes after that step.";
+                               : "Bambu is currently waiting for a verification code. The cloud login completes after that step.";
 }
 
 SourceMode parse_source_mode_field(const cJSON* root) {
@@ -618,7 +618,7 @@ CloudPortalPresentation cloud_portal_presentation(const BambuCloudSnapshot& clou
     presentation.badge_value = "Code required";
     presentation.badge_class = "warn";
     presentation.status_line =
-        presentation.snapshot.tfa_required ? "2FA required" : "Email code required";
+        presentation.snapshot.tfa_required ? "2FA required" : "Verification code required";
     return presentation;
   }
 
@@ -1577,10 +1577,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const auto render_cloud_section = [&]() {
     begin_collapsible_section(
         "Bambu Cloud",
-        "Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.",
+        "Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. Use Connect to start the login immediately. If Bambu asks for a verification code or 2FA code, you can complete that step here.",
         cloud_badge_value, cloud_badge_class, cloud_section_open, "cloud-section-pill");
     html += "<div class=\"grid-2\">";
-    html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email</label><input id=\"cloud_email\" value=\"";
+    html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email / Phone</label><input id=\"cloud_email\" value=\"";
     html += json_escape(cloud.email);
     html += "\" autocomplete=\"username\"></div>";
     html += "<div class=\"field\"><label for=\"cloud_password\">Bambu Password</label><input id=\"cloud_password\" type=\"password\" value=\"\" placeholder=\"";
@@ -2370,7 +2370,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(body&&cloudProvisioningReady(body)){const detail=(cloudDetailLooksTransitional(body.cloud_detail||body.detail)?'Bambu Cloud session is ready.':(body.cloud_detail||body.detail||'Bambu Cloud session is ready.'));setStatus('Cloud connected',detail,5000);stopCloudFollowup();if(!cloudSuccessReloadScheduled){cloudSuccessReloadScheduled=true;schedulePortalReload(serialReady?350:600);}return;}"
           "if(body&&stage==='binding_printer'){setStatus('Cloud connected',body.cloud_detail||body.detail||'Resolving your printer from the Bambu Cloud account now.',4000);}"
           "if(body&&stage==='connecting_mqtt'){setStatus('Cloud connected',body.cloud_detail||body.detail||'Connecting the live cloud monitor now.',4000);}"
-          "if(body&&cloudStageIsCodeRequired(stage)){setStatus(body.cloud_tfa_required?'2FA required':'Email code required',body.cloud_detail||'Enter the requested code to finish the login.',10000);stopCloudFollowup();return;}"
+          "if(body&&cloudStageIsCodeRequired(stage)){setStatus(body.cloud_tfa_required?'2FA required':'Verification code required',body.cloud_detail||'Enter the requested code to finish the login.',10000);stopCloudFollowup();return;}"
           "if(body&&stage==='failed'){setStatus('Cloud login failed',body.cloud_detail||body.detail||'The Bambu Cloud login did not complete.',8000);stopCloudFollowup();return;}"
           "if(Date.now()>=cloudFollowupUntil){if(body&&cloudSessionLooksReady(body)&&!serialReady){cloudFollowupUntil=Date.now()+5000;cloudFollowupTimer=setTimeout(poll,350);return;}if(body&&cloudStageIsBusy(stage)){setStatus('Cloud login still running',body.cloud_detail||body.detail||'The cloud login is still progressing in the background.',6000);}stopCloudFollowup();return;}"
           "cloudFollowupTimer=setTimeout(poll,350);};"
@@ -2462,9 +2462,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const stage=cloudSetupStage(body);"
           "const tfa=stage==='tfa_required'||!!body.cloud_tfa_required;"
           "const required=cloudStageIsCodeRequired(stage);"
-          "label.textContent=tfa?'2FA Code':'Email Code';"
-          "input.placeholder=tfa?'Only needed if Bambu requests a 2FA code':'Only needed if Bambu requests an email code';"
-          "note.textContent=tfa?'Bambu is currently waiting for a 2FA code.':'Bambu is currently waiting for an email code. The cloud login completes after that step.';"
+          "label.textContent=tfa?'2FA Code':'Verification Code';"
+          "input.placeholder=tfa?'Only needed if Bambu requests a 2FA code':'Only needed if Bambu requests a verification code';"
+          "note.textContent=tfa?'Bambu is currently waiting for a 2FA code.':'Bambu is currently waiting for a verification code. The cloud login completes after that step.';"
           "note.classList.toggle('hidden',!required);}";
   html += "async function updateHealth(){if(healthInFlight)return null;healthInFlight=true;try{const response=await fetch('/api/health',{cache:'no-store'});"
           "if(!response.ok)return null;const body=await response.json();"
@@ -2589,7 +2589,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "savedConfig.cloud_password_saved=!!cloud_password||savedConfig.cloud_password_saved;"
           "const stage=cloudSetupStage(body);"
           "if(body.cloud_connected||cloudSessionLooksReady(body)){setStatus('Cloud connected',body.detail||body.cloud_detail||'Connected to Bambu Cloud.',7000);if(!cloudSuccessReloadScheduled){cloudSuccessReloadScheduled=true;schedulePortalReload(350);}}"
-          "else if(cloudStageIsCodeRequired(stage)){setStatus(stage==='tfa_required'?'2FA required':'Email code required',body.detail||body.cloud_detail||'Enter the requested code to finish the login.',10000);}"
+          "else if(cloudStageIsCodeRequired(stage)){setStatus(stage==='tfa_required'?'2FA required':'Verification code required',body.detail||body.cloud_detail||'Enter the requested code to finish the login.',10000);}"
           "else if(stage==='failed'){setStatus('Cloud connect failed',body.detail||body.cloud_detail||'The cloud login did not complete.',8000);}"
           "else{const detail=body.detail||body.cloud_detail||'Waiting for cloud response...';setStatus(cloudStageStatusLabel(stage),detail,4000);startCloudFollowup(detail,15000);}}"
           "else{setStatus(body.error||'Cloud connect failed',body.detail||'Please review the credentials and try again.',8000);}}"
@@ -2616,7 +2616,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(response.ok){"
           "const stage=cloudSetupStage(body);"
           "if(body.cloud_connected||cloudSessionLooksReady(body)){setStatus('Cloud connected',body.detail||body.cloud_detail||'Connected to Bambu Cloud.',7000);if(!cloudSuccessReloadScheduled){cloudSuccessReloadScheduled=true;schedulePortalReload(350);}}"
-          "else if(cloudStageIsCodeRequired(stage)){setStatus(stage==='tfa_required'?'2FA required':'Email code required',body.detail||body.cloud_detail||'Please check the code and try again.',8000);}"
+          "else if(cloudStageIsCodeRequired(stage)){setStatus(stage==='tfa_required'?'2FA required':'Verification code required',body.detail||body.cloud_detail||'Please check the code and try again.',8000);}"
           "else if(stage==='failed'){setStatus('Cloud code was rejected',body.detail||body.cloud_detail||'Please check the code and try again.',7000);}"
           "else{const detail=body.detail||body.cloud_detail||'The cloud accepted the code and is finishing login now.';setStatus(cloudStageStatusLabel(stage),detail,4000);startCloudFollowup(detail,15000);}"
           "const codeInput=document.getElementById('cloud_verification_code');if(codeInput){codeInput.value='';}}"

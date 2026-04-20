@@ -33,6 +33,7 @@ constexpr char kTag[] = "printsphere.cloud";
 constexpr char kLoginPath[] = "/v1/user-service/user/login";
 constexpr char kTfaLoginPath[] = "/api/sign-in/tfa";
 constexpr char kEmailCodePath[] = "/v1/user-service/user/sendemail/code";
+constexpr char kSmsCodePath[] = "/v1/user-service/user/sendsmscode";
 constexpr char kBindPath[] = "/v1/iot-service/api/user/bind";
 constexpr char kPreferencePath[] = "/v1/design-user-service/my/preference";
 constexpr char kTasksPath[] = "/v1/user-service/my/tasks?limit=10";
@@ -57,6 +58,33 @@ constexpr uint64_t kCloudLiveDataFreshMs = 120000ULL;
 constexpr uint64_t kCloudOptimisticLightMs = 8000ULL;
 constexpr int kCloudPrintErrorTaskCanceled = 0x0300400C;
 constexpr int kCloudPrintErrorPrintingCancelled = 0x0500400E;
+
+struct TfaCookieContext {
+  std::string token;
+};
+
+esp_err_t tfa_event_handler(esp_http_client_event_t* evt) {
+  if (evt == nullptr || evt->user_data == nullptr) {
+    return ESP_OK;
+  }
+  if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->header_key != nullptr &&
+      evt->header_value != nullptr) {
+    if (strcasecmp(evt->header_key, "Set-Cookie") == 0) {
+      const std::string cookie(evt->header_value);
+      constexpr char kPrefix[] = "token=";
+      const auto pos = cookie.find(kPrefix);
+      if (pos != std::string::npos) {
+        const auto value_start = pos + sizeof(kPrefix) - 1;
+        const auto value_end = cookie.find(';', value_start);
+        auto* ctx = static_cast<TfaCookieContext*>(evt->user_data);
+        ctx->token = cookie.substr(value_start,
+                                   value_end != std::string::npos ? value_end - value_start
+                                                                  : std::string::npos);
+      }
+    }
+  }
+  return ESP_OK;
+}
 
 const char* wifi_second_channel_name(wifi_second_chan_t second) {
   switch (second) {
@@ -1815,7 +1843,7 @@ void BambuCloudClient::submit_verification_code(std::string code) {
   rest.setup_stage = CloudSetupStage::kCodeSubmitted;
   rest.last_update_ms = now_ms();
   copy_text(&rest.detail, auth_mode() == AuthMode::kTfaCode ? "Submitting Bambu Cloud 2FA code"
-                                                            : "Submitting Bambu Cloud email code");
+                                                            : "Submitting Bambu Cloud verification code");
   store_rest_runtime(std::move(rest), false);
   publish_combined_snapshot();
   if (task_handle_ != nullptr && xTaskGetCurrentTaskHandle() != task_handle_) {
@@ -3162,7 +3190,7 @@ void BambuCloudClient::task_loop() {
         apply_cloud_session_state(true, false, true, auth_mode() == AuthMode::kTfaCode,
                                   auth_mode() == AuthMode::kTfaCode
                                       ? "Bambu Cloud requires 2FA code"
-                                      : "Bambu Cloud email code required",
+                                      : "Bambu Cloud verification code required",
                                   false, true);
       } else {
         apply_cloud_session_state(true, false, false, false,
@@ -3358,14 +3386,16 @@ bool BambuCloudClient::authenticate_with_password() {
 
   if (login_type == "verifyCode") {
     set_auth_mode(AuthMode::kEmailCode);
-    const bool code_requested = request_email_verification_code();
+    const bool is_phone = credentials_.email.find('@') == std::string::npos;
+    const bool code_requested = request_verification_code();
     if (!code_requested) {
-      ESP_LOGW(kTag, "Bambu Cloud requested email-code login but sending the code failed");
+      ESP_LOGW(kTag, "Bambu Cloud requested verification-code login but sending the code failed");
     }
     apply_cloud_session_state(true, false, true, false,
                               code_requested
-                                  ? "Bambu Cloud sent email code; enter it in setup portal"
-                                  : "Bambu Cloud email code required; request a fresh code in setup portal",
+                                  ? (is_phone ? "Bambu Cloud sent SMS code; enter it in setup portal"
+                                              : "Bambu Cloud sent email code; enter it in setup portal")
+                                  : "Bambu Cloud verification code required; request a fresh code in setup portal",
                               false, true);
     cJSON_Delete(root);
     return false;
@@ -3436,14 +3466,14 @@ bool BambuCloudClient::authenticate_with_email_code(const std::string& code) {
   if (!perform_json_request(cloud_api_url(credentials_.region, kLoginPath), "POST", request_body,
                             {}, &status_code, &response_body)) {
     apply_cloud_session_state(true, false, true, false,
-                              "Bambu Cloud email-code login failed", false, true);
+                              "Bambu Cloud verification-code login failed", false, true);
     return false;
   }
 
   cJSON* root = cJSON_Parse(response_body.c_str());
   if (root == nullptr) {
     apply_cloud_session_state(true, false, true, false,
-                              "Bambu Cloud email-code response invalid", false, true);
+                              "Bambu Cloud verification-code response invalid", false, true);
     return false;
   }
 
@@ -3485,13 +3515,13 @@ bool BambuCloudClient::authenticate_with_email_code(const std::string& code) {
   std::string failed_detail;
   if (status_code == 400 && error_code == 1) {
     clear_pending_code();
-    request_email_verification_code();
-    failed_detail = "Bambu Cloud email code expired; new code requested";
+    request_verification_code();
+    failed_detail = "Bambu Cloud verification code expired; new code requested";
   } else if (status_code == 400 && error_code == 2) {
     clear_pending_code();
-    failed_detail = "Bambu Cloud email code incorrect";
+    failed_detail = "Bambu Cloud verification code incorrect";
   } else {
-    failed_detail = "Bambu Cloud email-code login rejected";
+    failed_detail = "Bambu Cloud verification-code login rejected";
   }
   apply_cloud_session_state(true, false, true, false, failed_detail, false, true);
   cJSON_Delete(root);
@@ -3522,22 +3552,124 @@ bool BambuCloudClient::authenticate_with_tfa_code(const std::string& code) {
   const std::string request_body(payload);
   cJSON_free(payload);
 
-  int status_code = 0;
-  std::string response_body;
-  if (!perform_json_request(cloud_site_url(credentials_.region, kTfaLoginPath), "POST",
-                            request_body, {}, &status_code, &response_body)) {
+  // The TFA endpoint returns the access token in a Set-Cookie header
+  // (not in the JSON body), so we use an event handler to capture it.
+  TfaCookieContext cookie_ctx;
+
+  const std::string url = cloud_site_url(credentials_.region, kTfaLoginPath);
+
+  esp_http_client_config_t config = {};
+  config.url = url.c_str();
+  config.timeout_ms = 10000;
+  config.crt_bundle_attach = esp_crt_bundle_attach;
+  config.method = HTTP_METHOD_POST;
+  config.keep_alive_enable = false;
+  config.buffer_size = 2048;
+  config.buffer_size_tx = 1024;
+  config.event_handler = tfa_event_handler;
+  config.user_data = &cookie_ctx;
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == nullptr) {
     apply_cloud_session_state(true, false, true, true,
-                              "Bambu Cloud 2FA login failed", false, true);
+                              "Bambu Cloud 2FA login failed (HTTP init)", false, true);
     return false;
   }
 
-  apply_cloud_session_state(
-      true, false, true, true,
-      (status_code >= 200 && status_code < 300)
-          ? "Bambu Cloud 2FA returned token cookie, not yet handled on ESP"
-          : "Bambu Cloud 2FA rejected",
-      false, true);
-  return false;
+  esp_http_client_set_header(client, "User-Agent", "bambu_network_agent/01.09.05.01");
+  esp_http_client_set_header(client, "X-BBL-Client-Name", "OrcaSlicer");
+  esp_http_client_set_header(client, "X-BBL-Client-Type", "slicer");
+  esp_http_client_set_header(client, "X-BBL-Client-Version", "01.09.05.51");
+  esp_http_client_set_header(client, "X-BBL-Language", "en-US");
+  esp_http_client_set_header(client, "X-BBL-OS-Type", "linux");
+  esp_http_client_set_header(client, "X-BBL-OS-Version", "6.2.0");
+  esp_http_client_set_header(client, "X-BBL-Agent-Version", "01.09.05.01");
+  esp_http_client_set_header(client, "X-BBL-Executable-info", "{}");
+  esp_http_client_set_header(client, "X-BBL-Agent-OS-Type", "linux");
+  esp_http_client_set_header(client, "Accept", "application/json");
+  esp_http_client_set_header(client, "Content-Type", "application/json");
+
+  const esp_err_t open_err = esp_http_client_open(client, static_cast<int>(request_body.size()));
+  if (open_err != ESP_OK) {
+    ESP_LOGW(kTag, "HTTP open failed for TFA: %s", esp_err_to_name(open_err));
+    esp_http_client_cleanup(client);
+    apply_cloud_session_state(true, false, true, true,
+                              "Bambu Cloud 2FA connection failed", false, true);
+    return false;
+  }
+
+  const int written =
+      esp_http_client_write(client, request_body.c_str(), static_cast<int>(request_body.size()));
+  if (written < 0) {
+    ESP_LOGW(kTag, "HTTP write failed for TFA");
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    apply_cloud_session_state(true, false, true, true,
+                              "Bambu Cloud 2FA request failed", false, true);
+    return false;
+  }
+
+  const int fetch_result = esp_http_client_fetch_headers(client);
+  if (fetch_result < 0) {
+    ESP_LOGW(kTag, "HTTP fetch headers failed for TFA");
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    apply_cloud_session_state(true, false, true, true,
+                              "Bambu Cloud 2FA response failed", false, true);
+    return false;
+  }
+
+  const int status_code = esp_http_client_get_status_code(client);
+
+  // Drain the response body (we don't need it, but must read it to completion)
+  char drain_buf[256];
+  while (true) {
+    const int n = esp_http_client_read(client, drain_buf, sizeof(drain_buf));
+    if (n <= 0) {
+      break;
+    }
+  }
+
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+
+  if (status_code < 200 || status_code >= 300) {
+    ESP_LOGW(kTag, "Bambu Cloud 2FA rejected: status=%d", status_code);
+    apply_cloud_session_state(true, false, true, true,
+                              "Bambu Cloud 2FA code rejected", false, true);
+    return false;
+  }
+
+  if (cookie_ctx.token.empty()) {
+    ESP_LOGW(kTag, "Bambu Cloud 2FA succeeded but no token cookie received");
+    apply_cloud_session_state(true, false, true, true,
+                              "Bambu Cloud 2FA succeeded but no token received", false, true);
+    return false;
+  }
+
+  ESP_LOGI(kTag, "Bambu Cloud 2FA login successful (token from cookie)");
+  access_token_ = cookie_ctx.token;
+  token_expiry_us_ =
+      esp_timer_get_time() + static_cast<int64_t>(3600 - 60) * 1000000LL;
+  mqtt_username_.clear();
+  mqtt_auth_recovery_requested_ = false;
+  mqtt_auth_connect_return_code_ = static_cast<int>(MQTT_CONNECTION_ACCEPTED);
+  mqtt_auth_retry_not_before_us_ = 0;
+  stop_mqtt_client();
+  const bool token_persisted = persist_access_token();
+  if (token_persisted && config_store_ != nullptr) {
+    const esp_err_t clear_err =
+        config_store_->save_cloud_credentials(
+            {.email = credentials_.email, .password = {}, .region = credentials_.region});
+    if (clear_err != ESP_OK) {
+      ESP_LOGW(kTag, "Failed to clear persisted cloud password: %s", esp_err_to_name(clear_err));
+    }
+  }
+  clear_auth_state();
+
+  apply_cloud_session_state(true, false, false, false,
+                            "Bambu Cloud session ready", true, true);
+  return true;
 }
 
 bool BambuCloudClient::request_email_verification_code() {
@@ -3573,6 +3705,46 @@ bool BambuCloudClient::request_email_verification_code() {
   }
   ESP_LOGI(kTag, "Bambu Cloud email code requested successfully");
   return true;
+}
+
+bool BambuCloudClient::request_sms_verification_code() {
+  cJSON* body = cJSON_CreateObject();
+  if (body == nullptr) {
+    return false;
+  }
+  cJSON_AddStringToObject(body, "phone", credentials_.email.c_str());
+  cJSON_AddStringToObject(body, "type", "codeLogin");
+
+  char* payload = cJSON_PrintUnformatted(body);
+  cJSON_Delete(body);
+  if (payload == nullptr) {
+    return false;
+  }
+
+  const std::string request_body(payload);
+  cJSON_free(payload);
+
+  int status_code = 0;
+  std::string response_body;
+  const bool success = perform_json_request(
+      cloud_api_url(credentials_.region, kSmsCodePath), "POST", request_body, {}, &status_code,
+      &response_body);
+  if (!success) {
+    ESP_LOGW(kTag, "Bambu Cloud SMS-code request failed");
+    return false;
+  }
+  if (status_code < 200 || status_code >= 300) {
+    ESP_LOGW(kTag, "Bambu Cloud SMS-code request rejected: status=%d body=%s", status_code,
+             response_body.c_str());
+    return false;
+  }
+  ESP_LOGI(kTag, "Bambu Cloud SMS code requested successfully");
+  return true;
+}
+
+bool BambuCloudClient::request_verification_code() {
+  const bool is_phone = credentials_.email.find('@') == std::string::npos;
+  return is_phone ? request_sms_verification_code() : request_email_verification_code();
 }
 
 bool BambuCloudClient::fetch_bindings() {

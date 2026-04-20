@@ -206,6 +206,8 @@ class BambuCloudClient {
   bool fetch_latest_preview(bool allow_preview_download);
   std::shared_ptr<std::vector<uint8_t>> download_preview_image(const std::string& url);
   bool request_email_verification_code();
+  bool request_sms_verification_code();
+  bool request_verification_code();
   bool perform_json_request(const std::string& url, const char* method,
                             const std::string& request_body, const std::string& bearer_token,
                             int* status_code, std::string* response_body);
