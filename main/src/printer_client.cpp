@@ -2401,7 +2401,7 @@ void PrinterClient::task_loop() {
             fd_set wset;
             FD_ZERO(&wset);
             FD_SET(probe_sock, &wset);
-            struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+            struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
             int sel = select(probe_sock + 1, nullptr, &wset, nullptr, &tv);
             if (sel > 0) {
               int sock_err = 0;
@@ -2425,15 +2425,22 @@ void PrinterClient::task_loop() {
           if (rc < 0) {
             ++consecutive_probe_failures_;
 
-            // First failure during boot: stay in "connecting" state and retry
-            // silently so the UI doesn't flash "failed" before the printer has
-            // had time to respond.
-            if (consecutive_probe_failures_ <= 1) {
-              ESP_LOGW(kTag, "TCP probe: host %s unreachable on first attempt (errno=%d), retrying silently",
-                       connection.host.c_str(), probe_errno);
+            // First few failures during boot: stay in "connecting" state and
+            // retry silently so the UI doesn't flash "failed" before the mesh
+            // router has had time to establish routing to the printer.
+            // 5 retries ≈ 32s total (5s timeout + backoff each), enough for
+            // Bambu printers to recover stale connections after rapid reboots.
+            if (consecutive_probe_failures_ <= 5) {
+              const uint32_t early_backoff_ms =
+                  consecutive_probe_failures_ <= 1 ? 300U :
+                  consecutive_probe_failures_ <= 2 ? 500U :
+                  consecutive_probe_failures_ <= 3 ? 1000U :
+                  consecutive_probe_failures_ <= 4 ? 2000U : 3000U;
+              ESP_LOGW(kTag, "TCP probe: host %s unreachable (attempt %d/5, errno=%d), retrying in %ums",
+                       connection.host.c_str(), static_cast<int>(consecutive_probe_failures_),
+                       probe_errno, static_cast<unsigned>(early_backoff_ms));
               log_wifi_link_diagnostics("TCP probe failed");
-              const uint32_t backoff_ms = 1500U;
-              schedule_client_rebuild("tcp probe failed (first attempt)", backoff_ms);
+              schedule_client_rebuild("tcp probe failed (early)", early_backoff_ms);
               vTaskDelay(pdMS_TO_TICKS(500));
               continue;
             }
