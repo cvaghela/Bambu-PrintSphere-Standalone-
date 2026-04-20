@@ -2258,6 +2258,7 @@ void PrinterClient::stop_client() {
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_mqtt_client_destroy(client_);
     client_ = nullptr;
+    log_heap_status("After MQTT client destroy");
   }
 }
 
@@ -2521,6 +2522,7 @@ void PrinterClient::task_loop() {
         mqtt_cfg.credentials.authentication.password = active_connection_.access_code.c_str();
       }
 
+      log_heap_status("Before MQTT client init");
       client_ = esp_mqtt_client_init(&mqtt_cfg);
       if (client_ == nullptr) {
         LocalPrinterRuntimeState failed = runtime_state_copy();
@@ -2541,6 +2543,7 @@ void PrinterClient::task_loop() {
         continue;
       }
 
+      log_heap_status("Before MQTT client start (TLS handshake)");
       esp_mqtt_client_register_event(client_, MQTT_EVENT_ANY, &PrinterClient::mqtt_event_handler, this);
       if (esp_mqtt_client_start(client_) != ESP_OK) {
         LocalPrinterRuntimeState failed = runtime_state_copy();
